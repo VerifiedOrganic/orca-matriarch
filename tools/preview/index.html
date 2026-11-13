@@ -120,7 +120,10 @@
     'projects.list': () => ({ projects }),
     'project.enable': () => ({ ok: true, message: 'on', repo: 'acme/app' }),
     'config.get': () => ({ config: structuredClone(config), errors: [], warnings: clean ? [] : ['reviewers[2]: Matriarch can start only claude and codex reviewers read-only, so "style" (grok) is not started.'], agents }),
-    'config.save': () => ({ saved: true, errors: [], warnings: [] }),
+    // ?saveerr=1: the worker turns the save down.
+    'config.save': () => params.get('saveerr') === '1'
+      ? ({ saved: false, errors: ['reviewers[1].name: "security" is used twice', 'merge.requireHuman[0]: "migrations/**/" ends in a slash'], warnings: [] })
+      : ({ saved: true, errors: [], warnings: [] }),
     'project.focused': () => clean ? { repo: 'acme/app', root: '/src/app', enabled: true, name: 'app', candidates: [] } : (params.get('focus') === 'off'
       ? { repo: 'acme/docs', root: '/src/docs', enabled: false, name: 'main', candidates: ['acme/docs'] }
       : { repo: null, root: null, enabled: false, name: 'main', candidates: ['acme/app', 'acme/infra'] })
@@ -143,6 +146,19 @@
       setTimeout(() => { const q = document.querySelector('.picker-search'); if (q && params.get('q')) { q.value = params.get('q'); q.dispatchEvent(new Event('input')) } }, 100)
     }, 100)
   }, 400)
+  // Settings states: ?groups=all (or review,fixes,merge,project) opens rule groups, ?dirty=1 makes an
+  // unsaved change, ?save=1 clicks Save, ?confirm=1 asks to turn Matriarch off, ?scroll=N scrolls.
+  if (params.get('page') === 'settings') setTimeout(() => {
+    const groups = params.get('groups')
+    const keys = ['review', 'fixes', 'merge', 'project']
+    if (groups) document.querySelectorAll('.settings details.group').forEach((d, i) => { if (groups === 'all' || groups.split(',').includes(keys[i])) d.open = true })
+    if (params.get('dirty') === '1') { const n = document.querySelector('.settings input.num'); n.value = '4'; n.dispatchEvent(new Event('input', { bubbles: true })) }
+    if (params.get('confirm') === '1') click('Turn off')
+    setTimeout(() => {
+      if (params.get('save') === '1') click('Save')
+      if (params.get('scroll')) window.scrollTo(0, Number(params.get('scroll')))
+    }, 100)
+  }, 600)
   if (params.get('page') === 'add') setTimeout(() => click('+ Add project'), 200)
   if (params.get('page') === 'all') setTimeout(() => click('All'), 200)
 </script>
