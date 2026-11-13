@@ -11,7 +11,7 @@ export const GROUPS: { id: Group; label: string }[] = [
   { id: 'active', label: 'Working' },
   { id: 'waiting', label: 'Awaiting CI' },
   { id: 'ready', label: 'Ready / merging' },
-  { id: 'quiet', label: 'Idle' },
+  { id: 'quiet', label: 'Draft / idle' },
   { id: 'done', label: 'Merged / closed' }
 ]
 
@@ -125,10 +125,13 @@ export function concurrency(tracks: readonly TrackView[], s: Scale, now: number,
   return out
 }
 
-/** Tracks per board group, keeping the engine's order inside each group. */
-export function byGroup(tracks: readonly TrackView[]): { group: Group; label: string; tracks: TrackView[] }[] {
+/**
+ * Tracks per board group, keeping the engine's order inside each group. With `all`, empty groups
+ * stay too: the board always shows the whole pipeline, so a lane's place never moves.
+ */
+export function byGroup(tracks: readonly TrackView[], all = false): { group: Group; label: string; tracks: TrackView[] }[] {
   return GROUPS.map((g) => ({ group: g.id, label: g.label, tracks: tracks.filter((t) => groupOf(t.lane) === g.id) })).filter(
-    (g) => g.tracks.length > 0
+    (g) => all || g.tracks.length > 0
   )
 }
 

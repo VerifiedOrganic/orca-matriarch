@@ -58,5 +58,8 @@ test('ticks fall on round local times', () => {
 test('board groups keep lane priority and counts', () => {
   const tracks = [track('x', [], 'ready'), track('y', [], 'needs-you'), track('z', [], 'fixing-ci')]
   assert.deepEqual(byGroup(tracks).map((g) => g.group), ['blocked', 'fixing', 'ready'])
+  // The board asks for every lane, empty ones included, in the same order.
+  assert.deepEqual(byGroup(tracks, true).map((g) => g.group), ['blocked', 'fixing', 'review', 'active', 'waiting', 'ready', 'quiet', 'done'])
+  assert.equal(byGroup(tracks, true).find((g) => g.group === 'review')?.tracks.length, 0)
   assert.equal(summary(tracks).blocked, 1)
 })

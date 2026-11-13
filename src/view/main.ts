@@ -427,7 +427,7 @@ function card(t: TrackView): HTMLElement {
       pr ? el('span', { class: 'pill', title: pr.failing.join(', ') }, `CI ${pr.ci}${pr.failing.length ? ` (${pr.failing.length})` : ''}`) : null,
       pr && pr.openThreads ? el('span', { class: 'pill' }, `${pr.openThreads} comment(s)`) : null,
       t.owner ? el('span', { class: 'pill', title: t.owner.supervised ? 'Supervised orchestration worker' : 'Agent without orchestration supervision' },
-        `${t.owner.agent ?? 'agent'}${t.owner.model ? ` · ${t.owner.model}` : ''} · ${t.owner.activity}`) : null,
+        `${t.owner.agent ?? 'worker'}${t.owner.model ? ` · ${t.owner.model}` : ''} · ${t.owner.activity}`) : null,
       t.review ? el('span', { class: 'pill' }, `review r${t.review.round} ${t.review.verdict ?? t.review.status}`) : null),
     el('div', { class: 'reason' }, t.reason),
     t.review && t.review.reviewers.length
@@ -488,8 +488,8 @@ function boardView(tracks: TrackView[]): HTMLElement {
   return el(
     'div',
     { class: 'columns' },
-    ...byGroup(tracks).map((g) =>
-      el('div', { class: 'column' },
+    ...byGroup(tracks, true).map((g) =>
+      el('div', { class: g.tracks.length ? 'column' : 'column empty' },
         el('h3', {}, el('span', { class: 'dot', style: `background:${COLOR[g.group]}` }), g.label, el('span', { class: 'muted' }, String(g.tracks.length))),
         ...g.tracks.map(card))
     )

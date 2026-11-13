@@ -150,6 +150,8 @@ select:disabled { opacity: .5; }
 .columns { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); align-items: start; }
 .column { background: color-mix(in srgb, var(--orca-muted) 60%, transparent); border-radius: var(--orca-radius, 6px); padding: 6px; display: flex; flex-direction: column; gap: 6px; }
 .column h3 { margin: 2px 2px 0; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+/* An empty lane stays in place, quieter, so the pipeline reads the same whatever is in it. */
+.column.empty { opacity: 0.55; }
 .card { background: var(--orca-card); color: var(--orca-card-foreground); border: 1px solid var(--orca-border); border-left: 3px solid var(--lane);
   border-radius: var(--orca-radius, 6px); padding: 6px 8px; display: flex; flex-direction: column; gap: 3px; }
 .card .top { display: flex; gap: 6px; align-items: baseline; }
