@@ -6,12 +6,14 @@ import type { JsonValue } from 'orca/host'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { AGENT_CATALOG, agentOptions, MODEL_LISTERS, parseModelList, type LiveModel } from './agents.ts'
 import { readModelCatalog, readOrcaProfile } from './orca-profile.ts'
-import { CONFIG_OFF_PATH, CONFIG_PATH, defaultConfig, parseConfig, validateConfig, type MatriarchConfig } from './config.ts'
+import { CONFIG_OFF_PATH, CONFIG_PATH, defaultConfig, forgeSettingOf, parseConfig, validateConfig, type ForgeSetting, type MatriarchConfig } from './config.ts'
 import { createCrew, launchedTerminal, type Crew } from './crew.ts'
 import { branchName, tick, type ActivityInfo, type EngineDeps, type RepoInfo, type Workspace } from './engine.ts'
 import { nodeExec, type Exec } from './exec.ts'
 import { createExecutor } from './executor.ts'
-import { createGitHub, parseGitHubRemote, repoKey, type GitHub, type PrSnapshot } from './github.ts'
+import { forgeTerms, gitlabRef, parseRemote, repoKey, type ForgeReader, type RepoRef } from './forge.ts'
+import { createGitHub, parseGitHubRemote, type GitHub, type PrSnapshot } from './github.ts'
+import { createGitLab } from './gitlab.ts'
 import { ledgerKey, loadLedger, record, roundsUsed } from './ledger.ts'
 import { createdTerminal, createOrcaCli, listWorkers, OrcaRefusal, OrcaUnavailable, type OrcaCli } from './orca-cli.ts'
 import { selectReviewers, type Activity, type Lane } from './plan.ts'
@@ -23,6 +25,7 @@ export interface WorkerOptions {
   orcaDataDir?: string
   exec?: Exec
   github?: GitHub
+  gitlab?: ForgeReader
   orcaCli?: OrcaCli
   now?: () => number
   /** Start polling on activate (tests turn it off and call board.refresh). */
@@ -126,29 +129,84 @@ export function statusText(board: Board): { text: string; tooltip: string; tone:
   return { text: board.autopilot ? text : `${text} (dry run)`, tooltip, tone }
 }
 
-export function createRepoResolver(exec: Exec): (path: string) => Promise<RepoInfo | null> {
-  const cache = new Map<string, Promise<RepoInfo | null>>()
+/** Why a project cannot be followed when its origin names no forge at all. */
+export const NO_FORGE = 'Its origin is not on GitHub or GitLab, so Matriarch cannot follow its pull requests.'
+
+/**
+ * The forge a remote is on. github.com is GitHub. Another host is GitLab when the project's own
+ * settings say so (also naming the host, for an ssh alias), or when glab is signed in to it.
+ * Otherwise the reason, with what to run.
+ */
+export async function detectForge(
+  url: string,
+  setting: ForgeSetting | null,
+  signedIn: (host: string) => Promise<boolean>
+): Promise<{ ref: RepoRef } | { problem: string }> {
+  // github.com is never a GitLab, unless the setting names the GitLab host that mirrors it.
+  const github = parseGitHubRemote(url)
+  if (github && !(setting?.kind === 'gitlab' && setting.host)) return { ref: github }
+  const remote = parseRemote(url)
+  if (!remote) return { problem: NO_FORGE }
+  if (setting?.kind === 'gitlab') return { ref: gitlabRef(setting.host ?? remote.host, remote.path) }
+  if (setting?.kind === 'github') return { problem: `Its settings say GitHub, but its origin is on ${remote.host}; Matriarch reads GitHub only on github.com.` }
+  if (await signedIn(remote.host)) return { ref: gitlabRef(remote.host, remote.path) }
+  return {
+    problem: `Its origin is on ${remote.host}, which is neither GitHub nor a GitLab host glab is signed in to. If it is a GitLab, run glab auth login --hostname ${remote.host}, then look again.`
+  }
+}
+
+/** Finds the project behind a workspace and the forge it is on; `problem` says why there is none. */
+export interface RepoResolver {
+  (path: string): Promise<RepoInfo | null>
+  problem(path: string): Promise<string | null>
+}
+
+export function createRepoResolver(exec: Exec, readText: (path: string) => Promise<string | null> = (p) => readFile(p, 'utf8').catch(() => null)): RepoResolver {
+  const cache = new Map<string, Promise<{ info: RepoInfo | null; problem: string | null }>>()
+  const hosts = new Map<string, Promise<boolean>>()
   const git = async (cwd: string, args: string[]) => {
     const res = await exec('git', ['-C', cwd, ...args], { timeoutMs: 15_000 })
     return res.code === 0 ? res.stdout.trim() : null
   }
-  return (path) => {
+  // Only glab's exit code is read: it signs in and keeps the token, and nothing it prints is kept.
+  const signedIn = (host: string): Promise<boolean> => {
+    let known = hosts.get(host)
+    if (!known) {
+      known = exec('glab', ['auth', 'status', '--hostname', host], { timeoutMs: 15_000 }).then((r) => r.code === 0, () => false)
+      hosts.set(host, known)
+    }
+    return known
+  }
+  /** The forge the project's own settings name, on or kept aside while it is off. */
+  const settingAt = async (root: string): Promise<ForgeSetting | null> => {
+    for (const file of [CONFIG_PATH, CONFIG_OFF_PATH]) {
+      const text = await readText(join(root, file))
+      if (text === null) continue
+      try {
+        return forgeSettingOf(JSON.parse(text))
+      } catch {
+        return null
+      }
+    }
+    return null
+  }
+  const lookup = (path: string) => {
     let hit = cache.get(path)
     if (!hit) {
       hit = (async () => {
         const common = await git(path, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
         const url = await git(path, ['config', '--get', 'remote.origin.url'])
-        if (!common || !url) return null
-        const ref = parseGitHubRemote(url)
-        if (!ref) return null
+        if (!common || !url) return { info: null, problem: NO_FORGE }
         // A worktree's common dir is the main checkout's .git; a bare repository has no checkout.
         const root = basename(common) === '.git' ? dirname(common) : path
-        return { ref, key: repoKey(ref), root }
+        const found = await detectForge(url, await settingAt(root), signedIn)
+        return 'ref' in found ? { info: { ref: found.ref, key: repoKey(found.ref), root }, problem: null } : { info: null, problem: found.problem }
       })()
       cache.set(path, hit)
     }
     return hit
   }
+  return Object.assign((path: string) => lookup(path).then((r) => r.info), { problem: (path: string) => lookup(path).then((r) => r.problem) })
 }
 
 export function createWorker(options: WorkerOptions = {}) {
@@ -163,7 +221,11 @@ export function createWorker(options: WorkerOptions = {}) {
       ))
     const now = options.now ?? Date.now
     const cli = options.orcaCli ?? createOrcaCli(exec)
-    const github = options.github ?? createGitHub(exec, now)
+    // One client per forge reads and acts, so GitHub's change probes are shared by both.
+    const githubForge = createGitHub(exec, now)
+    const gitlabForge = createGitLab(exec, now)
+    const github = options.github ?? githubForge
+    const gitlab = options.gitlab ?? gitlabForge
     const activity = new ActivityTracker()
     const lockdown = createLockdown(now, { get: (k) => orca.storage.get(k), set: (k, v) => orca.storage.set(k, v) })
     const crew =
@@ -285,6 +347,7 @@ export function createWorker(options: WorkerOptions = {}) {
         }
       },
       github,
+      gitlab,
       // Failures surface to the engine, which then sends nothing to workers rather than guess.
       workers: () => listWorkers(cli),
       activity: (id, path) => activity.forWorkspace(id, now(), path),
@@ -327,6 +390,7 @@ export function createWorker(options: WorkerOptions = {}) {
         exec,
         orca: cli,
         crew,
+        forges: { github: githubForge, gitlab: gitlabForge },
         mailbox: (ctx) => mailboxFor(ctx.pr.repo, ctx.root),
         notify: async (title, body) => {
           await orca.host.call('notifications.show', { title, body })
@@ -352,8 +416,8 @@ export function createWorker(options: WorkerOptions = {}) {
           const next = await exclusive(async () => tick(deps, { autopilot: await isOn(), stillOn: isOn }))
           // Orca accepts only plain JSON from a worker: drop undefined fields once, here.
           board = JSON.parse(JSON.stringify(next)) as Board
-          // Back off while Orca or GitHub keeps failing (rate limits included), not only when the board is empty.
-          const trouble = (board.errors.length > 0 && board.tracks.length === 0) || board.repos.some((r) => r.errors.some((e) => e.startsWith('GitHub:')))
+          // Back off while Orca or a forge keeps failing (rate limits included), not only when the board is empty.
+          const trouble = (board.errors.length > 0 && board.tracks.length === 0) || board.repos.some((r) => r.errors.some((e) => /^(GitHub|GitLab):/.test(e)))
           failures = trouble ? failures + 1 : 0
           postBoard(board)
           const s = statusText(board)
@@ -405,7 +469,7 @@ export function createWorker(options: WorkerOptions = {}) {
       if (timer) clearTimeout(timer)
       void (async () => {
         const base = ms ?? (await pollSeconds()) * 1000
-        // Back off while ticks keep failing (Orca or GitHub unreachable), up to 10 minutes.
+        // Back off while ticks keep failing (Orca, GitHub or GitLab unreachable), up to 10 minutes.
         const delay = ms ?? Math.min(base * 2 ** Math.min(failures, 4), 600_000)
         timer = setTimeout(async () => {
           await runTick()
@@ -442,7 +506,7 @@ export function createWorker(options: WorkerOptions = {}) {
     orca.panels.handle('supervisor.start', async ({ repo, objective }) => {
       const repoView = board.repos.find((r) => r.repo === repo)
       if (!repoView) return { started: false, message: `${repo} has not opted in (no ${CONFIG_PATH})` }
-      if (repoView.empty) return { started: false, message: 'This project has no commits on GitHub yet. Push a first commit to main, then start the supervisor.' }
+      if (repoView.empty) return { started: false, message: `This project has no commits on ${forgeTerms(repoView.forge).name} yet. Push a first commit to main, then start the supervisor.` }
       const cfg = await deps.readConfig(repoView.root)
       if (!cfg) return { started: false, message: `${CONFIG_PATH} is missing` }
       // The base branch PRs target: origin's HEAD, else main.
@@ -450,7 +514,8 @@ export function createWorker(options: WorkerOptions = {}) {
       const base = head.code === 0 && head.stdout.trim().startsWith('origin/') ? head.stdout.trim().slice('origin/'.length) : 'main'
       const tag = supervisorTag(repo, now().toString(36))
       const sup = cfg.config.supervisor
-      const brief = supervisorBrief({ repo, root: repoView.root, objective: objective ?? '', tag, base, config: cfg.config })
+      const ref = (await repoOf(repoView.root).catch(() => null))?.ref
+      const brief = supervisorBrief({ repo, root: repoView.root, objective: objective ?? '', tag, base, config: cfg.config, forge: repoView.forge, host: ref?.host })
       let receipt: unknown
       try {
         receipt = await cli.run(supervisorLaunchArgs(sup, repoView.root, brief, 'chat'))
@@ -486,7 +551,7 @@ export function createWorker(options: WorkerOptions = {}) {
     })
 
     // A review round on demand, in dry run too: the crew runs and the board shows its verdict;
-    // sending findings to a worker or posting to GitHub still waits for autopilot.
+    // sending findings to a worker or posting on the PR still waits for autopilot.
     orca.panels.handle('review.start', async ({ repo, number }) => {
       const repoView = board.repos.find((r) => r.repo === repo)
       if (!repoView) return { started: false, message: `${repo} has not opted in (no ${CONFIG_PATH})` }
@@ -577,6 +642,8 @@ export function createWorker(options: WorkerOptions = {}) {
     })
 
     orca.panels.handle('projects.list', async () => {
+      // Each look starts afresh, so a GitLab host glab was signed in to since then shows up.
+      repoOf = createRepoResolver(exec)
       const listed = (await cli.run(['repo', 'list'])) as { repos?: { path?: unknown; displayName?: unknown }[] }
       const projects: ProjectInfo[] = []
       for (const r of listed.repos ?? []) {
@@ -584,7 +651,7 @@ export function createWorker(options: WorkerOptions = {}) {
         const info = await repoOf(r.path).catch(() => null)
         const root = info?.root ?? r.path
         let problem: string | null = null
-        if (!info) problem = 'Its origin is not on GitHub, so Matriarch cannot follow its pull requests.'
+        if (!info) problem = (await repoOf.problem(r.path).catch(() => null)) ?? NO_FORGE
         else if ((await exec('git', ['-C', root, 'rev-parse', '--verify', '--quiet', 'HEAD'], { timeoutMs: 10_000 })).code !== 0) {
           problem = 'It has no commits yet. Commit and push a first version to main before starting a supervisor.'
         }
@@ -595,7 +662,7 @@ export function createWorker(options: WorkerOptions = {}) {
 
     orca.panels.handle('project.enable', async ({ root }) => {
       const info = await repoOf(root).catch(() => null)
-      if (!info) return { ok: false, message: 'Its origin is not on GitHub, so Matriarch cannot follow its pull requests.', repo: null }
+      if (!info) return { ok: false, message: (await repoOf.problem(root).catch(() => null)) ?? NO_FORGE, repo: null }
       const on = join(info.root, CONFIG_PATH)
       const off = join(info.root, CONFIG_OFF_PATH)
       if (!(await exists(on))) {
@@ -652,6 +719,8 @@ export function createWorker(options: WorkerOptions = {}) {
       const checked = validateConfig(config)
       if (checked.errors.length > 0) return { saved: false, errors: checked.errors, warnings: checked.warnings }
       await writeConfig(root, checked.config)
+      // The forge setting decides which forge the project is read from: look it up again.
+      repoOf = createRepoResolver(exec)
       await runTick()
       return { saved: true, errors: [], warnings: checked.warnings }
     })

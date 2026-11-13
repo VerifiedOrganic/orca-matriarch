@@ -3,6 +3,7 @@
 // reported, so one typo cannot switch the whole crew off.
 
 import { MODEL_AGENTS } from './agents.ts'
+import type { ForgeKind } from './forge.ts'
 import { LOCKABLE_AGENTS } from './lockdown.ts'
 
 export const CONFIG_PATH = '.orca/matriarch.json'
@@ -48,6 +49,17 @@ export interface ReviewerSpec extends RoleSpec {
   readOnly?: boolean
 }
 
+/**
+ * Where the project lives, when its origin alone does not say: GitLab on a host glab is not
+ * signed in to yet, or behind an ssh alias that hides the real host. Matriarch detects it
+ * otherwise (github.com is GitHub; another host is GitLab when glab is signed in to it).
+ */
+export interface ForgeSetting {
+  kind: ForgeKind
+  /** The forge's web host, such as gitlab.example.com; the origin's host when left out. */
+  host?: string
+}
+
 export interface FixPolicy {
   enabled: boolean
   maxRounds: number
@@ -55,6 +67,8 @@ export interface FixPolicy {
 
 export interface MatriarchConfig {
   version: 1
+  /** Set only to override what the origin says; see ForgeSetting. */
+  forge?: ForgeSetting
   supervisor: RoleSpec
   workers: { default: RoleSpec; tiers: Record<string, RoleSpec> }
   reviewers: ReviewerSpec[]
@@ -205,6 +219,34 @@ class Reader {
     return [...(v as string[])]
   }
 
+  /** The optional forge setting: github or gitlab, and for GitLab a bare host name. */
+  forge(v: unknown): ForgeSetting | undefined {
+    if (v === undefined || v === null) return undefined
+    if (!isObj(v)) {
+      this.errors.push('forge: expected an object with a kind, github or gitlab')
+      return undefined
+    }
+    this.unknownKeys(v, ['kind', 'host'], 'forge')
+    if (v.kind !== 'github' && v.kind !== 'gitlab') {
+      this.errors.push('forge.kind: expected one of github, gitlab')
+      return undefined
+    }
+    const setting: ForgeSetting = { kind: v.kind }
+    if (v.host !== undefined) {
+      const host = typeof v.host === 'string' ? v.host.trim().toLowerCase() : ''
+      if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:\d{1,5})?$/.test(host)) {
+        this.errors.push('forge.host: expected a host name such as gitlab.example.com, without https:// or a path')
+        return undefined
+      }
+      setting.host = host
+    }
+    if (setting.kind === 'github' && setting.host && setting.host !== 'github.com') {
+      this.errors.push('forge.host: Matriarch reads GitHub only on github.com')
+      return undefined
+    }
+    return setting
+  }
+
   role(v: unknown, path: string, fallback: RoleSpec | null): RoleSpec | null {
     if (v === undefined) return fallback
     if (v === null) return null
@@ -245,6 +287,13 @@ class Reader {
   }
 }
 
+/** A project file's forge setting, when it has a valid one; the rest of the file is not checked here. */
+export function forgeSettingOf(raw: unknown): ForgeSetting | null {
+  const r = new Reader()
+  const setting = isObj(raw) ? r.forge(raw.forge) : undefined
+  return setting && r.errors.length === 0 ? setting : null
+}
+
 export function parseConfig(text: string): ConfigResult {
   let raw: unknown
   try {
@@ -261,8 +310,9 @@ export function validateConfig(raw: unknown): ConfigResult {
   if (!isObj(raw)) {
     return { config: d, errors: [`${CONFIG_PATH}: expected a JSON object`], warnings: [] }
   }
-  r.unknownKeys(raw, ['version', 'supervisor', 'workers', 'reviewers', 'arbiter', 'review', 'fix', 'merge', 'escalation', 'limits'], 'config')
+  r.unknownKeys(raw, ['version', 'forge', 'supervisor', 'workers', 'reviewers', 'arbiter', 'review', 'fix', 'merge', 'escalation', 'limits'], 'config')
   if (raw.version !== undefined && raw.version !== 1) r.errors.push('config.version: only version 1 is supported')
+  const forge = r.forge(raw.forge)
 
   const supervisor = r.role(raw.supervisor, 'supervisor', d.supervisor) ?? d.supervisor
 
@@ -387,7 +437,7 @@ export function validateConfig(raw: unknown): ConfigResult {
   }
 
   return {
-    config: { version: 1, supervisor, workers: { default: workerDefault, tiers }, reviewers, arbiter, review, fix, merge, escalation, limits },
+    config: { version: 1, ...(forge ? { forge } : {}), supervisor, workers: { default: workerDefault, tiers }, reviewers, arbiter, review, fix, merge, escalation, limits },
     errors: r.errors,
     warnings: r.warnings
   }

@@ -1,11 +1,12 @@
-// Carries out planned actions with the orca CLI and the project's forge (gh for GitHub). Only
-// runs when autopilot is on. Merges are pinned to the head commit that passed the gate and never
-// bypass the forge's own rules (no --admin on GitHub).
+// Carries out planned actions with the orca CLI and the project's forge (gh for GitHub, glab for
+// GitLab). Only runs when autopilot is on. Merges are pinned to the head commit that passed the
+// gate and never bypass the forge's own rules (no --admin on GitHub).
 import type { MatriarchConfig } from './config.ts'
 import type { Crew } from './crew.ts'
 import type { Exec } from './exec.ts'
 import { forgeKind, forgeTerms, type ForgeActions, type ForgeKind, type Outcome, type RepoRef } from './forge.ts'
 import { createGitHub, type PrSnapshot } from './github.ts'
+import { createGitLab } from './gitlab.ts'
 import { ciFailureMessage, commentsMessage, escalationMessage, rebaseMessage, updateMessage } from './messages.ts'
 import { sendMessage, type OrcaCli } from './orca-cli.ts'
 import type { Action } from './plan.ts'
@@ -60,7 +61,8 @@ export interface ExecutorDeps {
   notify(title: string, body: string): Promise<void>
   crew?: Crew
   ghBin?: string
-  /** The forges' actions, by kind; GitHub's defaults to its own CLI (gh). */
+  glabBin?: string
+  /** The forges' actions, by kind; each defaults to its own CLI (gh, glab). */
   forges?: Partial<Record<ForgeKind, ForgeActions>>
   /**
    * Matriarch's own terminal in the project, to send orchestration mail from: Orca refuses a
@@ -73,6 +75,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
   // Each forge acts through its own CLI; the worker passes the same clients it reads with.
   const forges: Partial<Record<ForgeKind, ForgeActions>> = {
     github: createGitHub(deps.exec, Date.now, deps.ghBin ?? 'gh'),
+    gitlab: createGitLab(deps.exec, Date.now, deps.glabBin ?? 'glab'),
     ...deps.forges
   }
   /** The forge the project lives on. */
