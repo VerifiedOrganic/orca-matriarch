@@ -90,7 +90,7 @@
     arbiter: null,
     review: { enabled: true, trigger: 'ci-green', pass: 'all-blocking-approve', blockAt: 'major', differentProviderThanAuthor: true, maxRounds: 3, publish: 'orca-only', followUp: 'focused', fallback: role('claude', 'claude-sonnet-5-5') },
     fix: { ci: { enabled: true, maxRounds: 3 }, comments: { enabled: true, maxRounds: 3 }, conflicts: { enabled: true, maxRounds: 2 } },
-    merge: { mode: 'manual', method: 'squash', requireHuman: [], updateBranch: 'rebase', onBaseRed: 'pause', deleteBranch: true, removeWorktree: true },
+    merge: { mode: 'manual', method: 'squash', requireHuman: [], updateBranch: 'rebase', onBaseRed: 'pause', deleteBranch: true, removeWorktree: true, removeFinishedWorktrees: true },
     escalation: { supervisorFirst: true, humanAfterMinutes: 30 }, limits: { maxConcurrentReviews: 2 }
   }
   const agent = (id, label, installed, lockable, models, efforts) => ({ id, label, installed, lockable, takesModel: true, efforts, defaultModel: models[0] ?? null, defaultEffort: null,
