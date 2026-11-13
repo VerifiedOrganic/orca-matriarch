@@ -41,9 +41,11 @@ export const CLAUDE_ALLOW: readonly string[] = [
 ]
 
 /**
- * Refused even when the person's own Claude settings allow them: changes, GitHub writes, the
- * web, and any command that reaches outside the worktree (an absolute path, the home folder, or
- * climbing out with ..), so a reviewer cannot read your files into a verdict that gets posted.
+ * Refused even when the person's own Claude settings allow them: changes, GitHub and GitLab
+ * writes, the web, and any command that reaches outside the worktree (an absolute path, the home
+ * folder, or climbing out with ..), so a reviewer cannot read your files into a verdict that gets
+ * posted. glab's write commands act on the current branch's merge request when given no number,
+ * so each is refused bare too.
  */
 export const CLAUDE_DENY: readonly string[] = [
   'Bash(* /*)', 'Bash(* "/*)', "Bash(* '/*)", 'Bash(*=/*)', 'Bash(*</*)', 'Bash(*< /*)',
@@ -52,7 +54,10 @@ export const CLAUDE_DENY: readonly string[] = [
   'Bash(git push *)', 'Bash(git push)', 'Bash(git commit *)', 'Bash(git reset *)', 'Bash(git checkout *)', 'Bash(git switch *)',
   'Bash(git rebase *)', 'Bash(git merge *)', 'Bash(git tag *)', 'Bash(git stash *)', 'Bash(git * --output*)',
   'Bash(gh pr merge *)', 'Bash(gh pr review *)', 'Bash(gh pr comment *)', 'Bash(gh pr close *)', 'Bash(gh pr edit *)',
-  'Bash(gh api *)', 'Bash(rm *)', 'WebFetch', 'WebSearch'
+  'Bash(gh api *)',
+  ...['merge', 'create', 'update', 'note', 'approve', 'revoke', 'close', 'reopen', 'rebase', 'delete'].flatMap((w) => [`Bash(glab mr ${w} *)`, `Bash(glab mr ${w})`]),
+  ...['run', 'retry', 'cancel', 'delete', 'trigger'].flatMap((w) => [`Bash(glab ci ${w} *)`, `Bash(glab ci ${w})`]),
+  'Bash(glab api *)', 'Bash(rm *)', 'WebFetch', 'WebSearch'
 ]
 
 /** Codex config overrides that pin its sandbox shut, whatever ~/.codex/config.toml says. */

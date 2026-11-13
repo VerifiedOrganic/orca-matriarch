@@ -125,3 +125,21 @@ test('a launch record outlives a reload of the plugin', async () => {
   assert.equal(await after.recall('/wt/review-51', 'codex', 5_000), 'codex-sandbox')
   assert.equal(await after.recall('/wt/review-51', 'codex', 5_001), null, 'an older launch does not confirm a newer one')
 })
+
+describe('GitLab writes are refused like GitHub ones', () => {
+  test('glab mr and ci writes, with or without a number, and glab api', async () => {
+    for (const rule of [
+      'Bash(glab mr merge *)', 'Bash(glab mr merge)', 'Bash(glab mr create *)', 'Bash(glab mr update *)', 'Bash(glab mr note *)',
+      'Bash(glab mr approve *)', 'Bash(glab mr close *)', 'Bash(glab mr rebase *)', 'Bash(glab mr rebase)',
+      'Bash(glab api *)', 'Bash(glab ci run *)', 'Bash(glab ci retry *)', 'Bash(glab ci cancel *)'
+    ]) {
+      assert.ok(CLAUDE_DENY.includes(rule), rule)
+    }
+    assert.ok(!CLAUDE_ALLOW.some((r) => r.includes('glab')), 'nothing of glab is allowed outright')
+    // They reach Claude as one word of the deny list, and a real shell agrees.
+    const out = rewritten('claude', `claude --dangerously-skip-permissions ${q(PROMPT)}`)
+    const words = argv(out)
+    assert.equal(words[words.indexOf('--disallowedTools') + 1], CLAUDE_DENY.join(' '))
+    assert.deepEqual(await shellArgv(out, 'claude'), words.slice(1))
+  })
+})

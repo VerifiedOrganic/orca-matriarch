@@ -21,7 +21,7 @@ const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
 const VERDICT_DIR = '.matriarch/review/'
 const DENY_WRITE = 'Matriarch reviewers are read-only: write only your verdict file, .matriarch/review/<sha>/<your name>.json.'
-const DENY_SHELL = 'Matriarch reviewers are read-only: only read-only commands (git diff/log/show, grep, cat, ls, gh pr view/diff) are allowed here.'
+const DENY_SHELL = 'Matriarch reviewers are read-only: only read-only commands (git diff/log/show, grep, cat, ls, gh pr view/diff, glab mr view/diff) are allowed here.'
 const DENY_OUTSIDE = 'Matriarch reviewers read only this worktree: use paths relative to it (no absolute paths, ~, $HOME or .. out of it).'
 
 /** Is `file` (absolute or relative to `root`) a verdict file inside the review worktree `root`? */
@@ -129,20 +129,36 @@ function gitAllowed(args: string[]): boolean {
   return false
 }
 
+/** `gh api` and `glab api` reads: no method other than GET, and no fields or body (those make it a POST). */
+function apiReadOnly(args: string[]): boolean {
+  for (let i = 1; i < args.length; i++) {
+    const x = args[i]
+    if ((x === '-X' || x === '--method') && (args[i + 1] ?? '').toUpperCase() !== 'GET') return false
+    if (/^--method=/.test(x) && x.slice(9).toUpperCase() !== 'GET') return false
+    if (['-f', '-F', '--field', '--raw-field', '--input'].includes(x) || /^-[fF]./.test(x)) return false
+  }
+  return true
+}
+
 function ghAllowed(args: string[]): boolean {
   const [a, b] = args
   if (a === 'pr' || a === 'issue' || a === 'run' || a === 'repo') return ['view', 'diff', 'checks', 'list', 'status'].includes(b)
-  if (a === 'api') {
-    // Reads only: no method other than GET, and no fields or body (those make it a POST).
-    for (let i = 1; i < args.length; i++) {
-      const x = args[i]
-      if ((x === '-X' || x === '--method') && (args[i + 1] ?? '').toUpperCase() !== 'GET') return false
-      if (/^--method=/.test(x) && x.slice(9).toUpperCase() !== 'GET') return false
-      if (['-f', '-F', '--field', '--raw-field', '--input'].includes(x) || /^-[fF]./.test(x)) return false
-    }
-    return true
-  }
+  if (a === 'api') return apiReadOnly(args)
   return false
+}
+
+/** glab's read-only commands; `ci view` is left out, as its screen can run and retry jobs. */
+const GLAB_READ: Record<string, readonly string[]> = {
+  mr: ['view', 'diff', 'list'],
+  issue: ['view', 'list'],
+  ci: ['status', 'list', 'get', 'trace'],
+  repo: ['view']
+}
+
+function glabAllowed(args: string[]): boolean {
+  const [a, b] = args
+  if (a === 'api') return apiReadOnly(args)
+  return Object.hasOwn(GLAB_READ, a) && GLAB_READ[a].includes(b)
 }
 
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
@@ -223,6 +239,7 @@ function segmentAllowed(segment: string, root: string | null): boolean {
   const [cmd, ...args] = w
   if (cmd === 'git') return gitAllowed(args)
   if (cmd === 'gh') return ghAllowed(args)
+  if (cmd === 'glab') return glabAllowed(args)
   if (cmd === 'sed') return !args.some((a) => a === '-i' || a.startsWith('-i') || a === '--in-place' || a.startsWith('--in-place') || /(^|[;{])\s*[wW]\s/.test(a))
   if (cmd === 'awk') return !args.some((a) => /system\s*\(|print[^|]*>|\|\s*"/.test(a))
   if (cmd === 'find') return !args.some((a) => ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprintf', '-fls'].includes(a))

@@ -113,3 +113,38 @@ test('calls outside a review worktree are untouched, whatever they do', () => {
   assert.equal(reviewGuard({ tool: 'Edit', workspaceId: null, input: { file_path: '/wt/login/src/a.ts' } }, guard), null)
   assert.ok(!isReadOnlyShell('git push', null))
 })
+
+describe('shell: glab writes from a review are refused', () => {
+  for (const cmd of [
+    'glab mr merge 12',
+    'glab mr merge',
+    'glab mr note 12 -m "looks good"',
+    'glab mr approve 12',
+    'glab mr update 12 --ready',
+    'glab mr rebase 12',
+    'glab mr checkout 12',
+    'glab ci retry 4711',
+    'glab ci run',
+    'glab ci view',
+    'glab api -X PUT projects/g%2Fp/merge_requests/12/merge',
+    'glab api projects/g%2Fp/merge_requests/12/notes -f body=x',
+    "glab api graphql -f query='mutation { x }'",
+    'glab constructor x'
+  ]) {
+    test(cmd, () => assert.ok(bash(cmd), `should refuse: ${cmd}`))
+  }
+})
+
+describe('shell: what a reviewer reads with glab is allowed', () => {
+  for (const cmd of [
+    'glab mr view 12',
+    'glab mr view 12 --comments -F json',
+    'glab mr diff 12',
+    'glab ci status',
+    'glab ci trace 4711',
+    'glab api projects/g%2Fp/merge_requests/12/changes',
+    'glab api --hostname gitlab.example.com projects/g%2Fp/merge_requests/12/discussions'
+  ]) {
+    test(cmd, () => assert.equal(bash(cmd), null, `should allow: ${cmd}`))
+  }
+})
