@@ -6,7 +6,8 @@ agents in Orca:
 - a **supervisor** agent plans and delegates;
 - **workers** build each piece in their own worktree and open PRs;
 - a **review crew** of several reviewers, each on its own provider and model, reviews every PR;
-- a deterministic **engine** drives every PR through CI, review, fixes, conflicts and merge.
+- a deterministic **engine** drives every PR through CI, review, fixes, conflicts and merge, on
+  GitHub or GitLab (gitlab.com or self-hosted), where a PR is a merge request.
 
 It can run unattended.
 
@@ -51,6 +52,8 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
 ```jsonc
 {
   "version": 1,
+  // Optional: only when the origin does not say (see Forges). "host" defaults to the origin's.
+  "forge": { "kind": "gitlab", "host": "gitlab.example.com" },
   "supervisor": { "agent": "claude", "model": "claude-opus-5-5", "effort": "high" },
   "workers": {
     "default": { "agent": "codex", "model": "gpt-6-astra", "effort": "high" },
@@ -62,7 +65,7 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
   ],
   "arbiter": null,
   "review": { "enabled": true, "trigger": "ci-green", "pass": "all-blocking-approve", "blockAt": "major",
-              "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github" },
+              "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github" }, // "github": on the PR, GitLab too
   "fix": { "ci": { "enabled": true, "maxRounds": 3 }, "comments": { "enabled": true, "maxRounds": 3 },
            "conflicts": { "enabled": true, "maxRounds": 2 } },
   "merge": { "mode": "manual", "method": "squash", "requireHuman": [], "updateBranch": "rebase",
@@ -85,11 +88,12 @@ agent in the throwaway worktree.
 ```
             ┌─────────────── Orca desktop ───────────────┐
  you ──▶ Matriarch panel ──▶ engine (plugin worker, always on via status bar item)
-            │            │      ├─ GitHub poller (ETag probes; GraphQL list + detail on change)
+            │            │      ├─ forge per project: GitHub (ETag probes; GraphQL list + detail
+            │            │      │   on change) or GitLab (GraphQL list each tick; detail on change)
             │            │      ├─ owner index: PR branch → workspace → orchestration dispatch
             │            │      ├─ planner (pure): lane + next actions per PR
             │            │      ├─ ledger (plugin storage): what was done, rounds used
-            │            │      └─ executor: orca CLI / gh CLI / notifications
+            │            │      └─ executor: orca CLI / gh or glab CLI / notifications
             │            ▼
             │     supervisor agent ── orca orchestration worker-start ──▶ workers (own worktrees)
             │            ▲                                                      │ push + PR
@@ -159,7 +163,7 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   permission choice for:
   - **Claude:** `--permission-mode dontAsk`, an allowlist (read the worktree, read-only git,
     `cat`/`grep`/`rg`/`ls`, write only `.matriarch/review/**`) and a denylist (push, commit,
-    reset, merge, `gh` writes, `gh api`, `rm`, web). The denylist also refuses any command that
+    reset, merge, `gh` and `glab` writes, `gh api`, `glab api`, `rm`, web). The denylist also refuses any command that
     reaches outside the worktree: absolute paths (quoted or not, after `=` or `<`), `~`, `$HOME`,
     and `..` out of it. So a reviewer cannot read your files into a verdict that gets posted.
     Also `--setting-sources user`, so a PR's own `.claude/settings.json` cannot widen it while
@@ -193,8 +197,9 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
 - **Cross-provider rule.** With `differentProviderThanAuthor`, reviewers on the author's agent
   are skipped, unless that would leave no reviewer.
 - **Publishing** (`publish`).
-  - `github` (recommended): one combined comment review per round, with inline comments for
-    findings at or above `blockAt`. Each carries a `<!-- matriarch:... -->` marker so the engine
+  - `github` (recommended; the name predates GitLab and means "on the PR"): one combined comment
+    review per round, with inline comments for findings at or above `blockAt`. On GitLab, one
+    merge request note with those findings folded in. Each carries a `<!-- matriarch:... -->` marker so the engine
     can tell its own threads from human ones. It posts as you, so it can only be a comment
     review, never approve or request changes; orchestrator.inc has the same limit.
   - `orca-only`: findings stay in the panel and the worker message.
@@ -229,19 +234,21 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   - CI passing on the exact head commit;
   - review policy passed on that commit;
   - no unresolved human threads and no human "changes requested";
-  - GitHub reports it can merge;
+  - the forge reports it can merge;
   - no file matches `requireHuman`. If the file list was cut short, the gate assumes it does.
 - **Manual.** `ready`, plus one notification per commit.
 - **Auto: a merge train per base branch.**
   - Merges one PR at a time, in task order, then by PR number.
-  - Merges with `gh pr merge --<method> --match-head-commit <sha>`, so a change after review
-    can't be merged by mistake.
+  - Merges with `gh pr merge --<method> --match-head-commit <sha>` (on GitLab, `PUT
+    …/merge` with `sha`), so a change after review can't be merged by mistake.
   - Never uses `--admin`.
-  - A PR that is only behind its base gets `gh pr update-branch`. A PR with real conflicts goes
-    to its worker, then up the escalation ladder.
-  - Branch protection that needs a human (`BLOCKED`) leaves the PR in `needs-you`.
-- **Base branch health (built).** The cheap GitHub list query also reads the default branch's
-  CI rollup. While it is red, auto merges pause and the supervisor is asked to fix it forward
+  - A PR that is only behind its base gets `gh pr update-branch` (GitLab: `PUT …/rebase`, or a
+    message to its worker when `updateBranch` is `merge`). A PR with real conflicts goes to its
+    worker, then up the escalation ladder.
+  - Branch protection that needs a human (`BLOCKED`; on GitLab also missing approvals,
+    unresolved threads and other merge checks) leaves the PR in `needs-you`.
+- **Base branch health (built).** The cheap list query also reads the default branch's CI
+  rollup (GitLab: its latest pipeline, when that pipeline is for the branch's head). While it is red, auto merges pause and the supervisor is asked to fix it forward
   (or to find and revert the change, with `onBaseRed: "revert"`).
 - **After each merge.**
   - The other PRs are polled again: newly conflicting ones are sent back, clean ones are updated.
@@ -249,6 +256,121 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
     then fixes forward, or with `revert` Matriarch opens a revert PR (GitHub `revertPullRequest`).
 - **Cleanup.** The worker is released and its worktree removed (dirty worktrees are kept); the
   branch is deleted when `deleteBranch` is set.
+
+## Forges: GitHub and GitLab
+
+Code: `src/forge.ts` (the abstraction, each forge's names and agent commands, remote parsing),
+`src/github.ts` and `src/gitlab.ts`. Detection is `detectForge` in `src/worker.ts`.
+
+- **One snapshot.** Each forge reads a PR into the same `PrSnapshot`, so the planner never asks
+  which one it reads. A merge request carries `forge: "gitlab"`, which only picks the words and
+  commands in reasons, messages and briefs (`forgeTerms`).
+- **The interface.** A `Forge` reads (`listOpen`, `detail`) and acts (`merge`, `updateBranch`,
+  `publishReview`, `failedLogs`), and says which branch updates it can do itself (`updates`). The
+  engine reads through the project's forge, and the executor acts through it. GitHub's code moved
+  behind it unchanged: the same `gh` calls, arguments and error texts.
+- **Identity.** On GitHub a project is `{ owner, name }` as before. On GitLab it is
+  `{ kind: "gitlab", host, owner, name }`, where `owner` is the namespace with every nested group
+  (`group/sub`). Storage keys: GitHub's stay `owner/name`, since a live installation's state is
+  stored under them; GitLab's are `<host>/<path>` (`gitlab.example.com/group/sub/app`). These have
+  at least two slashes, so they can never be a GitHub key.
+- **Detection**, from the origin URL. https, `git@host:path` and `ssh://git@host:port/path` are
+  read; a trailing `.git` or `/` is dropped; an ssh port is dropped, an https port kept.
+  1. github.com is GitHub, exactly as before, unless the project's setting names a GitLab host.
+  2. `forge: { kind: "gitlab", host? }` in `.orca/matriarch.json` (Settings → Forge) makes it GitLab
+     on that host, or the origin's: for an ssh alias, or a host glab is not signed in to yet.
+  3. Otherwise `glab auth status --hostname <host>` decides. Only its exit code is read, once per
+     host per lookup; the project list looks again each time it opens.
+  4. Failing all three, the project list says the origin is on neither GitHub nor a GitLab host glab
+     is signed in to, and to run `glab auth login --hostname <host>`.
+
+### GitLab through glab
+
+Every call is `glab api --hostname <host> …`, so glab never guesses the host from a working folder
+and does the signing in. Matriarch never reads, prints or passes a token.
+
+- **No free polling.** GitLab sends ETags and answers `If-None-Match` with 304, but a 304 still
+  counts against its rate limit (checked on gitlab.com: `RateLimit-Observed` went up). The
+  simplest sound approach is one GraphQL query per project per tick. It reads:
+  - `currentUser`;
+  - the open merge requests (50 a page, up to 4 pages, newest update first), each with its
+    branches, `diffHeadSha`, `updatedAt`, author and `headPipeline { status }`;
+  - the default branch's name, its head (`repository.tree(ref:).lastCommit.sha`), and its latest
+    pipeline (`project.pipelines(ref:, first: 1)`).
+
+  A commit's own pipelines include other refs' (Duo workflow refs on gitlab.com), so the base is
+  judged by the branch's pipelines. Its name is kept per project: the first read asks with `HEAD`,
+  learns the name and reads again.
+- **Detail on change.** A merge request is read in full only when its head, `updatedAt` or pipeline
+  status moved, or its detail is older than 5 minutes (`QUIET_REFRESH_MS`, through the list's
+  `detailMaxAgeMs`): approvals and resolved threads may not move `updatedAt`. One GraphQL query
+  reads it; on gitlab.com it fits even the anonymous complexity limit.
+- **Lazy mergeability.** GitLab works out whether a merge request can merge only when asked, and a
+  GraphQL read does not ask: on gitlab.com merge requests stayed `UNCHECKED` across reads. While it
+  is unknown, the detail also reads the merge request over REST. GitLab rechecks on that read for
+  someone who may merge it (not verified: anonymous reads never trigger it).
+- **Mapping into PrSnapshot.**
+
+  | GitLab | PrSnapshot |
+  |---|---|
+  | head pipeline's jobs (`retried: false`) | checks. Failed is failure, or neutral when allowed to fail. Canceled is cancelled. A manual job is skipped when allowed to fail, else pending. Unfinished is pending. A bridge job has no log. When the list is cut short, the pipeline's status decides. |
+  | head pipeline's status | the list's rollup, in GitHub's words: failed is FAILURE, unfinished is PENDING |
+  | resolvable discussions | threads, resolved ones kept as resolved, path and line from the first note's position. Started by the viewer, or carrying `<!-- matriarch`, they are ours. System notes and plain comments are not resolvable and are left out. |
+  | a reviewer whose `reviewState` is `REQUESTED_CHANGES` | a `review:<user>` thread, like GitHub's "changes requested" review body |
+  | `diffStats` | files, cut short when `diffStatsSummary.fileCount` is larger |
+  | `approved`, `approvedBy`, reviewers, `NOT_APPROVED` | `reviewDecision`, as on GitHub. The gate reads the merge status below, not this. |
+  | the default branch's latest pipeline, when it is for the branch's head | the base rollup, for the red-base pause |
+  | `RateLimit-Remaining` and `-Reset` headers (`glab api -i`) | the board's budget, labelled GitLab when no GitHub project reports one. A self-hosted GitLab may send none. |
+
+  | `detailedMergeStatus` | mergeable | mergeStateStatus | so the planner |
+  |---|---|---|---|
+  | `mergeable` | MERGEABLE | CLEAN | marks it ready, or merges it |
+  | `conflict`, `broken_status` | CONFLICTING | DIRTY | sends the conflict to the worker |
+  | `need_rebase` | MERGEABLE | BEHIND | updates the branch |
+  | `draft_status` | MERGEABLE | DRAFT | treats it as a draft |
+  | `ci_must_pass`, `ci_still_running` | MERGEABLE | UNKNOWN | follows the jobs, and waits |
+  | `checking`, `unchecked`, `preparing`, `approvals_syncing` | UNKNOWN | UNKNOWN | waits, reading it again each tick |
+  | `not_approved`, `discussions_not_resolved`, `blocked_status`, `requested_changes`, and the other checks a person settles | MERGEABLE | BLOCKED | needs you |
+
+- **Actions.**
+  - Merge: `PUT …/merge_requests/:iid/merge` with `sha` (GitLab refuses when it is no longer the
+    head), `squash` (method `squash`) and `should_remove_source_branch` (`merge.deleteBranch`).
+    Methods `merge` and `rebase` both merge with the project's own merge method in GitLab.
+  - Update a branch that is behind: `PUT …/rebase`, which GitLab runs in the background, like
+    `gh pr update-branch`. GitLab has no API to merge the base into a branch, so with
+    `updateBranch: "merge"` the worker that owns the branch is asked to (the supervisor when none
+    does).
+  - Review: one note (`POST …/notes`), starting with `<!-- matriarch:review … -->`, with the
+    blocking findings folded in. A plain note is not a resolvable thread, so it never blocks "every
+    thread resolved".
+  - CI logs: `projects/<project>/jobs/:id/trace`, from the project the job ran in, taken from its
+    page (a fork's pipeline runs in the fork). Section markers, redrawn lines and runner timestamps
+    are dropped.
+- **Agent commands.** `glab mr create --target-branch <base> --fill --yes`, `glab mr view <n> -F
+  json` and `glab mr update <n> --ready`. A worker resolves a thread with `discussionToggleResolve`
+  through `glab api graphql`. A GitLab brief also says the project is on GitLab and that a PR there
+  is a merge request.
+- **Reviewer lockdown.** The Claude denylist adds `glab mr
+  merge|create|update|note|approve|revoke|close|reopen|rebase|delete` and `glab ci
+  run|retry|cancel|delete|trigger`, each bare too (glab acts on the current branch's merge request
+  without a number), and `glab api`. The tool guard allows only `glab mr view|diff|list`, `glab
+  issue view|list`, `glab ci status|list|get|trace`, `glab repo view` and GET-only `glab api`, as
+  for gh. `glab ci view` is refused: its screen can run and retry jobs.
+- **Checked against gitlab.com (2026-11-13)** with anonymous GET requests on public projects
+  (gitlab-org/gitlab-runner):
+  - the REST merge request list, a single merge request, pipelines and jobs;
+  - the GraphQL list and detail queries above: their field names, `iid` as a string, `gid://`
+    ids, diff notes' `position`, `bot` on authors, `retried` on jobs, `reviewState`, and
+    `project: null` for a project it cannot see;
+  - rate-limit headers on REST and GraphQL, and a 304 counting against them;
+  - that a head pipeline may run in a fork.
+
+  **Not verified:**
+  - job traces (gitlab.com answers 401 without signing in) and `currentUser`;
+  - merge, rebase, notes, approvals and the REST mergeability recheck;
+  - `--hostname` with a port;
+  - anything on a self-hosted GitLab. An older one lacks some of these GraphQL fields
+    (`detailedMergeStatus`, `reviewState` among them), and the board then shows GitLab's error.
 
 ## Seeing the work
 
@@ -367,7 +489,7 @@ can be changed and checked without Orca.
 - Dry run is the default (`autopilot` setting off): the board shows what would happen and nothing is sent.
 - Per-repo opt-in: only repositories that commit `.orca/matriarch.json` are touched.
 - Only PRs whose head branch belongs to an Orca workspace and whose author is the signed-in
-  `gh` user are managed.
+  `gh` (or, on GitLab, `glab`) user are managed.
 - Merges are checked against the commit that was reviewed, never bypass branch protection, and
   stop for protected paths.
 - Round caps on every loop.
@@ -386,7 +508,7 @@ can be changed and checked without Orca.
 - A reviewer that hits its account's usage limit, or a rate-limit menu, shows as **Needs you**
   with **Open** and **Restart**: switch the account or add credits, then restart it. The other
   reviewers keep their verdicts.
-- When Orca's worker list or GitHub cannot be read, nothing is sent to workers, nothing is
+- When Orca's worker list or the forge cannot be read, nothing is sent to workers, nothing is
   escalated as orphaned, and the timeline keeps its last known state.
 
 ## Orca integration
@@ -405,9 +527,10 @@ can be changed and checked without Orca.
   - `orca orchestration worker-list | send | run-create | worker-start`
   - `orca worktree create | rm`, `orca agent launch`
   - `gh api graphql`, `gh api -X HEAD -i` (change probes), `gh pr merge | update-branch`
+  - `glab auth status --hostname`, `glab api --hostname <host> graphql | projects/…` (see Forges)
 
-The plugin runs `orca`, `gh` and `git` with your user's access, so a person approves it as a
-full-access plugin. The README lists every command it runs.
+The plugin runs `orca`, `gh`, `glab` and `git` with your user's access, so a person approves it as
+a full-access plugin. The README lists every command it runs.
 
 ### Verified live (Orca 1.4.255, 2026-11-10)
 
@@ -467,6 +590,7 @@ lockdown was checked live (2026-11-10, Claude Code 2.1.322, Codex 0.167.0):
   `cat "/etc/hosts"`, `cat '/etc/hosts'`, `cat </etc/hosts`, `grep --file=/etc/hosts`,
   `cat "../x"`, `cat ~/x`, `cat $HOME/x` and `cat src/../../x` were refused. `grep -rn`,
   `git log`, a pipe and the verdict write ran. Claude parsed all 39 deny rules without a warning.
+  (The 31 `glab` rules added with GitLab support have not been run through Claude yet.)
 
 ### Tuned after the first long run on a real project (2026-11-12)
 
@@ -530,6 +654,7 @@ lockdown was checked live (2026-11-10, Claude Code 2.1.322, Codex 0.167.0):
 - Live on ctxmesh: an idle tick is 6 probes, ~0.8 s, no GraphQL, no rate limit. The old poller
   spent a GraphQL list every 45 s (80 an hour per repository) plus every PR's detail every 5
   minutes.
+- GitLab has no such free check: see [Forges](#forges-github-and-gitlab).
 
 ### Still unknown (needs a supervised worker)
 

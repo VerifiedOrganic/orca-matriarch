@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **GitLab**, on gitlab.com or a GitLab of your own, through `glab`: merge requests go through the
+  same CI, review comments, conflicts, AI review and merge as GitHub PRs. github.com is GitHub;
+  another host is GitLab when glab is signed in to it, or when the project's settings say so
+  (Settings → Forge). Reviewers are kept from glab's writes as they are from gh's.
+
 ## 0.1.0
 
 The first release.

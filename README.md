@@ -4,9 +4,10 @@
 
 A supervisor for your pod of coding agents in [Orca](https://www.onorca.dev). You tell a
 supervisor agent what to build; it plans the work and starts workers, each in its own worktree,
-on the agents and models you picked. Matriarch then drives every PR they open through CI, review
-comments, conflicts, an AI review by a crew of reviewers on several providers, fixes, and merge,
-and shows all of it on one timeline.
+on the agents and models you picked. Matriarch then drives every PR they open (a merge request,
+on GitLab) through CI, review comments, conflicts, an AI review by a crew of reviewers on several
+providers, fixes, and merge, and shows all of it on one timeline. Projects can be on GitHub, on
+gitlab.com, or on a GitLab of your own.
 
 It starts in **dry run**: it watches and shows what it would do until you turn on autopilot.
 
@@ -35,7 +36,9 @@ permission prompt for you: those show as **Needs you**.
 
 - Orca **1.4.257** or newer, with orchestration turned on (Settings → Experimental), so the
   supervisor can start and message workers.
-- The GitHub CLI, `gh`, signed in. Projects must be on GitHub.
+- For projects on GitHub: the GitHub CLI, `gh`, signed in. Only github.com (not GitHub Enterprise).
+- For projects on GitLab, gitlab.com or self-hosted: the GitLab CLI, `glab`, signed in to that
+  host (`glab auth login --hostname <host>`). glab keeps the token; Matriarch never sees it.
 - The agents you want to use, installed and signed in. Any agent Orca can start works as the
   supervisor or a worker; reviewers start read-only only on **Claude Code** and **Codex**.
 - `git`, and `sqlite3` to read your Orca settings (macOS includes it).
@@ -60,14 +63,18 @@ Either way Orca shows what it asks for (see [Permissions](#permissions)) and ask
 ## Get started
 
 1. Open the **Matriarch** panel in the right sidebar, or run **Matriarch: Show board**.
-2. Click **+ Add project**, then **Turn on** for a project open in Orca. It needs a GitHub origin
-   and at least one commit on its main branch; the list says when it does not.
+2. Click **+ Add project**, then **Turn on** for a project open in Orca. Its origin must be on
+   github.com, or on a GitLab host glab is signed in to, and it needs at least one commit on its
+   main branch; the list says when it does not, and what to run.
 3. In **Settings**, pick the agent, model and effort for the supervisor, the workers (plus any
    worker tiers, such as a cheaper one for small tasks) and each reviewer. Then **Save**. The
    agents offered are the ones turned on in your Orca settings and installed; the model box
    searches the models each agent offers you now.
 4. Click **Open supervisor chat** and tell it what to build.
 5. Watch the timeline in dry run. When you are happy with what it would do, **Turn on autopilot**.
+
+Matriarch finds the forge from the project's origin. For a GitLab behind an ssh alias, or one glab
+is not signed in to yet, pick it under **Forge** in Settings.
 
 Settings are saved in the project's `.orca/matriarch.json`, so you can commit them to share with
 your team. Nobody has to edit that file: every setting Matriarch uses is in **Settings**, and
@@ -111,7 +118,7 @@ model you choose; otherwise it shows the reviewer as **Needs you**.
 ## Permissions
 
 Matriarch is a **full-access** plugin (`trusted-worker`): its worker runs as you, on your
-machine, so Orca asks you to approve it on install. It needs that to run `git`, `gh` and `orca`,
+machine, so Orca asks you to approve it on install. It needs that to run `git`, `gh`, `glab` and `orca`,
 start agents and read their state. It asks Orca for these capabilities:
 
 - **Read workspaces** (`workspace:read`): lists your projects and worktrees, finds the workspace
@@ -124,7 +131,7 @@ start agents and read their state. It asks Orca for these capabilities:
   is in the background.
 - **Own storage** (`storage:own`): keeps each PR's history and review state in the plugin's own
   storage.
-- **Own settings** (`settings:own`): autopilot on or off, and how often it checks GitHub.
+- **Own settings** (`settings:own`): autopilot on or off, and how often it checks GitHub and GitLab.
 
 It also adds two **hooks** that apply only to agents launched in a review worktree:
 
@@ -134,7 +141,8 @@ It also adds two **hooks** that apply only to agents launched in a review worktr
     `--permission-mode dontAsk` is set with an allowlist (read and search inside the worktree,
     read-only `git` and shell commands, and writing only its own notes under
     `.matriarch/review/`) and a denylist (paths outside the worktree, `git push`/`commit`, `gh`
-    writes, `gh api`, `rm`, web fetches), plus `--setting-sources user --strict-mcp-config`.
+    and `glab` writes, `gh api`, `glab api`, `rm`, web fetches), plus `--setting-sources user
+    --strict-mcp-config`.
   - Codex: the bypass flags are removed and it runs with `--sandbox workspace-write
     --ask-for-approval never`, no network, no extra writable folders and no MCP servers.
   - Any other agent is refused as a reviewer unless you mark that reviewer **Run it without the
@@ -150,6 +158,7 @@ Supervisor and worker launches are not changed.
 | Command | When |
 |---|---|
 | `git -C <workspace> rev-parse …`, `git config --get remote.origin.url` | find the repository behind each workspace |
+| `glab auth status --hostname <host>` | an origin on a host other than github.com: whether it is a GitLab glab is signed in to (only the exit code is read) |
 | `gh api -X HEAD -i -H 'If-None-Match: …'` | each check: ask GitHub whether PRs, the default branch or followed checks changed (free when nothing did) |
 | `gh api graphql` | read open PRs, CI checks and review threads, when something changed |
 | `gh api repos/<repo>/actions/jobs/<id>/logs` | autopilot: the tail of a failed job's log, for the worker |
@@ -162,12 +171,18 @@ Supervisor and worker launches are not changed.
 | `gh api repos/<repo>/pulls/<n>/reviews` | autopilot, when **Where reviews go** includes the PR: one comment review per round |
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
 | `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
+| `glab api --hostname <host> graphql` | GitLab: each check, the open merge requests with their pipeline status and the default branch's; a merge request's jobs, threads, files and approvals when it changed |
+| `glab api --hostname <host> projects/<project>/merge_requests/<n>` | GitLab: only while it has not worked out whether a merge request can merge, which this read asks it to |
+| `glab api --hostname <host> projects/<project>/jobs/<id>/trace` | GitLab, autopilot: the tail of a failed job's log, for the worker |
+| `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
+| `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
+| `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | GitLab, autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `git -C <worktree> status --porcelain`, `orca worktree rm --delete-branch` | autopilot: remove a merged PR's worktree when nothing runs there and nothing is uncommitted |
 | `sqlite3 'file:…?mode=ro'` | read your Orca settings (below), read-only |
 | `opencode api model.list` | **Settings**: the models OpenCode offers you now, from every provider you signed in to |
 | `orca --version` | **Settings**: say when this Orca is not the one Matriarch was tested with |
 
-It never passes `--admin` and never bypasses branch protection.
+It never passes `--admin` and never bypasses branch protection or GitLab's merge checks.
 
 ### What it reads from Orca's own files
 
@@ -187,14 +202,27 @@ replace them.
 
 ### Network and data
 
-Matriarch talks to the network only through `gh`, to GitHub. It sends nothing anywhere else and
-has no telemetry. Each PR's history and review state stay in the plugin's own storage on your
-machine; each project's settings are in its `.orca/matriarch.json`; reviewers' notes are written
-in their throwaway worktree and removed with it.
+Matriarch talks to the network only through `gh`, to GitHub, and `glab`, to the GitLab hosts your
+projects are on. It sends nothing anywhere else and has no telemetry. Each PR's history and
+review state stay in the plugin's own storage on your machine; each project's settings are in its
+`.orca/matriarch.json`; reviewers' notes are written in their throwaway worktree and removed with
+it.
 
 ## Limits
 
-- GitHub only, and only PRs you opened from an Orca workspace's branch.
+- GitHub (github.com) and GitLab (gitlab.com or self-hosted), and only PRs you opened from an Orca
+  workspace's branch.
+- On GitLab:
+  - every check reads the open merge requests: GitLab has no free "nothing changed" answer, and
+    counts a 304 against its rate limit like any request;
+  - `merge.method` decides only whether to squash; the project's merge method in GitLab decides
+    the rest;
+  - GitLab cannot merge the base into a branch for Matriarch, so with **merge the base into it**
+    the worker is asked to;
+  - threads you start yourself count as notes to yourself, not as review feedback;
+  - checked against gitlab.com's API. Merging, rebasing, notes and approvals have not been run on
+    a real project yet, nor on a self-hosted GitLab (which needs one recent enough to have the
+    GraphQL fields Matriarch reads; DESIGN.md lists them).
 - Read-only reviewers on Claude Code and Codex only.
 - It relies on Orca's orchestration behaving as it does in 1.4.257, and on the files above.
   Settings says when you run a different Orca.
