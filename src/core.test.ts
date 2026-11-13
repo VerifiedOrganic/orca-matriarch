@@ -7,6 +7,7 @@ import { matchingGlobs } from './glob.ts'
 import { emptyHistory, noteLane, prune, windowed } from './history.ts'
 import { loadLedger } from './ledger.ts'
 import { createdTerminal, createOrcaCli, OrcaRefusal, OrcaUnavailable, parseWorkerList, sendMessage } from './orca-cli.ts'
+import { draftMessage } from './messages.ts'
 import { check, config, pr, SHA } from './testing/fixtures.ts'
 
 function fakeExec(reply: (file: string, args: readonly string[]) => Partial<ExecResult>) {
@@ -275,4 +276,10 @@ describe('executor', () => {
   test('log tails drop timestamps, colour and blank lines', () => {
     assert.equal(tailLog('2026-11-10T10:00:00.0000000Z a\n\n\u001b[1mb\u001b[0m\nc', 2), 'b\nc')
   })
+})
+
+test('asking the supervisor about a quiet draft is plain mail, not an escalation', () => {
+  const m = draftMessage(pr({ number: 4, title: 'P2' }), '#4 has been a draft for 15 min with nobody working on it.')
+  assert.equal(m.subject, 'acme/app #4 is still a draft')
+  assert.ok(!/stuck|decision|escalat/i.test(m.subject + m.body))
 })

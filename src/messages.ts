@@ -91,6 +91,14 @@ export function commentsMessage(pr: PrSnapshot, threads: readonly ThreadInfo[], 
   }
 }
 
+/** A draft nobody works on: a routine question for the supervisor, not a problem to decide. */
+export function draftMessage(pr: PrSnapshot, reason: string): Message {
+  return {
+    subject: `${pr.repo} #${pr.number} is still a draft`,
+    body: [`PR #${pr.number} "${pr.title}" (branch ${pr.headRef}, ${short(pr.headSha)}): ${reason}`, pr.url].join('\n')
+  }
+}
+
 export function escalationMessage(pr: PrSnapshot, reason: string): Message {
   return {
     subject: `Matriarch needs a decision on ${pr.repo} #${pr.number}`,
