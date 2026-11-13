@@ -164,7 +164,7 @@ function header(b: Board): HTMLElement {
       el('span', { class: 'dot', style: `background:${b.autopilot ? 'var(--m-ready)' : 'var(--m-waiting)'}` }),
       b.autopilot ? 'Autopilot' : 'Dry run'),
     toggle,
-    el('button', { class: 'ghost', title: 'Check GitHub and Orca now', disabled: state.busy, onclick: () => void request(async () => {
+    el('button', { class: 'ghost', title: `Check ${forgeNames(b)} and Orca now`, disabled: state.busy, onclick: () => void request(async () => {
       state.board = await orca.plugin.request('board.refresh')
     }) }, 'Refresh'),
     el('span', { class: 'muted', title: new Date(b.at).toLocaleString() }, `updated ${ago(Date.now() - b.at)} ago`)
@@ -172,6 +172,12 @@ function header(b: Board): HTMLElement {
 }
 
 const shortName = (repo: string): string => repo.split('/').pop() ?? repo
+
+/** What a project's forge is called: GitLab when the board says so, else GitHub. */
+const forgeOf = (r: RepoView | undefined): string => (r?.forge === 'gitlab' ? 'GitLab' : 'GitHub')
+const forgeName = (repo: string): string => forgeOf(state.board?.repos.find((r) => r.repo === repo))
+/** The forges the board's projects are on, as words: "GitHub", or "GitHub and GitLab". */
+const forgeNames = (b: Board): string => [...new Set(b.repos.length ? b.repos.map(forgeOf) : ['GitHub'])].join(' and ')
 
 /** The last project focus resolved to: the panel follows a change of it, not every event. */
 let followed: string | null = null
@@ -250,10 +256,10 @@ function chips(tracks: TrackView[], b: Board): HTMLElement {
       ? el('span', {
           class: 'pill muted',
           title: [
-            `GitHub API resets ${b.rate.resetAt}.`,
-            b.github ? `Last check: ${b.github.unchanged} project(s) unchanged (checked free, with conditional requests), ${b.github.read} read in full.` : ''
+            `${b.rate.forge ?? 'GitHub'} API resets ${b.rate.resetAt}.`,
+            b.github && !b.rate.forge ? `Last check: ${b.github.unchanged} GitHub project(s) unchanged (checked free, with conditional requests), ${b.github.read} read in full.` : ''
           ].filter(Boolean).join(' ')
-        }, `GitHub ${b.rate.remaining} left${b.github && b.github.read === 0 ? ' · no changes' : ''}`)
+        }, `${b.rate.forge ?? 'GitHub'} ${b.rate.remaining} left${b.github && !b.rate.forge && b.github.read === 0 ? ' · no changes' : ''}`)
       : null
   )
 }
@@ -418,7 +424,7 @@ function card(t: TrackView): HTMLElement {
     'div',
     { class: 'card', style: `--lane:${COLOR[lane.group]}` },
     el('div', { class: 'top' },
-      pr ? el('a', { title: 'Open the PR on GitHub', onclick: () => openPr(pr.url) }, `#${pr.number}`) : null,
+      pr ? el('a', { title: forgeName(t.repo) === 'GitLab' ? 'Open the merge request on GitLab' : 'Open the PR on GitHub', onclick: () => openPr(pr.url) }, `#${pr.number}`) : null,
       el('span', { class: 'name', title: pr?.title ?? t.workspace.name }, t.role === 'supervisor' ? 'Supervisor' : pr?.title || t.workspace.name)),
     // Without a PR the title already is the worktree's name, so it is not repeated here.
     el('div', { class: 'muted' }, el('a', { title: 'Open the worktree in Orca', onclick: () => openTrack(t) }, pr || t.role === 'supervisor' ? t.workspace.name : 'Open the worktree'), t.workspace.branch ? ` · ${t.workspace.branch}` : ''),
@@ -543,12 +549,12 @@ function supervisorCard(r: RepoView): HTMLElement {
       phase === 'running' ? el('span', { class: 'muted' }, `· ${s.workers} worker${s.workers === 1 ? '' : 's'}`) : null,
       el('span', { class: 'spacer' }),
       phase === 'idle'
-        ? el('button', { class: 'primary', disabled: state.busy || r.empty === true, title: r.empty ? 'Push a first commit to GitHub first' : 'Opens a briefed chat; nothing starts until you agree a plan there', onclick: openChat }, 'Open supervisor chat')
+        ? el('button', { class: 'primary', disabled: state.busy || r.empty === true, title: r.empty ? `Push a first commit to ${forgeOf(r)} first` : 'Opens a briefed chat; nothing starts until you agree a plan there', onclick: openChat }, 'Open supervisor chat')
         : el('button', { class: 'primary', onclick: reopen }, 'Open'),
       phase === 'idle' ? null : el('button', { class: 'ghost', disabled: state.busy, title: 'Start a fresh supervisor chat; Matriarch links the new one instead', onclick: openChat }, 'New chat')),
     el('div', { class: 'muted' },
       r.empty
-        ? 'This project has no commits on GitHub yet. Push a first commit to main, then start the supervisor.'
+        ? `This project has no commits on ${forgeOf(r)} yet. Push a first commit to main, then start the supervisor.`
         : phase === 'idle'
           ? 'Tell it what to build in its chat. It proposes a plan and starts workers only after you agree. Each worker opens a PR, and Matriarch takes it from there.'
           : phase === 'starting'

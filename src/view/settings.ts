@@ -163,6 +163,19 @@ const SEVERITY_LABEL: Record<Severity, string> = { blocker: 'blockers only', maj
 
 const FIX_LABEL = { ci: 'CI failures', comments: 'Review comments', conflicts: 'Conflicts' } as const
 
+/** Where the project lives: found from its origin unless set here, with a host for GitLab. */
+function forgeControls(d: MatriarchConfig, act: SettingsActions): HTMLElement {
+  return el('div', {},
+    field('Where it lives', select(d.forge?.kind ?? '', [['', 'found from its origin'], ['github', 'GitHub (github.com)'], ['gitlab', 'GitLab']], (v) => {
+      if (v === 'github' || v === 'gitlab') d.forge = { kind: v }
+      else delete d.forge
+      act.redraw()
+    }), 'github.com is GitHub. Another host is GitLab once glab is signed in to it (glab auth login --hostname <host>). Pick GitLab here for a host behind an ssh alias.'),
+    d.forge?.kind === 'gitlab'
+      ? field('GitLab host', textInput(d.forge.host ?? '', (v) => (d.forge = v.trim() ? { kind: 'gitlab', host: v.trim() } : { kind: 'gitlab' }), { placeholder: "the origin's host, e.g. gitlab.example.com" }), 'Its web address without https://. Left empty, the origin\'s host.')
+      : null)
+}
+
 /** Paths typed as a comma- or line-separated list. */
 const globList = (v: string): string[] => v.split(/[,\n]/).map((g) => g.trim()).filter(Boolean)
 
@@ -215,7 +228,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       }),
       d.review.fallback ? roleControls(s, d.review.fallback, act) : null,
       checkbox(d.review.differentProviderThanAuthor, 'Skip reviewers on the same agent that wrote the PR', (on) => (d.review.differentProviderThanAuthor = on)),
-      field('Where reviews go', select(d.review.publish, [['orca-only', 'stay in Orca'], ['github', 'also posted on the PR as a comment review']], (v) => (d.review.publish = v as typeof d.review.publish)))),
+      field('Where reviews go', select(d.review.publish, [['orca-only', 'stay in Orca'], ['github', 'also posted on the PR (a comment review on GitHub, a note on GitLab)']], (v) => (d.review.publish = v as typeof d.review.publish)))),
     section('Fixes',
       el('p', { class: 'muted hint' }, 'Sent to the worker that owns the branch, or to the supervisor once that worker has finished. After the last round, it escalates.'),
       fixRow('ci'), fixRow('comments'), fixRow('conflicts')),
@@ -224,16 +237,17 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       field('Tell you after', el('span', { class: 'inline' }, num(d.escalation.humanAfterMinutes, (n) => (d.escalation.humanAfterMinutes = n), 1, 24 * 60), el('span', { class: 'muted' }, ' minutes')), 'If the supervisor has not settled it by then.')),
     section('Merging',
       field('Who merges', select(d.merge.mode, [['manual', 'you: Matriarch marks PRs ready'], ['auto', 'Matriarch, once CI and review pass']], (v) => (d.merge.mode = v as typeof d.merge.mode))),
-      field('Merge method', select(d.merge.method, [['squash', 'squash'], ['merge', 'merge commit'], ['rebase', 'rebase']], (v) => (d.merge.method = v as typeof d.merge.method))),
-      field('When a PR falls behind', select(d.merge.updateBranch, [['rebase', 'rebase it onto the base'], ['merge', 'merge the base into it'], ['off', 'leave it']], (v) => (d.merge.updateBranch = v as typeof d.merge.updateBranch))),
+      field('Merge method', select(d.merge.method, [['squash', 'squash'], ['merge', 'merge commit'], ['rebase', 'rebase']], (v) => (d.merge.method = v as typeof d.merge.method)), "On GitLab: squash or not; the project's own merge method in GitLab decides the rest."),
+      field('When a PR falls behind', select(d.merge.updateBranch, [['rebase', 'rebase it onto the base'], ['merge', 'merge the base into it'], ['off', 'leave it']], (v) => (d.merge.updateBranch = v as typeof d.merge.updateBranch)), 'GitLab cannot merge the base in for Matriarch: the worker is asked to.'),
       field("When the base branch's CI is red", select(d.merge.onBaseRed, [
         ['pause', 'pause merges and ask for a fix'],
         ...(d.merge.onBaseRed === 'fix-forward' ? [['fix-forward', 'pause merges and ask for a fix forward'] as [string, string]] : []),
         ['revert', 'pause merges and ask to revert what broke it']
       ], (v) => (d.merge.onBaseRed = v as typeof d.merge.onBaseRed))),
       field('Paths that always need you to merge', textInput(d.merge.requireHuman.join(', '), (v) => (d.merge.requireHuman = globList(v)), { placeholder: 'e.g. migrations/**, .github/**' }), 'A PR that touches one waits for you, even when Matriarch merges.'),
-      checkbox(d.merge.deleteBranch, 'Delete the branch on GitHub once merged', (on) => (d.merge.deleteBranch = on)),
+      checkbox(d.merge.deleteBranch, 'Delete the branch on GitHub or GitLab once merged', (on) => (d.merge.deleteBranch = on)),
       checkbox(d.merge.removeWorktree, "Remove a PR's worktree once it merged (only when nothing runs there and nothing is uncommitted)", (on) => (d.merge.removeWorktree = on))),
+    section('Forge', forgeControls(d, act)),
     s.errors.length ? el('div', { class: 'callout' }, el('b', {}, 'Fix these to save'), el('ul', {}, ...s.errors.map((e) => el('li', {}, e)))) : null,
     s.warnings.length ? el('div', { class: 'callout warn' }, el('b', {}, 'Notes'), el('ul', {}, ...s.warnings.map((w) => el('li', {}, w)))) : null,
     el('div', { class: 'actions' },
