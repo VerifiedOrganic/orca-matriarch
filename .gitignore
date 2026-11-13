@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+
+# Orca's plugin typings (`pnpm types`) and `orca plugin shot` output
+.orca/
+
+# The preview's compiled view (`pnpm preview:build`)
+tools/preview/js/

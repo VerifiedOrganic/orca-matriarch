@@ -1,0 +1,149 @@
+{
+  "manifestVersion": 2,
+  "id": "matriarch",
+  "name": "Matriarch",
+  "version": "0.1.0",
+  "description": "A supervisor, workers and a read-only review crew across several models drive every PR through CI, review, fixes and merge. Starts in dry run.",
+  "author": {
+    "name": "VerifiedOrganic"
+  },
+  "repository": "https://github.com/VerifiedOrganic/orca-matriarch",
+  "license": "MIT",
+  "icon": "assets/icon.png",
+  "cover": {
+    "path": "assets/cover.png",
+    "alt": "Matriarch's sidebar in Orca: a running supervisor, PR counts by state, and a timeline of each worktree's work, beside the name and tagline."
+  },
+  "screenshots": [
+    {
+      "path": "assets/screenshot-1.png",
+      "alt": "The timeline across two projects: a row per worktree or PR, colored by state, under a strip counting what ran at once.",
+      "caption": "Every PR from first commit to merge, across your projects, on one timeline."
+    },
+    {
+      "path": "assets/screenshot-2.png",
+      "alt": "The board: PR cards grouped by state, with the agent and model on each, CI, rounds used, and what dry run would do next.",
+      "caption": "The board shows what each PR waits on, and in dry run what Matriarch would do next."
+    },
+    {
+      "path": "assets/screenshot-3.png",
+      "alt": "The sidebar beside its settings: supervisor, workers and a review crew, each with its own agent, model and effort.",
+      "caption": "Pick each role's agent, model and effort in Settings: no config files to edit."
+    }
+  ],
+  "engines": {
+    "orca": ">=1.4.257"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "workspace:write"
+    },
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "notifications:show"
+    },
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    }
+  ],
+  "contributes": {
+    "panels": [
+      {
+        "id": "board",
+        "title": "Matriarch",
+        "icon": "bot",
+        "entry": "src/view/main.ts",
+        "ui": "html"
+      }
+    ],
+    "customEditors": [
+      {
+        "id": "board",
+        "title": "Matriarch",
+        "extensions": [
+          ".matriarch"
+        ],
+        "entry": "src/view/main.ts",
+        "frame": "isolated"
+      }
+    ],
+    "newFiles": [
+      {
+        "id": "board",
+        "title": "Matriarch board",
+        "extension": ".matriarch",
+        "template": "assets/board.matriarch"
+      }
+    ],
+    "commands": [
+      {
+        "id": "showBoard",
+        "title": "Matriarch: Show board"
+      },
+      {
+        "id": "refresh",
+        "title": "Matriarch: Refresh now"
+      },
+      {
+        "id": "toggleAutopilot",
+        "title": "Matriarch: Turn autopilot on or off"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "summary",
+        "text": "Matriarch",
+        "icon": "bot",
+        "tooltip": "Matriarch: starting",
+        "command": "showBoard"
+      }
+    ],
+    "events": [
+      {
+        "on": "agent.status.changed"
+      },
+      {
+        "on": "workspace.created"
+      },
+      {
+        "on": "workspace.removed"
+      }
+    ],
+    "hooks": [
+      {
+        "event": "agent.tool.before"
+      },
+      {
+        "event": "agent.launch.before"
+      }
+    ],
+    "settings": [
+      {
+        "key": "autopilot",
+        "title": "Autopilot",
+        "type": "boolean",
+        "default": false,
+        "description": "Off: dry run, Matriarch watches and shows what it would do. On: it messages workers, updates branches and merges as each repository's .orca/matriarch.json allows."
+      },
+      {
+        "key": "pollSeconds",
+        "title": "GitHub poll interval (seconds)",
+        "type": "integer",
+        "default": 45,
+        "minimum": 15,
+        "maximum": 600
+      }
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "orca-matriarch",
+  "private": true,
+  "type": "module",
+  "description": "Development tooling for Matriarch. The repository root is the plugin: Orca installs every tracked file.",
+  "scripts": {
+    "types": "node scripts/orca-types.mjs",
+    "typecheck": "tsc -p .",
+    "test": "orca plugin test .",
+    "validate": "orca plugin validate .",
+    "binaries": "node scripts/check-binaries.mjs",
+    "verify": "pnpm typecheck && pnpm test && pnpm validate && pnpm binaries",
+    "preview:build": "tsc --ignoreConfig --outDir tools/preview/js --rootDir src --module esnext --target es2022 --moduleResolution bundler --allowImportingTsExtensions --rewriteRelativeImportExtensions --noCheck --skipLibCheck --types '' src/view/main.ts",
+    "preview": "pnpm preview:build && python3 -m http.server 8765 --bind 127.0.0.1 --directory tools/preview"
+  },
+  "config": {
+    "orcaVersion": "1.4.257"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "undici-types": "^8.12.4"
+  },
+  "packageManager": "pnpm@12.18.0"
+}

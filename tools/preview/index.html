@@ -1,0 +1,149 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* Stand-ins for Orca's theme variables (light), overridden for dark below. */
+  :root { --orca-background:#ffffff; --orca-foreground:#18181b; --orca-card:#ffffff; --orca-card-foreground:#18181b;
+    --orca-popover:#ffffff; --orca-primary:#2563eb; --orca-primary-foreground:#ffffff; --orca-secondary:#f4f4f5;
+    --orca-secondary-foreground:#18181b; --orca-muted:#f4f4f5; --orca-muted-foreground:#71717a; --orca-accent:#e4e4e7;
+    --orca-accent-foreground:#18181b; --orca-destructive:#dc2626; --orca-destructive-foreground:#ffffff;
+    --orca-border:#e4e4e7; --orca-input:#e4e4e7; --orca-ring:#a1a1aa; --orca-radius:6px; }
+  html.dark { --orca-background:#0b0b0e; --orca-foreground:#e4e4e7; --orca-card:#141418; --orca-card-foreground:#e4e4e7;
+    --orca-primary:#60a5fa; --orca-primary-foreground:#0b0b0e; --orca-secondary:#1c1c22; --orca-secondary-foreground:#e4e4e7;
+    --orca-muted:#1c1c22; --orca-muted-foreground:#a1a1aa; --orca-accent:#27272a; --orca-destructive:#f87171;
+    --orca-destructive-foreground:#0b0b0e; --orca-border:#27272a; --orca-input:#27272a; --orca-ring:#52525b; }
+</style>
+</head>
+<body>
+<script type="module">
+  const params = new URLSearchParams(location.search)
+  if (params.get('theme') === 'dark') document.documentElement.classList.add('dark')
+  // Emulates the right sidebar's width (Chrome will not make a window this narrow).
+  if (params.get('width')) document.body.style.width = `${params.get('width')}px`
+  const now = Date.now(), M = 60_000, H = 60 * M
+  // Builds segments from [lane, minutesAgoStart] steps; the last one stays open.
+  const segs = (steps) => steps.map(([lane, ago, reason], i) => ({
+    lane, from: now - ago * M, to: i + 1 < steps.length ? now - steps[i + 1][1] * M : null, reason: reason ?? lane }))
+  const mark = (kind, ago, label) => ({ kind, at: now - ago * M, label })
+  const track = (o) => ({ repo: 'acme/app', next: [], review: null, rounds: { ci: 0, conflicts: 0, comments: 0, reviews: 0 }, marks: [], ...o,
+    workspace: { id: o.key, name: o.key, branch: o.branch ?? `feature/${o.key}` } })
+  const board = {
+    ready: true, attention: [],
+    at: now - 12_000, autopilot: false, since: now - 24 * H, rate: { remaining: 4870, resetAt: '13:00' }, errors: [],
+    repos: [
+      { repo: 'acme/app', root: '/src/app', mergeMode: 'auto', supervisor: { agent: 'claude', model: 'claude-opus-5-5', run: 'run:r-41a', pending: false, terminal: null, workers: 3 }, errors: [], warnings: ['reviewers[2].model: Orca cannot pass --model to gemini; it will run its default model'] },
+      { repo: 'acme/infra', root: '/src/infra', mergeMode: 'manual', supervisor: { agent: 'claude', model: 'claude-opus-5-5', run: null, pending: false, terminal: null, workers: 0 }, errors: [], warnings: [] }
+    ],
+    tracks: [
+      track({ key: 'search-api', lane: 'needs-you', reason: 'conflicts with main; 2/2 rounds used, escalated to you',
+        pr: { number: 42, title: 'Search API pagination', url: '#', sha: 'b'.repeat(40), base: 'main', ci: 'passing', failing: [], openThreads: 0 },
+        owner: { agent: 'codex', model: 'gpt-6-astra', activity: 'done', supervised: true }, rounds: { ci: 1, conflicts: 2, comments: 0, reviews: 1 },
+        segments: segs([['building', 300], ['awaiting-ci', 215], ['fixing-ci', 200], ['awaiting-ci', 185], ['ai-review', 170], ['fixing-conflict', 120], ['awaiting-ci', 95], ['fixing-conflict', 70], ['needs-you', 40]]),
+        marks: [mark('push', 215, 'pushed'), mark('ci-sent', 200, 'CI failure sent (round 1)'), mark('review-start', 170, 'review round 1'), mark('rebase-sent', 120, 'rebase requested (round 1)'), mark('rebase-sent', 70, 'rebase requested (round 2)'), mark('escalate-supervisor', 55, 'escalated to supervisor'), mark('escalate-human', 40, 'escalated to you')] }),
+      track({ key: 'perf-audit', lane: 'needs-you', reason: 'the agent is waiting on input', pr: null,
+        owner: { agent: 'claude', model: 'claude-opus-5-5', activity: 'waiting', supervised: true },
+        segments: segs([['building', 150], ['needs-you', 25]]) }),
+      track({ key: 'settings-refactor', lane: 'fixing-ci', reason: 'CI failing on 9f2c1aa: test (ubuntu-latest); sending to the worker (round 2/3)',
+        next: ['send 1 failing check(s) to the worker (round 2)'],
+        pr: { number: 44, title: 'Refactor settings page', url: '#', sha: 'c'.repeat(40), base: 'main', ci: 'failing', failing: ['test (ubuntu-latest)'], openThreads: 0 },
+        owner: { agent: 'codex', model: 'gpt-6-astra', activity: 'done', supervised: true }, rounds: { ci: 1, conflicts: 0, comments: 0, reviews: 0 },
+        segments: segs([['building', 260], ['awaiting-ci', 160], ['fixing-ci', 145], ['working', 130], ['awaiting-ci', 100], ['fixing-ci', 20]]),
+        marks: [mark('push', 160, 'pushed'), mark('ci-sent', 145, 'CI failure sent (round 1)'), mark('push', 100, 'pushed')] }),
+      track({ key: 'billing-webhooks', lane: 'ai-review', reason: 'review round 1 running',
+        pr: { number: 43, title: 'Billing webhooks', url: '#', sha: 'd'.repeat(40), base: 'main', ci: 'passing', failing: [], openThreads: 0 },
+        owner: { agent: 'claude', model: 'claude-sonnet-5-5', activity: 'done', supervised: true },
+        review: { round: 1, status: 'running', reviewers: [{ name: 'correctness', agent: 'claude', model: 'claude-opus-5-5', status: 'running' }, { name: 'security', agent: 'codex', model: 'gpt-6-astra', status: 'done', verdict: 'approve', findings: 0 }] }, rounds: { ci: 0, conflicts: 0, comments: 0, reviews: 1 },
+        segments: segs([['building', 220], ['awaiting-ci', 80], ['ai-review', 35]]),
+        marks: [mark('push', 80, 'pushed'), mark('review-start', 35, 'review round 1 started')] }),
+      track({ key: 'oauth-login', lane: 'ready', reason: 'queued: another merge into main is in flight',
+        pr: { number: 41, title: 'Add OAuth login', url: '#', sha: 'e'.repeat(40), base: 'main', ci: 'passing', failing: [], openThreads: 0 },
+        owner: { agent: 'codex', model: 'gpt-6-astra', activity: 'done', supervised: true }, rounds: { ci: 1, conflicts: 0, comments: 1, reviews: 2 },
+        segments: segs([['building', 340], ['awaiting-ci', 250], ['fixing-ci', 238], ['awaiting-ci', 220], ['ai-review', 205], ['fixing-review', 185], ['working', 175], ['awaiting-ci', 150], ['ai-review', 135], ['ready', 110]]),
+        marks: [mark('ci-sent', 238, 'CI failure sent'), mark('review-start', 205, 'review round 1'), mark('comments-sent', 185, '4 findings sent'), mark('review-start', 135, 'review round 2')] }),
+      track({ key: 'docs-revamp', lane: 'building', reason: 'the agent is working; no PR yet', pr: null,
+        owner: { agent: 'grok', model: 'grok-4.7', activity: 'working', supervised: true },
+        segments: segs([['building', 90]]) }),
+      track({ key: 'flaky-test', lane: 'merged', reason: 'merged',
+        pr: { number: 39, title: 'Fix flaky checkout test', url: '#', sha: 'f'.repeat(40), base: 'main', ci: 'passing', failing: [], openThreads: 0 },
+        owner: { agent: 'codex', model: 'gpt-6-astra', activity: 'done', supervised: true }, rounds: { ci: 0, conflicts: 0, comments: 0, reviews: 1 },
+        segments: segs([['building', 330], ['awaiting-ci', 270], ['ai-review', 255], ['ready', 235], ['merging', 230], ['merged', 228]]),
+        marks: [mark('review-start', 255, 'review round 1'), mark('merge', 230, 'merge requested')] }),
+      track({ key: 'old-spike', lane: 'idle', reason: 'no PR and no agent working', pr: null, owner: null, segments: segs([['idle', 300]]) }),
+      track({ key: 'tf-bump', repo: 'acme/infra', lane: 'awaiting-ci', reason: '3 check(s) running on 77ab0c2',
+        pr: { number: 7, title: 'Terraform module bump', url: '#', sha: '7'.repeat(40), base: 'main', ci: 'pending', failing: [], openThreads: 0 },
+        owner: { agent: 'claude', model: 'claude-sonnet-5-5', activity: 'done', supervised: true },
+        segments: segs([['building', 60], ['awaiting-ci', 15]]), marks: [mark('push', 15, 'pushed')] })
+    ]
+  }
+  const role = (agent, model, effort) => ({ agent, ...(model ? { model } : {}), ...(effort ? { effort } : {}) })
+  const config = {
+    version: 1, supervisor: role('claude', 'claude-opus-5-5', 'high'),
+    workers: { default: role('codex', 'gpt-6-astra', 'high'), tiers: { light: role('claude', 'claude-sonnet-5-5') } },
+    reviewers: [
+      { name: 'correctness', ...role('claude', 'claude-opus-5-5'), focus: 'bugs, edge cases, missing tests', blocking: true },
+      { name: 'security', ...role('codex', 'gpt-6-astra'), focus: 'authz, injection, secrets, unsafe input', blocking: true },
+      { name: 'style', ...role('grok'), blocking: false }
+    ],
+    arbiter: null,
+    review: { enabled: true, trigger: 'ci-green', pass: 'all-blocking-approve', blockAt: 'major', differentProviderThanAuthor: true, maxRounds: 3, publish: 'orca-only', followUp: 'focused', fallback: role('claude', 'claude-sonnet-5-5') },
+    fix: { ci: { enabled: true, maxRounds: 3 }, comments: { enabled: true, maxRounds: 3 }, conflicts: { enabled: true, maxRounds: 2 } },
+    merge: { mode: 'manual', method: 'squash', requireHuman: [], updateBranch: 'rebase', onBaseRed: 'pause', deleteBranch: true, removeWorktree: true },
+    escalation: { supervisorFirst: true, humanAfterMinutes: 30 }, limits: { maxConcurrentReviews: 2 }
+  }
+  const agent = (id, label, installed, lockable, models, efforts) => ({ id, label, installed, lockable, takesModel: true, efforts, defaultModel: models[0] ?? null, defaultEffort: null,
+    models: models.map((m) => ({ id: m, label: m, efforts })) })
+  const agents = [
+    agent('claude', 'Claude Code', true, true, ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'], ['low', 'medium', 'high', 'xhigh', 'max']),
+    agent('codex', 'Codex', true, true, ['gpt-6-astra'], ['low', 'medium', 'high', 'xhigh']),
+    { id: 'opencode', label: 'OpenCode', installed: true, lockable: false, takesModel: true, efforts: [], defaultModel: null, defaultEffort: null,
+      models: [
+        ...['anthropic/claude-fable-5', 'ByteDance/Seed-2.0-code', 'ByteDance/Seed-2.0-mini', 'deepseek-ai/DeepSeek-V4-Pro', 'moonshotai/Kimi-K3', 'Qwen/Qwen4-Coder-480B'].map((m) => ({ id: `deepinfra/${m}`, label: m, efforts: [] })),
+        { id: 'deepseek/deepseek-v4-pro', label: 'deepseek/DeepSeek V4 Pro', efforts: ['low', 'high'] },
+        ...['deepseek-flash-latest', 'glm-5p3', 'glm-5p3-fast', 'kimi-fast-latest'].map((m) => ({ id: `fireworks-ai/accounts/fireworks/routers/${m}`, label: `fireworks-ai/${m}`, efforts: ['low', 'high'] }))
+      ] },
+    agent('cursor', 'Cursor', true, false, [], []), agent('antigravity', 'Antigravity', true, false, [], []),
+    agent('grok', 'Grok', true, false, [], []), agent('muse', 'Muse', false, false, [], [])
+  ]
+  const projects = [
+    { root: '/src/app', name: 'app', repo: 'acme/app', enabled: true, problem: null },
+    { root: '/src/infra', name: 'infra', repo: 'acme/infra', enabled: true, problem: null },
+    { root: '/src/docs', name: 'docs', repo: 'acme/docs', enabled: false, problem: 'It has no commits yet. Commit and push a first version to main before starting a supervisor.' },
+    { root: '/src/notes', name: 'notes', repo: null, enabled: false, problem: 'Its origin is not on GitHub, so Matriarch cannot follow its pull requests.' }
+  ]
+  // ?clean=1: no sample warnings, and the focused project is known (for screenshots).
+  const clean = params.get('clean') === '1'
+  if (clean) for (const r of board.repos) r.warnings = []
+  const replies = {
+    'projects.list': () => ({ projects }),
+    'project.enable': () => ({ ok: true, message: 'on', repo: 'acme/app' }),
+    'config.get': () => ({ config: structuredClone(config), errors: [], warnings: clean ? [] : ['reviewers[2]: Matriarch can start only claude and codex reviewers read-only, so "style" (grok) is not started.'], agents }),
+    'config.save': () => ({ saved: true, errors: [], warnings: [] }),
+    'project.focused': () => clean ? { repo: 'acme/app', root: '/src/app', enabled: true, name: 'app', candidates: [] } : (params.get('focus') === 'off'
+      ? { repo: 'acme/docs', root: '/src/docs', enabled: false, name: 'main', candidates: ['acme/docs'] }
+      : { repo: null, root: null, enabled: false, name: 'main', candidates: ['acme/app', 'acme/infra'] })
+  }
+  window.orca = {
+    plugin: { request: async (name) => (replies[name] ? replies[name]() : board), on: () => ({ dispose() {} }) },
+    on: (event, handler) => (event === 'workspace.changed' && setTimeout(() => handler({ context: null }), 50), { dispose() {} }),
+    shell: { openExternal: async () => ({ opened: true }) }
+  }
+  try { localStorage.removeItem('matriarch.page') } catch {}
+  await import('./js/view/main.js')
+  const click = (text) => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === text)?.click()
+  if (params.get('view') === 'board') setTimeout(() => click('Board'), 200)
+  if (params.get('page') === 'settings' || params.get('page') === 'picker') setTimeout(() => click('Settings'), 200)
+  if (params.get('page') === 'picker') setTimeout(() => {
+    const select = [...document.querySelectorAll('.role select')].find((x) => x.value === 'codex')
+    select.value = 'opencode'; select.dispatchEvent(new Event('change'))
+    setTimeout(() => {
+      document.querySelectorAll('.picker-button')[1]?.click()
+      setTimeout(() => { const q = document.querySelector('.picker-search'); if (q && params.get('q')) { q.value = params.get('q'); q.dispatchEvent(new Event('input')) } }, 100)
+    }, 100)
+  }, 400)
+  if (params.get('page') === 'add') setTimeout(() => click('+ Add project'), 200)
+  if (params.get('page') === 'all') setTimeout(() => click('All'), 200)
+</script>
+</body>
+</html>

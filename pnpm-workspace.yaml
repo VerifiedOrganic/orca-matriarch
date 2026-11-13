@@ -1,0 +1,5 @@
+# No symlinks anywhere in node_modules: the repository root is the plugin, and Orca refuses to
+# load a plugin folder that holds one. pnpm's default layout is made of them; hoisted is flat,
+# and command shims replace the symlinks it would put in node_modules/.bin.
+nodeLinker: hoisted
+preferSymlinkedExecutables: false
