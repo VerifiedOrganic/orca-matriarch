@@ -96,6 +96,8 @@ interface PendingCleanup {
   kept?: string
 }
 const CLEANUP_GIVE_UP_MS = 7 * 24 * 3600_000
+/** How long a merged or closed PR stays on the board and timeline, in Merged / closed. */
+export const SHOW_CLOSED_MS = 6 * 3600_000
 /** How long a worktree that never became a PR stays after its last worker finished. */
 export const FINISHED_GRACE_MS = 60 * 60_000
 
@@ -522,12 +524,27 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
             const list = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
             if (!list.some((c) => c.path === done.path)) await deps.store.set(`cleanup:${repoKey}`, [...list, { path: done.path, number, at: now }] as unknown as JsonValue)
           }
+          // Kept as it closed, so it can stay on the board without asking the forge again.
+          await deps.store.set(`snap:${repoKey}#${number}`, { snap: pr } as unknown as JsonValue)
           items.push({ snap: pr, ledger, ws: byBranch.get(pr.headRef) })
         } catch (error) {
           view.errors.push(`#${number}: ${(error as Error).message}`)
         }
       }
       await deps.store.set(trackedKey, [...open])
+      // Merged and closed PRs stay on the board and timeline for a while, from the state read when
+      // they closed: nothing is asked of the forge for them again.
+      if (deps.store.keys) {
+        const shown = new Set(items.map((i) => i.snap.number))
+        for (const key of (await deps.store.keys()).filter((k) => k.startsWith(`closed:${repoKey}#`))) {
+          const number = Number(key.slice(key.lastIndexOf('#') + 1))
+          const at = await deps.store.get(key)
+          if (shown.has(number) || typeof at !== 'number' || now - at > SHOW_CLOSED_MS) continue
+          const snap = ((await deps.store.get(`snap:${repoKey}#${number}`)) as { snap?: PrSnapshot } | null)?.snap
+          if (!snap || snap.state === 'OPEN') continue
+          items.push({ snap, ledger: loadLedger(await deps.store.get(ledgerKey(repoKey, number))), ws: byBranch.get(snap.headRef) })
+        }
+      }
     }
 
     // Worktrees of merged PRs: removed once no worker is live there and nothing is uncommitted.

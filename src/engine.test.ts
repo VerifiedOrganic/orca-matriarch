@@ -1,6 +1,6 @@
 import { assert, describe, test } from 'orca/testing'
 import { validateConfig } from './config.ts'
-import { FINISHED_GRACE_MS, tick, type EngineDeps, type Workspace } from './engine.ts'
+import { FINISHED_GRACE_MS, SHOW_CLOSED_MS, tick, type EngineDeps, type Workspace } from './engine.ts'
 import type { Executor } from './executor.ts'
 import type { GitHub, PrSnapshot } from './github.ts'
 import { ledgerKey } from './ledger.ts'
@@ -359,5 +359,28 @@ describe("a finished worktree that never became a PR", () => {
     off.h.advance(FINISHED_GRACE_MS)
     await tick(off.h.deps, { autopilot: true })
     assert.deepEqual(off.removed, [])
+  })
+})
+
+describe('a merged PR', () => {
+  test('stays on the board in Merged / closed for a while, without asking the forge again', async () => {
+    const open = pr({ number: 12 })
+    const prs = [open]
+    const h = harness(prs)
+    h.deps.store.keys = async () => [...h.store.keys()]
+    await tick(h.deps, { autopilot: false })
+    prs[0] = { ...open, state: 'MERGED' }
+    const merged = await tick(h.deps, { autopilot: false })
+    assert.equal(merged.tracks.find((t) => t.pr?.number === 12)?.lane, 'merged')
+    let asked = 0
+    const detail = h.deps.github.detail
+    h.deps.github.detail = async (...args) => (asked++, detail(...args))
+    h.advance(60 * 60_000)
+    const later = await tick(h.deps, { autopilot: false })
+    assert.equal(later.tracks.find((t) => t.pr?.number === 12)?.lane, 'merged', 'still shown an hour later')
+    assert.equal(asked, 0, 'from what was read when it closed')
+    h.advance(SHOW_CLOSED_MS)
+    const gone = await tick(h.deps, { autopilot: false })
+    assert.ok(!gone.tracks.some((t) => t.pr?.number === 12), 'gone once the window passed')
   })
 })
