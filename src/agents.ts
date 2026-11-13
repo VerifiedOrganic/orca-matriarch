@@ -35,7 +35,9 @@ export const AGENT_CATALOG: readonly CatalogEntry[] = [
   { id: 'grok', label: 'Grok', command: 'grok', takesModel: true, efforts: LEVELS },
   { id: 'muse', label: 'Muse', command: 'muse', takesModel: true, efforts: LEVELS },
   { id: 'codebuddy', label: 'CodeBuddy', command: 'codebuddy', takesModel: true, efforts: LEVELS },
-  { id: 'omp', label: 'Oh My Pi', command: 'omp', takesModel: true, efforts: LEVELS },
+  // Orca passes its thinking level with --effort (its own --thinking); each model's own levels
+  // come from `omp models ls`, these are all it has.
+  { id: 'omp', label: 'Oh My Pi', command: 'omp', takesModel: true, efforts: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
   { id: 'copilot', label: 'GitHub Copilot', command: 'copilot' },
   { id: 'amp', label: 'Amp', command: 'amp' },
   { id: 'aider', label: 'Aider', command: 'aider' },
@@ -82,11 +84,13 @@ export interface LiveModel {
 /**
  * Agents whose own CLI lists the models available to the person right now, with every provider
  * they are signed in to, tried in order: OpenCode's API gives names and thinking levels, its
- * `models` command only ids. Asked when the settings open: Orca's discovered list can be days old.
+ * `models` command only ids; Oh My Pi lists each model's selector, name and thinking levels.
+ * Asked when the settings open: Orca's discovered list can be days old.
  */
 export const MODEL_LISTERS: Readonly<Record<string, readonly (readonly string[])[]>> = {
   opencode: [['api', 'model.list'], ['models']],
-  opencode2: [['api', 'model.list'], ['models']]
+  opencode2: [['api', 'model.list'], ['models']],
+  omp: [['models', 'ls', '--json']]
 }
 
 /** Models from a lister's output: OpenCode's `model.list` JSON, or `provider/model` ids by line. */
@@ -95,10 +99,22 @@ export function parseModelList(stdout: string): LiveModel[] {
   if (text.startsWith('{') || text.startsWith('[')) {
     try {
       const d = JSON.parse(text) as unknown
-      const items = Array.isArray(d) ? d : Array.isArray((d as { data?: unknown }).data) ? ((d as { data: unknown[] }).data) : []
+      const list = (d && typeof d === 'object' ? d : {}) as { data?: unknown; models?: unknown }
+      const items = Array.isArray(d) ? d : Array.isArray(list.data) ? list.data : Array.isArray(list.models) ? list.models : []
       const out: LiveModel[] = []
       for (const item of items) {
         const m = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>
+        // Oh My Pi: `selector` is the provider/model id Orca passes, `thinking` that model's levels.
+        if (typeof m.selector === 'string' && m.selector) {
+          if (m.kind !== undefined && m.kind !== 'chat') continue
+          const thinking = Array.isArray(m.thinking) ? m.thinking : []
+          out.push({
+            id: m.selector,
+            label: typeof m.name === 'string' && m.name ? m.name : m.selector,
+            efforts: thinking.filter((t): t is string => typeof t === 'string' && t !== '')
+          })
+          continue
+        }
         const provider = typeof m.providerID === 'string' ? m.providerID : null
         const model = typeof m.modelID === 'string' ? m.modelID : typeof m.id === 'string' ? m.id : null
         if (!provider || !model || m.enabled === false) continue

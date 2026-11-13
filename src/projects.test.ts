@@ -193,6 +193,20 @@ test('the agent choices follow the Orca profile, and the models Orca discovered'
   assert.deepEqual([by.claude.defaultModel, by.claude.defaultEffort], ['claude-opus-5-5', 'xhigh'])
 })
 
+test("Oh My Pi's own list gives each model's selector, name and thinking levels", () => {
+  const omp = parseModelList(JSON.stringify({ models: [
+    { provider: 'deepinfra', kind: 'chat', id: 'deepseek-ai/DeepSeek-V4.1-Flash-1017', selector: 'deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017', name: 'DeepSeek V4.1 Flash 1017', thinking: ['low', 'high', 'max'] },
+    { provider: 'deepinfra', kind: 'chat', id: 'deepseek-ai/DeepSeek-V3', selector: 'deepinfra/deepseek-ai/DeepSeek-V3', name: 'DeepSeek-V3', thinking: null },
+    { provider: 'x', kind: 'embedding', id: 'e', selector: 'x/e', name: 'E', thinking: null }
+  ] }))
+  assert.deepEqual(omp, [
+    { id: 'deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017', label: 'DeepSeek V4.1 Flash 1017', efforts: ['low', 'high', 'max'] },
+    { id: 'deepinfra/deepseek-ai/DeepSeek-V3', label: 'DeepSeek-V3', efforts: [] }
+  ])
+  // Orca gets the model and the thinking level for an Oh My Pi worker.
+  assert.deepEqual(modelFlags({ agent: 'omp', model: 'deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017', effort: 'max' }), ['--model', 'deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017', '--effort', 'max'])
+})
+
 test('the thinking level goes to Orca as --effort, for OpenCode too (its API rejects model#variant)', () => {
   assert.deepEqual(modelFlags({ agent: 'opencode', model: 'deepinfra/deepseek-ai/DeepSeek-V4-Pro', effort: 'high' }), ['--model', 'deepinfra/deepseek-ai/DeepSeek-V4-Pro', '--effort', 'high'])
   assert.deepEqual(modelFlags({ agent: 'opencode', model: 'x/y#low' }), ['--model', 'x/y', '--effort', 'low'])
