@@ -3,13 +3,12 @@
 // update, the default branch, its checks, and the checks of each PR Matriarch follows. Only when
 // one changed (or every few minutes regardless) does it read the open PRs over GraphQL; and the
 // full detail of a PR only when its head, checks, base or update time changed (or it went stale).
+// It is one of Matriarch's two forges (forge.ts): it also merges, updates branches, posts reviews
+// and reads failed job logs, all with `gh`.
 import type { Exec } from './exec.ts'
+import { repoKey, tailLog, type Forge, type ForgeKind, type ForgeReader, type Outcome, type RepoRef } from './forge.ts'
 
-export interface RepoRef {
-  owner: string
-  name: string
-}
-export const repoKey = (r: RepoRef): string => `${r.owner}/${r.name}`
+export { repoKey, type RepoRef }
 
 /** Hidden marker on everything Matriarch posts, so its own threads never count as a human's. */
 export const OUR_MARKER = '<!-- matriarch'
@@ -21,7 +20,7 @@ export interface CheckInfo {
   name: string
   state: CheckState
   url: string | null
-  /** A GitHub Actions check run id, which is also its job id (for logs). */
+  /** A GitHub Actions check run id, which is also its job id (for logs); on GitLab, the job's id. */
   jobId: number | null
 }
 
@@ -48,6 +47,7 @@ export interface PrSummary {
   baseRef?: string
   author: string | null
   updatedAt: string
+  /** Its CI rollup in GitHub's words (SUCCESS, FAILURE, ERROR, PENDING, EXPECTED), or null with no CI. */
   rollup: string | null
   /**
    * A stamp of its head's checks as GitHub last answered (their ETags), when Matriarch watches
@@ -57,6 +57,8 @@ export interface PrSummary {
 }
 
 export interface PrSnapshot {
+  /** Set on GitLab merge requests; absent on GitHub PRs, as in every snapshot stored before GitLab. */
+  forge?: ForgeKind
   repo: string
   number: number
   url: string
@@ -69,7 +71,10 @@ export interface PrSnapshot {
   draft: boolean
   state: 'OPEN' | 'MERGED' | 'CLOSED'
   mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'
-  /** GitHub's mergeStateStatus: CLEAN, BEHIND, BLOCKED, DIRTY, UNSTABLE, HAS_HOOKS, DRAFT, UNKNOWN. */
+  /**
+   * GitHub's mergeStateStatus: CLEAN, BEHIND, BLOCKED, DIRTY, UNSTABLE, HAS_HOOKS, DRAFT, UNKNOWN.
+   * GitLab's detailed merge status is read into the same words (gitlab.ts, mergeabilityOf).
+   */
   mergeState: string
   reviewDecision: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null
   ci: CiState
@@ -294,6 +299,11 @@ export interface OpenList {
   base?: BaseBranch | null
   /** True when GitHub said nothing changed since the last read, so this is that read again. */
   unchanged?: boolean
+  /**
+   * How long a PR's detail may be reused while its summary looks the same, when the forge cannot
+   * tell every change from the list (GitLab). The engine's own limit applies when it is shorter.
+   */
+  detailMaxAgeMs?: number
 }
 
 export interface ListOptions {
@@ -301,10 +311,8 @@ export interface ListOptions {
   watch?: (pr: PrSummary, viewer: string) => boolean
 }
 
-export interface GitHub {
-  listOpen(repo: RepoRef, options?: ListOptions): Promise<OpenList>
-  detail(repo: RepoRef, number: number): Promise<{ pr: PrSnapshot | null; rate: RateInfo | null }>
-}
+/** Reading GitHub: the open PRs, cheaply, and one PR in full. Every forge reads this way. */
+export type GitHub = ForgeReader
 
 /** Even when every check says nothing changed, read the open PRs again this often. */
 export const QUIET_REFRESH_MS = 5 * 60_000
@@ -348,7 +356,7 @@ function rateOf(data: Obj): RateInfo | null {
   return remaining === null ? null : { cost: num(r.cost) ?? 0, remaining, resetAt: str(r.resetAt) ?? '' }
 }
 
-export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh', options: { quietRefreshMs?: number } = {}): GitHub {
+export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh', options: { quietRefreshMs?: number } = {}): Forge {
   const quietRefreshMs = options.quietRefreshMs ?? QUIET_REFRESH_MS
   /** Per repository: the last full read, and the ETag GitHub last gave for each watched path. */
   const watches = new Map<string, { list: OpenList; at: number; etags: Map<string, string> }>()
@@ -456,7 +464,17 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
       return { viewer, prs, rate, base }
   }
 
+  const repoArg = (r: RepoRef) => `${r.owner}/${r.name}`
+
+  /** Runs one gh command for an action; a failure answers what gh said. */
+  async function run(args: string[]): Promise<Outcome> {
+    const res = await exec(bin, args, { timeoutMs: 120_000 })
+    return res.code === 0 ? { ok: true } : { ok: false, error: `${bin} ${args.slice(0, 2).join(' ')}: ${(res.stderr || res.stdout).trim().slice(0, 400)}` }
+  }
+
   return {
+    kind: 'github',
+    updates: ['rebase', 'merge'],
     async listOpen(repo, options = {}) {
       const key = repoKey(repo)
       const seen = watches.get(key)
@@ -478,6 +496,39 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
     async detail(repo, number) {
       const data = await graphql(DETAIL_QUERY, { owner: repo.owner, name: repo.name, number })
       return { pr: normalizePr(obj(data.repository).pullRequest, repoKey(repo), now()), rate: rateOf(data) }
+    },
+    updateBranch: (repo, pr, method) => run(['pr', 'update-branch', String(pr.number), '--repo', repoArg(repo), ...(method === 'rebase' ? ['--rebase'] : [])]),
+    merge: (repo, pr, sha, method, deleteBranch) =>
+      run([
+        'pr',
+        'merge',
+        String(pr.number),
+        '--repo',
+        repoArg(repo),
+        `--${method}`,
+        '--match-head-commit',
+        sha,
+        ...(deleteBranch ? ['--delete-branch'] : [])
+      ]),
+    async failedLogs(repo, checks) {
+      const logs: Record<string, string> = {}
+      for (const { name, jobId } of checks.slice(0, 5)) {
+        if (jobId === null) continue
+        const res = await exec(bin, ['api', `repos/${repoArg(repo)}/actions/jobs/${jobId}/logs`], { timeoutMs: 60_000 })
+        if (res.code === 0 && res.stdout) logs[name] = tailLog(res.stdout)
+      }
+      return logs
+    },
+    async publishReview(repo, pr, sha, review) {
+      const post = (comments: typeof review.comments) =>
+        exec(bin, ['api', `repos/${repoArg(repo)}/pulls/${pr.number}/reviews`, '-X', 'POST', '--input', '-'], {
+          input: JSON.stringify({ commit_id: sha, event: 'COMMENT', body: review.body, comments: comments.map((c) => ({ ...c, side: 'RIGHT' })) }),
+          timeoutMs: 60_000
+        })
+      let res = await post(review.comments)
+      // A finding on a line outside the diff makes GitHub refuse inline comments: keep the summary.
+      if (res.code !== 0 && review.comments.length > 0 && /422|Unprocessable|line/i.test(res.stderr + res.stdout)) res = await post([])
+      return res.code === 0 ? { ok: true } : { ok: false, error: `gh api reviews: ${(res.stderr || res.stdout).trim().slice(0, 300)}` }
     }
   }
 }

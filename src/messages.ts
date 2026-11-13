@@ -1,5 +1,6 @@
 // What Matriarch tells workers and the supervisor. One message per round, written as
-// instructions an agent can follow without asking.
+// instructions an agent can follow without asking. Commands come from the PR's forge.
+import { forgeTerms } from './forge.ts'
 import type { CheckInfo, PrSnapshot, ThreadInfo } from './github.ts'
 
 export interface Message {
@@ -49,6 +50,26 @@ export function rebaseMessage(pr: PrSnapshot, round: number, max: number): Messa
   }
 }
 
+/**
+ * A branch that is only behind its base, when its forge cannot update it the way the project
+ * asked (GitLab has no API to merge the base into a branch): the worker brings it up to date.
+ */
+export function updateMessage(pr: PrSnapshot, method: 'rebase' | 'merge'): Message {
+  const how =
+    method === 'merge'
+      ? `Run git fetch, merge origin/${pr.baseRef} into ${pr.headRef}, resolve any conflict keeping the intent of both sides, run the checks, then push (no force push).`
+      : `Run git fetch, rebase ${pr.headRef} onto origin/${pr.baseRef}, resolve any conflict keeping the intent of both sides, run the checks, then push with git push --force-with-lease.`
+  return {
+    subject: `#${pr.number} is behind ${pr.baseRef}: bring it up to date`,
+    body: [
+      `PR #${pr.number} "${pr.title}" (branch ${pr.headRef}) is behind ${pr.baseRef}, and ${forgeTerms(pr.forge).name} cannot ${method === 'merge' ? `merge ${pr.baseRef} into it` : 'rebase it'} for Matriarch.`,
+      '',
+      how,
+      'Do not open a new PR. Matriarch watches CI after you push.'
+    ].join('\n')
+  }
+}
+
 export function commentsMessage(pr: PrSnapshot, threads: readonly ThreadInfo[], round: number, max: number): Message {
   const items = threads.map((t, i) => {
     const where = t.path ? `${t.path}${t.line ? `:${t.line}` : ''}` : 'review'
@@ -64,7 +85,7 @@ export function commentsMessage(pr: PrSnapshot, threads: readonly ThreadInfo[], 
       ...items,
       '',
       `Address each item, run the checks, then commit and push to ${pr.headRef}. Where you disagree, reply on the thread instead of changing code.`,
-      'After pushing, resolve the threads you fixed (GraphQL resolveReviewThread with the thread id).',
+      `After pushing, resolve the threads you fixed (${forgeTerms(pr.forge).resolve}).`,
       closing(round, max)
     ].join('\n')
   }

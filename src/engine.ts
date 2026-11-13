@@ -1,11 +1,13 @@
-// One engine tick: find the opted-in repositories behind Orca's workspaces, read their PRs,
-// plan each one, act when autopilot is on, record history, and answer the board.
-// Every dependency is injected, so a tick runs in tests without Orca, git or GitHub.
+// One engine tick: find the opted-in repositories behind Orca's workspaces, read their PRs from
+// each one's forge (GitHub or GitLab), plan each one, act when autopilot is on, record history,
+// and answer the board. Every dependency is injected, so a tick runs in tests without Orca, git,
+// GitHub or GitLab.
 import type { JsonValue } from 'orca/host'
 import { defaultConfig, type ConfigResult } from './config.ts'
 import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
 import type { Executor } from './executor.ts'
+import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
 import { ledgerKey, loadLedger, record, roundsUsed, type PrLedger } from './ledger.ts'
@@ -25,8 +27,9 @@ export interface Workspace {
 }
 
 export interface RepoInfo {
+  /** The project on its forge: GitHub's `owner/name`, or a GitLab host and path. */
   ref: RepoRef
-  /** `owner/name` */
+  /** `owner/name` on GitHub, `<host>/<path>` on GitLab (repoKey) */
   key: string
   /** The main checkout, where `.orca/matriarch.json` is read. */
   root: string
@@ -53,7 +56,10 @@ export interface EngineDeps {
   repoOf(path: string): Promise<RepoInfo | null>
   /** Null when the repository has no config, so it has not opted in. */
   readConfig(root: string): Promise<ConfigResult | null>
+  /** Reads projects on GitHub. */
   github: GitHub
+  /** Reads projects on GitLab; absent where there are none (tests of GitHub). */
+  gitlab?: ForgeReader | null
   workers(): Promise<WorkerRow[]>
   /** What agents in a workspace are doing; `path` also matches Orca's `<repoId>::<path>` ids. */
   activity(workspaceId: string, path?: string): ActivityInfo | null
@@ -121,13 +127,18 @@ const LANE_ORDER: Lane[] = [
 
 const short = (sha: string): string => sha.slice(0, 7)
 
+/** The forge that reads a project, or null when this host has none for it. */
+function readerFor(deps: EngineDeps, ref: RepoRef): ForgeReader | null {
+  return forgeKind(ref) === 'gitlab' ? (deps.gitlab ?? null) : deps.github
+}
+
 /** A prompt in an agent's tab counts as needing you only once nobody answered it this long. */
 export const PROMPT_GRACE_MS = 3 * 60_000
 
 /** Orca reports worktree branches as full refs (`refs/heads/x`); GitHub's headRefName is `x`. */
 export const branchName = (b: string | null | undefined): string | null => (b ? b.replace(/^refs\/heads\//, '') : null)
 
-export function describe(action: Action): string {
+export function describe(action: Action, forge: ForgeKind = 'github'): string {
   switch (action.kind) {
     case 'send-ci-failure':
       return `send ${action.checks.length} failing check(s) to the worker (round ${action.round})`
@@ -136,13 +147,14 @@ export function describe(action: Action): string {
     case 'send-comments':
       return `send ${action.threads.length} review comment(s) to the worker (round ${action.round})`
     case 'update-branch':
-      return `update the branch from its base (${action.method})`
+      // GitLab has no API to merge the base into a branch: its worker is asked to.
+      return forge === 'gitlab' && action.method === 'merge' ? 'ask the worker to merge its base in (GitLab cannot)' : `update the branch from its base (${action.method})`
     case 'start-review':
       return `start AI review round ${action.round}: ${action.reviewers.map((r) => `${r.name} (${r.agent}${r.model ? ` ${r.model}` : ''})`).join(', ')}`
     case 'send-findings':
       return `send the AI review findings to the worker (round ${action.round})`
     case 'publish-review':
-      return 'post the AI review to GitHub as a comment review'
+      return forge === 'gitlab' ? 'post the AI review on the merge request as a note' : 'post the AI review to GitHub as a comment review'
     case 'merge':
       return `merge ${short(action.sha)} (${action.method})`
     case 'escalate':
@@ -152,7 +164,7 @@ export function describe(action: Action): string {
   }
 }
 
-function markFor(action: Action, at: number): Mark {
+function markFor(action: Action, at: number, forge: ForgeKind = 'github'): Mark {
   switch (action.kind) {
     case 'send-ci-failure':
       return { at, kind: 'ci-sent', label: `CI failure sent (round ${action.round})` }
@@ -161,13 +173,13 @@ function markFor(action: Action, at: number): Mark {
     case 'send-comments':
       return { at, kind: 'comments-sent', label: `${action.threads.length} comment(s) sent (round ${action.round})` }
     case 'update-branch':
-      return { at, kind: 'update-branch', label: 'branch updated from base' }
+      return { at, kind: 'update-branch', label: forge === 'gitlab' && action.method === 'merge' ? 'worker asked to merge its base in' : 'branch updated from base' }
     case 'start-review':
       return { at, kind: 'review-start', label: `review round ${action.round} started` }
     case 'send-findings':
       return { at, kind: 'comments-sent', label: `AI review findings sent (round ${action.round})` }
     case 'publish-review':
-      return { at, kind: 'notify', label: 'AI review posted to GitHub' }
+      return { at, kind: 'notify', label: `AI review posted to ${forgeTerms(forge).name}` }
     case 'merge':
       return { at, kind: 'merge', label: `merge requested at ${short(action.sha)}` }
     case 'escalate':
@@ -222,7 +234,9 @@ async function snapshotFor(
     cached.snap.mergeable !== 'UNKNOWN' &&
     now - cached.snap.fetchedAt < maxAge
   if (fresh) return cached.snap
-  const { pr } = await deps.github.detail(repo.ref, summary.number)
+  const reader = readerFor(deps, repo.ref)
+  if (!reader) return null
+  const { pr } = await reader.detail(repo.ref, summary.number)
   if (pr) await deps.store.set(key, { snap: pr, rollup: summary.rollup, checksTag: summary.checksTag ?? null, baseSha } as unknown as JsonValue)
   return pr
 }
@@ -311,6 +325,9 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     }
     if (!cfg) continue
     const config = cfg.config
+    const kind = forgeKind(info.ref)
+    const terms = forgeTerms(kind)
+    const forge = readerFor(deps, info.ref)
     // The supervisor's Run: known, or found by the tag the launcher put in its objective.
     let supervisor = await deps.supervisor(repoKey).catch(() => null)
     // A Run Orca no longer knows is no supervisor: forget the link.
@@ -345,6 +362,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     }
     const view: RepoView = {
       repo: repoKey,
+      ...(kind === 'gitlab' ? { forge: kind } : {}),
       root: info.root,
       mergeMode: config.merge.mode,
       supervisor: {
@@ -383,23 +401,29 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     let viewer = ''
     let listed = false
     let base: { name: string; sha: string | null; rollup: string | null } | null = null
+    // How long a PR's detail may be reused: shorter where the forge's list cannot show every change.
+    let detailAge = maxAge
     // Only PRs whose branch lives in an Orca workspace and that the signed-in user opened.
     const follows = (s: PrSummary, who: string) => byBranch.has(s.headRef) && (!who || !s.author || s.author === who)
     try {
-      const list = await deps.github.listOpen(info.ref, { watch: follows })
+      if (!forge) throw new Error(`Matriarch cannot read ${terms.name} here`)
+      const list = await forge.listOpen(info.ref, { watch: follows })
       summaries = list.prs
       viewer = list.viewer
       base = list.base ?? null
-      board.rate = list.rate ?? board.rate
-      // The real client says null when GitHub has no default branch; a reader that omits it says nothing.
+      detailAge = Math.min(maxAge, list.detailMaxAgeMs ?? maxAge)
+      // GitHub's budget is the scarce one: GitLab's shows only when no GitHub project reports one.
+      if (list.rate && (kind === 'github' || !board.rate)) board.rate = kind === 'github' ? list.rate : { ...list.rate, forge: terms.name }
+      // The real client says null when the forge has no default branch; a reader that omits it says nothing.
       if (list.base === null) {
         view.empty = true
-        view.errors.push('GitHub has no commits for this project yet. Push a first commit to its main branch: workers branch from it and open their PRs against it.')
+        view.errors.push(`${terms.name} has no commits for this project yet. Push a first commit to its main branch: workers branch from it and open their PRs against it.`)
       }
-      board.github = { unchanged: (board.github?.unchanged ?? 0) + (list.unchanged ? 1 : 0), read: (board.github?.read ?? 0) + (list.unchanged ? 0 : 1) }
+      // Conditional requests make an unchanged GitHub list free; GitLab has no such thing.
+      if (kind === 'github') board.github = { unchanged: (board.github?.unchanged ?? 0) + (list.unchanged ? 1 : 0), read: (board.github?.read ?? 0) + (list.unchanged ? 0 : 1) }
       listed = true
     } catch (error) {
-      view.errors.push(`GitHub: ${(error as Error).message}`)
+      view.errors.push(`${terms.name}: ${(error as Error).message}`)
     }
     // Workspaces whose PR state is unknown this tick keep their last known lane, unwritten.
     const unknownWs = new Set<string>(listed ? [] : repoWorkspaces.map((w) => w.id))
@@ -415,7 +439,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     let runningReviews = 0
     for (const s of managed) {
       try {
-        const snap = await snapshotFor(deps, info, s, now, maxAge, base && s.baseRef === base.name ? base.sha : null)
+        const snap = await snapshotFor(deps, info, s, now, detailAge, base && s.baseRef === base.name ? base.sha : null)
         if (!snap) continue
         let ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, s.number)))
         // When each head was first seen: a new commit's checks get a grace period to register.
@@ -477,10 +501,10 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       }
     }
     // PRs Matriarch followed that left the open list: read their final state once.
-    if (listed) {
+    if (listed && forge) {
       for (const number of tracked.filter((n) => !open.has(n))) {
         try {
-          const { pr } = await deps.github.detail(info.ref, number)
+          const { pr } = await forge.detail(info.ref, number)
           if (!pr || pr.state === 'OPEN') continue
           // Its review rounds are moot now.
           if (deps.crew) await deps.crew.supersede(repoKey, number, null).catch(() => [])
@@ -590,7 +614,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       let ledger = item.ledger
       const marks: Mark[] = []
       const ownerRow = item.ws ? byWorktree.get(item.ws) : undefined
-      const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null }
+      const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null, owner: owner?.address ?? null }
       const run1 = async (a: Action) => {
         try {
           return await deps.executor!.execute(a, ctx)
@@ -614,7 +638,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         const outcome = await run1(action)
         if (outcome.ok) {
           ledger = record(ledger, action, now)
-          marks.push(markFor(action, now))
+          marks.push(markFor(action, now, kind))
           // Saved after each success, so a later failure in this tick cannot make it run twice.
           await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
           if (baseRedKey && escKey) await deps.store.set(baseRedKey, escKey)
@@ -629,7 +653,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
           const human: Action = { kind: 'escalate', to: 'human', key: action.key.replace(/:supervisor$/, ':human'), reason: `${action.reason} (the supervisor could not be reached)`, address: null }
           if ((await run1(human)).ok) {
             ledger = record(record(ledger, action, now), human, now)
-            marks.push(markFor(human, now))
+            marks.push(markFor(human, now, kind))
             await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
           }
         }
@@ -676,7 +700,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         owner: owner ? { agent: owner.agent, model: owner.model, activity: owner.activity, supervised: owner.address !== null } : null,
         lane: p.lane,
         reason: p.reason,
-        next: opts.autopilot ? [] : p.actions.map(describe),
+        next: opts.autopilot ? [] : p.actions.map((a) => describe(a, kind)),
         review:
           review || run
             ? {
@@ -723,7 +747,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     for (const ws of repoWorkspaces) {
       if (seenWorkspaces.has(ws.id)) continue
       if (unknownWs.has(ws.id)) {
-        // GitHub could not say what this worktree's PR is doing: show the last known lane, and
+        // The forge could not say what this worktree's PR is doing: show the last known lane, and
         // leave its history alone rather than rewrite it as idle.
         const known = loadHistory(await deps.store.get(historyKey(ws.id)))
         const last = known.segments[known.segments.length - 1]
@@ -735,7 +759,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
           pr: null,
           owner: null,
           lane: last?.lane ?? 'idle',
-          reason: `GitHub is unavailable; this is the last known state${last ? `: ${last.reason}` : ''}`,
+          reason: `${terms.name} is unavailable; this is the last known state${last ? `: ${last.reason}` : ''}`,
           next: [],
           review: null,
           rounds: { ci: 0, conflicts: 0, comments: 0, reviews: 0 },

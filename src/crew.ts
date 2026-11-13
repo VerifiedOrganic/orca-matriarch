@@ -113,6 +113,8 @@ export interface CrewRun {
   lastOutputAt?: number | null
   /** The PR's title and the round limit, to brief a reviewer started again. */
   title?: string
+  /** The PR's forge, when it is not GitHub, for the same brief. */
+  forge?: PrSnapshot['forge']
   maxRounds?: number
   /** Later rounds look only at what changed (`review.followUp: focused`). */
   focused?: boolean
@@ -424,7 +426,7 @@ export function createCrew(deps: CrewDeps): Crew {
       ...(old.focus ? { focus: old.focus } : {}),
       ...(old.lock === 'off' && !on ? { readOnly: false } : {})
     }
-    const pr = { repo: run.repo, number: run.number, title: run.title ?? '', headSha: run.sha, headRef: run.headRef, baseRef: run.baseRef } as PrSnapshot
+    const pr = { repo: run.repo, number: run.number, title: run.title ?? '', headSha: run.sha, headRef: run.headRef, baseRef: run.baseRef, ...(run.forge ? { forge: run.forge } : {}) } as PrSnapshot
     if (old.terminal) await deps.orca.run(['terminal', 'close', '--terminal', old.terminal]).catch(() => {})
     const entry = await launchReviewer(run.worktree!.path, pr, spec, run.round, run.maxRounds ?? 3, await previousOutcome(run.repo, run.number, run.sha), run.focused === true)
     entry.restarts = (old.restarts ?? 0) + 1
@@ -589,6 +591,7 @@ export function createCrew(deps: CrewDeps): Crew {
         error: null,
         cleaned: false,
         title: pr.title,
+        ...(pr.forge ? { forge: pr.forge } : {}),
         maxRounds: config.review.maxRounds,
         focused: config.review.followUp === 'focused',
         fallback: config.review.fallback

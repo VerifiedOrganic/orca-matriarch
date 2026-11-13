@@ -1,10 +1,11 @@
 // The worker ⇄ view contract, shared by src/worker.ts and src/view/*. Also the stored shapes
 // of a track's history.
 import type { MatriarchConfig } from './config.ts'
+import type { ForgeKind } from './forge.ts'
 import type { CiState } from './github.ts'
 import type { Activity, Lane } from './plan.ts'
 
-export type { Activity, CiState, Lane }
+export type { Activity, CiState, ForgeKind, Lane }
 
 /** A span of time a worktree spent in one lane. `to` is null while it is still there. */
 export interface Segment {
@@ -53,7 +54,7 @@ export interface ReviewerView {
 /** Something only a person can settle, with where to go. */
 export interface Attention {
   key: string
-  /** The project (`owner/name`) it belongs to. */
+  /** The project (`owner/name`, or `<host>/<path>` on GitLab) it belongs to. */
   repo?: string
   message: string
   /** Terminal handle to open (`orca terminal switch`). */
@@ -103,6 +104,8 @@ export interface TrackView {
 
 export interface RepoView {
   repo: string
+  /** Set for a project on GitLab; GitHub when absent. */
+  forge?: ForgeKind
   root: string
   mergeMode: 'manual' | 'auto'
   /** The supervisor agent for this repo and its orchestration Run, once found. */
@@ -119,7 +122,7 @@ export interface RepoView {
   }
   errors: string[]
   warnings: string[]
-  /** GitHub has no commits for it yet: nothing to branch from or open PRs against. */
+  /** Its forge has no commits for it yet: nothing to branch from or open PRs against. */
   empty?: boolean
 }
 
@@ -146,7 +149,7 @@ export interface AgentOption {
 export interface ProjectInfo {
   root: string
   name: string
-  /** `owner/name` on GitHub, when its origin is there. */
+  /** `owner/name` on GitHub or `<host>/<path>` on GitLab, when its origin is on one Matriarch can read. */
   repo: string | null
   enabled: boolean
   /** Why it cannot be used yet, or what to fix first. */
@@ -165,7 +168,8 @@ export interface Board {
   /** What needs a person now, most urgent first; the panel and status bar open it. */
   attention: Attention[]
   errors: string[]
-  rate: { remaining: number; resetAt: string } | null
+  /** The API budget left; `forge` names it when it is not GitHub's. */
+  rate: { remaining: number; resetAt: string; forge?: string } | null
   /** This tick's GitHub reads: repositories GitHub said were unchanged (free) and ones read in full. */
   github?: { unchanged: number; read: number }
 }
@@ -178,7 +182,7 @@ declare module 'orca' {
   interface PluginRequests {
     /** The latest board, with tracks' history since `since` (default: the last 24 hours). */
     'board.get': { input?: { since?: number }; output: Board }
-    /** Polls GitHub and Orca now, then answers the new board. */
+    /** Polls GitHub or GitLab, and Orca, now, then answers the new board. */
     'board.refresh': { output: Board }
     /** Turns autopilot on (act) or off (dry run: show what would happen). */
     'autopilot.set': { input: { on: boolean }; output: Board }

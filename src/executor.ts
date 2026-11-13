@@ -1,10 +1,12 @@
-// Carries out planned actions with the orca and gh CLIs. Only runs when autopilot is on.
-// Merges are pinned to the head commit that passed the gate and never use --admin.
+// Carries out planned actions with the orca CLI and the project's forge (gh for GitHub). Only
+// runs when autopilot is on. Merges are pinned to the head commit that passed the gate and never
+// bypass the forge's own rules (no --admin on GitHub).
 import type { MatriarchConfig } from './config.ts'
 import type { Crew } from './crew.ts'
 import type { Exec } from './exec.ts'
-import type { PrSnapshot, RepoRef } from './github.ts'
-import { ciFailureMessage, commentsMessage, escalationMessage, rebaseMessage } from './messages.ts'
+import { forgeKind, forgeTerms, type ForgeActions, type ForgeKind, type Outcome, type RepoRef } from './forge.ts'
+import { createGitHub, type PrSnapshot } from './github.ts'
+import { ciFailureMessage, commentsMessage, escalationMessage, rebaseMessage, updateMessage } from './messages.ts'
 import { sendMessage, type OrcaCli } from './orca-cli.ts'
 import type { Action } from './plan.ts'
 import { findingsMessage, githubReview } from './review.ts'
@@ -21,6 +23,8 @@ export interface ActionContext {
   worktree?: string | null
   /** Whether the worker that owns the branch is still running; null when unknown. */
   ownerLive?: boolean | null
+  /** Where the worker that owns the branch gets mail (`dispatch:<id>`), when one does. */
+  owner?: string | null
 }
 
 /** Orca's answer when only the Run's coordinator may wake a finished worker. */
@@ -42,12 +46,9 @@ export function forSupervisor(ctx: ActionContext, worker: string, subject: strin
   }
 }
 
-export interface Outcome {
-  ok: boolean
-  error?: string
-  /** Set when the action was deliberately not carried out (not built yet, say). */
-  skipped?: string
-}
+export type { Outcome }
+// The log tidying now lives with the forges; re-exported for its earlier callers.
+export { tailLog } from './forge.ts'
 
 export interface Executor {
   execute(action: Action, ctx: ActionContext): Promise<Outcome>
@@ -59,6 +60,8 @@ export interface ExecutorDeps {
   notify(title: string, body: string): Promise<void>
   crew?: Crew
   ghBin?: string
+  /** The forges' actions, by kind; GitHub's defaults to its own CLI (gh). */
+  forges?: Partial<Record<ForgeKind, ForgeActions>>
   /**
    * Matriarch's own terminal in the project, to send orchestration mail from: Orca refuses a
    * sender it cannot place in a terminal (no_active_sender_terminal), and a plugin has none.
@@ -66,36 +69,17 @@ export interface ExecutorDeps {
   mailbox?: (ctx: ActionContext) => Promise<string | null>
 }
 
-const LOG_LINES = 40
-// GitHub Actions log lines start with an ISO timestamp; colour codes add noise for an agent.
-const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z /
-const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`, 'g')
-
-export function tailLog(raw: string, lines = LOG_LINES): string {
-  const cleaned = raw
-    .split(/\r?\n/)
-    .map((l) => l.replace(TIMESTAMP, '').replace(ANSI, ''))
-    .filter((l) => l.trim() !== '')
-  return cleaned.slice(-lines).join('\n')
-}
-
 export function createExecutor(deps: ExecutorDeps): Executor {
-  const gh = deps.ghBin ?? 'gh'
-  const repoArg = (r: RepoRef) => `${r.owner}/${r.name}`
-
-  async function run(args: string[]): Promise<Outcome> {
-    const res = await deps.exec(gh, args, { timeoutMs: 120_000 })
-    return res.code === 0 ? { ok: true } : { ok: false, error: `${gh} ${args.slice(0, 2).join(' ')}: ${(res.stderr || res.stdout).trim().slice(0, 400)}` }
+  // Each forge acts through its own CLI; the worker passes the same clients it reads with.
+  const forges: Partial<Record<ForgeKind, ForgeActions>> = {
+    github: createGitHub(deps.exec, Date.now, deps.ghBin ?? 'gh'),
+    ...deps.forges
   }
-
-  async function jobLogs(repo: RepoRef, jobIds: readonly { name: string; jobId: number | null }[]): Promise<Record<string, string>> {
-    const logs: Record<string, string> = {}
-    for (const { name, jobId } of jobIds.slice(0, 5)) {
-      if (jobId === null) continue
-      const res = await deps.exec(gh, ['api', `repos/${repoArg(repo)}/actions/jobs/${jobId}/logs`], { timeoutMs: 60_000 })
-      if (res.code === 0 && res.stdout) logs[name] = tailLog(res.stdout)
-    }
-    return logs
+  /** The forge the project lives on. */
+  const forgeOf = (repo: RepoRef): ForgeActions => {
+    const forge = forges[forgeKind(repo)]
+    if (!forge) throw new Error(`Matriarch cannot act on ${forgeTerms(forgeKind(repo)).name} here`)
+    return forge
   }
 
   async function send(ctx: ActionContext, to: string, subject: string, body: string, type?: 'escalation'): Promise<Outcome> {
@@ -130,7 +114,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
       const { pr, repo, config } = ctx
       switch (action.kind) {
         case 'send-ci-failure': {
-          const logs = await jobLogs(repo, action.checks)
+          const logs = await forgeOf(repo).failedLogs(repo, action.checks)
           const m = ciFailureMessage(pr, action.checks, logs, action.round, config.fix.ci.maxRounds)
           return send(ctx, action.to, m.subject, m.body)
         }
@@ -142,20 +126,18 @@ export function createExecutor(deps: ExecutorDeps): Executor {
           const m = commentsMessage(pr, action.threads, action.round, config.fix.comments.maxRounds)
           return send(ctx, action.to, m.subject, m.body)
         }
-        case 'update-branch':
-          return run(['pr', 'update-branch', String(pr.number), '--repo', repoArg(repo), ...(action.method === 'rebase' ? ['--rebase'] : [])])
+        case 'update-branch': {
+          const forge = forgeOf(repo)
+          if (forge.updates.includes(action.method)) return forge.updateBranch(repo, pr, action.method)
+          // The forge cannot update the branch this way (GitLab cannot merge the base in): the
+          // worker that owns the branch does it, or the supervisor when no worker does.
+          const to = ctx.owner ?? ctx.supervisor
+          if (!to) return { ok: false, error: `${forgeTerms(forgeKind(repo)).name} cannot ${action.method === 'merge' ? 'merge the base into a branch' : 'rebase a branch'} for Matriarch, and no worker owns ${pr.headRef}` }
+          const m = updateMessage(pr, action.method)
+          return send(ctx, to, m.subject, m.body)
+        }
         case 'merge':
-          return run([
-            'pr',
-            'merge',
-            String(pr.number),
-            '--repo',
-            repoArg(repo),
-            `--${action.method}`,
-            '--match-head-commit',
-            action.sha,
-            ...(config.merge.deleteBranch ? ['--delete-branch'] : [])
-          ])
+          return forgeOf(repo).merge(repo, pr, action.sha, action.method, config.merge.deleteBranch)
         case 'escalate': {
           if (action.to === 'supervisor' && action.address) {
             const m = escalationMessage(pr, action.reason)
@@ -189,16 +171,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
         case 'publish-review': {
           const run = await deps.crew?.get(pr.repo, pr.number, action.sha)
           if (!run?.outcome) return { ok: false, error: 'no review outcome to publish' }
-          const review = githubReview(pr, run.outcome, action.round)
-          const post = (comments: typeof review.comments) =>
-            deps.exec(gh, ['api', `repos/${repoArg(repo)}/pulls/${pr.number}/reviews`, '-X', 'POST', '--input', '-'], {
-              input: JSON.stringify({ commit_id: action.sha, event: 'COMMENT', body: review.body, comments: comments.map((c) => ({ ...c, side: 'RIGHT' })) }),
-              timeoutMs: 60_000
-            })
-          let res = await post(review.comments)
-          // A finding on a line outside the diff makes GitHub refuse inline comments: keep the summary.
-          if (res.code !== 0 && review.comments.length > 0 && /422|Unprocessable|line/i.test(res.stderr + res.stdout)) res = await post([])
-          return res.code === 0 ? { ok: true } : { ok: false, error: `gh api reviews: ${(res.stderr || res.stdout).trim().slice(0, 300)}` }
+          return forgeOf(repo).publishReview(repo, pr, action.sha, githubReview(pr, run.outcome, action.round))
         }
       }
     }

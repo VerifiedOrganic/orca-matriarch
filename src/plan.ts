@@ -1,8 +1,10 @@
 // The planner: pure. From one PR's snapshot, its owning worker, the ledger of what Matriarch
 // already did and the repo config, it answers the PR's lane, why, and the next actions.
 // Every tick re-plans from current facts, so a message held back while a worker was busy goes
-// out once it is free, and nothing is sent twice for the same commit.
+// out once it is free, and nothing is sent twice for the same commit. It reads GitHub and GitLab
+// alike; only the words and commands in its reasons come from the PR's forge.
 import type { MatriarchConfig, ReviewerSpec } from './config.ts'
+import { forgeTerms } from './forge.ts'
 import { actionableThreads, type CheckInfo, type PrSnapshot, type ThreadInfo } from './github.ts'
 import { matchingGlobs } from './glob.ts'
 import { roundsUsed, type PrLedger } from './ledger.ts'
@@ -80,7 +82,7 @@ const short = (sha: string): string => sha.slice(0, 7)
 
 /** A new commit's checks take a moment to register; until then "no checks" is not "green". */
 export const CI_GRACE_MS = 3 * 60_000
-/** A merge GitHub has not completed by now has stalled (a merge queue dropped it, say). */
+/** A merge the forge has not completed by now has stalled (a merge queue dropped it, say). */
 export const MERGE_TIMEOUT_MS = 30 * 60_000
 
 export function ciSignature(checks: readonly CheckInfo[]): string {
@@ -220,7 +222,7 @@ export function plan(input: PlanInput): Plan {
         reason: 'draft PR; asking the supervisor to mark it ready or say why it waits',
         actions: [{
           kind: 'escalate', to: 'supervisor', key, address: input.supervisor,
-          reason: `#${pr.number} has been a draft for ${Math.round(quietFor / 60_000)} min with nobody working on it. Matriarch takes a PR through CI, review and merge only once it is ready. If its work is done, mark it ready (gh pr ready ${pr.number}); if it waits on something, leave it as a draft.`
+          reason: `#${pr.number} has been a draft for ${Math.round(quietFor / 60_000)} min with nobody working on it. Matriarch takes a PR through CI, review and merge only once it is ready. If its work is done, mark it ready (${forgeTerms(pr.forge).ready(pr.number)}); if it waits on something, leave it as a draft.`
         }]
       }
     }
@@ -232,7 +234,7 @@ export function plan(input: PlanInput): Plan {
       const e = escalate(input, `merge-stalled:${sha}`, `a merge requested ${Math.round((input.now - ledger.merge.at) / 60_000)} min ago has not completed`)
       return { lane: e.toHuman ? 'needs-you' : 'merging', reason: 'the merge has not completed', actions: e.actions }
     }
-    if (ledger.merge.status === 'requested') return { lane: 'merging', reason: 'merge requested, waiting for GitHub', actions: [] }
+    if (ledger.merge.status === 'requested') return { lane: 'merging', reason: `merge requested, waiting for ${forgeTerms(pr.forge).name}`, actions: [] }
     if (ledger.merge.status === 'failed') {
       const e = escalate(input, `merge:${sha}`, `merge failed: ${ledger.merge.error ?? 'unknown error'}`)
       return { lane: e.toHuman ? 'needs-you' : 'ready', reason: `merge failed: ${ledger.merge.error ?? 'unknown error'}`, actions: e.actions }
@@ -385,11 +387,11 @@ function mergeGate(input: PlanInput): Plan {
     return { lane: 'awaiting-ci', reason: `behind ${pr.baseRef}; updating the branch`, actions: [{ kind: 'update-branch', sha, method: merge.updateBranch }] }
   }
   if (pr.mergeState === 'BLOCKED') {
-    const why = 'GitHub blocks the merge (branch protection: approvals or required checks)'
+    const why = forgeTerms(pr.forge).blocked
     return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `blocked:${sha}`, `${pr.repo} #${pr.number} is blocked`, why) }
   }
   if (pr.mergeable !== 'MERGEABLE' || !['CLEAN', 'HAS_HOOKS', 'UNSTABLE'].includes(pr.mergeState)) {
-    return { lane: 'awaiting-ci', reason: 'GitHub is still working out whether it can merge', actions: [] }
+    return { lane: 'awaiting-ci', reason: `${forgeTerms(pr.forge).name} is still working out whether it can merge`, actions: [] }
   }
   if (merge.mode === 'manual') {
     return {

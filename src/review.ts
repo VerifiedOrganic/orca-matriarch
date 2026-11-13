@@ -1,6 +1,7 @@
 // The review crew's contract: the brief each reviewer gets, the verdict file it writes, and how
 // several verdicts become one outcome. Pure, so every policy is unit-tested.
 import { SEVERITIES, type MatriarchConfig, type ReviewerSpec, type Severity } from './config.ts'
+import { forgeTerms } from './forge.ts'
 import { OUR_MARKER, type PrSnapshot } from './github.ts'
 
 export interface Finding {
@@ -176,7 +177,7 @@ export function reviewerBrief(input: BriefInput): string {
     followUp
       ? '2. Review only the lines that changed since then and what they affect; do not review again code that did not change. Point at the exact file and line for every finding.'
       : '2. Review only what this PR changes. Point at the exact file and line for every finding.',
-    '3. Do not edit, commit, push, install, build or run tests, and post nothing to GitHub. Other reviewers work beside you.',
+    `3. Do not edit, commit, push, install, build or run tests, and post nothing to ${forgeTerms(pr.forge).name}. Other reviewers work beside you.`,
     '   This session is locked to reading this worktree: anything that would change files outside .matriarch/review/, or read outside this worktree, is refused automatically. Use paths relative to the worktree. Do not retry a refused command; read with git, grep and cat instead.',
     `4. Write your verdict as JSON to ${out} (create the folders), exactly this shape:`,
     '{"verdict": "approve" | "request_changes", "summary": "two or three sentences", "findings": [{"severity": "blocker" | "major" | "minor" | "nit", "file": "path/from/repo/root", "line": 12, "title": "short", "detail": "what is wrong and why", "suggestion": "how to fix"}]}',
@@ -220,7 +221,10 @@ export function findingsMessage(pr: PrSnapshot, outcome: CrewOutcome, round: num
   }
 }
 
-/** One GitHub comment review: the summary as the body, blocking findings inline. */
+/**
+ * One review as Matriarch posts it: the summary as the body, blocking findings inline. GitHub
+ * takes it as a comment review; GitLab as one note, with the inline findings folded in.
+ */
 export function githubReview(pr: PrSnapshot, outcome: CrewOutcome, round: number): { body: string; comments: { path: string; line: number; body: string }[] } {
   const marker = `${OUR_MARKER}:review round=${round} sha=${pr.headSha} -->`
   const rows = outcome.findings.map((f) => `| ${f.severity} | ${f.file ?? ''}${f.line ? `:${f.line}` : ''} | ${f.title.replace(/\|/g, '\\|')} | ${f.reviewers.join(', ')} |`)

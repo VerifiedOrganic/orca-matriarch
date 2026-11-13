@@ -2,6 +2,7 @@
 // it into tasks and starts workers with the tiers the repo configured. Matriarch gives it a brief,
 // then finds the orchestration Run it creates (by a tag in the objective) so escalations reach it.
 import { modelFlags, type MatriarchConfig, type RoleSpec } from './config.ts'
+import { forgeTerms, type ForgeKind } from './forge.ts'
 
 /** `[matriarch:<repo>:<nonce>]`: lets Matriarch find the supervisor's Run among all Runs. */
 export const supervisorTag = (repo: string, nonce: string): string => `[matriarch:${repo}:${nonce}]`
@@ -29,6 +30,10 @@ export interface BriefInput {
   tag: string
   base: string
   config: MatriarchConfig
+  /** Where the project lives; its CLI is the one workers open and check PRs with. GitHub when absent. */
+  forge?: ForgeKind
+  /** The forge's host, named in a GitLab brief. */
+  host?: string
 }
 
 /** `orca agent launch` arguments for the supervisor: a native chat by default, briefed and focused. */
@@ -38,11 +43,12 @@ export function supervisorLaunchArgs(role: RoleSpec, root: string, brief: string
   return args
 }
 
-export function supervisorBrief({ repo, root, objective, tag, base, config }: BriefInput): string {
+export function supervisorBrief({ repo, root, objective, tag, base, config, forge, host }: BriefInput): string {
   const tiers = Object.entries(config.workers.tiers)
+  const t = forgeTerms(forge)
   const contract = [
     'When the work is done: run the project checks, commit on your branch, push it, and open a PR',
-    `against ${base} with gh pr create --base ${base} --fill. Put "Matriarch-Task: <taskId>" in the PR body.`,
+    `against ${base} with ${t.create(base)}. Put "Matriarch-Task: <taskId>" in the ${t.body}.`,
     'Then send worker_done with the PR URL in --body. Do not merge, and do not review your own PR.'
   ].join(' ')
   const goal = objective.trim()
@@ -50,6 +56,9 @@ export function supervisorBrief({ repo, root, objective, tag, base, config }: Br
     `You are the supervisor for ${repo}, working with Matriarch.${goal ? ` The user's objective: ${goal}` : ''}`,
     '',
     'You coordinate; you do not write product code yourself. This chat is how the user talks to you.',
+    ...(forge === 'gitlab'
+      ? [`This project is on GitLab${host ? ` (${host})` : ''}: a PR here is a merge request, and its CLI is glab, which uses the project's origin to find the host.`]
+      : []),
     goal
       ? '0. Restate the objective in a line, then go on.'
       : '0. Start by asking the user what the pod should build. Wait for their answer before doing anything else.',
@@ -74,9 +83,9 @@ export function supervisorBrief({ repo, root, objective, tag, base, config }: Br
     '5. Matriarch runs the PR lifecycle: CI failures, review comments and conflicts go back to the',
     '   worker that owns the branch, and its review crew reviews every PR. Do not review or merge PRs yourself.',
     '   It takes up a PR only once it is ready: keep one as a draft only while it waits on something, and mark it',
-    '   ready (gh pr ready <number>) as soon as its work is done.',
+    `   ready (${t.ready('<number>')}) as soon as its work is done.`,
     config.merge.mode === 'auto'
-      ? '   Matriarch merges each PR itself once its review passes. Never ask the user to merge: wait for the PR to show MERGED (gh pr view <n> --json state) before starting work that depends on it.'
+      ? `   Matriarch merges each PR itself once its review passes. Never ask the user to merge: wait for the PR to show ${t.merged('<n>')} before starting work that depends on it.`
       : '   The user merges each PR once Matriarch marks it ready. Say in this chat which PR is ready and what waits on it, and keep other independent tasks moving meanwhile.',
     '6. When Matriarch sends you an escalation, decide the next step yourself: give the worker new instructions',
     '   (orca orchestration send --to dispatch:<id>), start a fixer on a stronger tier, or re-plan.',
