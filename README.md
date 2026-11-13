@@ -53,15 +53,15 @@ Windows are untested.
 
 ## Install
 
-**From Orca's plugin directory:** Settings → Plugins, search for Matriarch, and install.
-
 **From GitHub:**
 
 ```sh
 orca plugin install VerifiedOrganic/orca-matriarch
 ```
 
-Either way Orca shows what it asks for (see [Permissions](#permissions)) and asks you to approve it.
+Orca installs the newest version tag, or `main` while there is none, pinned to that commit. It
+shows what Matriarch asks for (see [Permissions](#permissions)) and asks you to approve it.
+Matriarch is not in Orca's plugin directory yet.
 
 **From a clone,** to change it: see [Develop](#develop).
 
@@ -238,7 +238,7 @@ it.
 
 ```sh
 pnpm install            # TypeScript, and Node's typings
-pnpm types              # Orca's plugin typings, into .orca/ (from Orca, or from GitHub on CI)
+pnpm types              # Orca's plugin typings, into .orca/ (from Orca, or from GitHub without it)
 pnpm verify             # typecheck, orca plugin test, orca plugin validate, binary check
 pnpm preview            # the panel with sample data at http://127.0.0.1:8765
 orca plugin dev load .  # run it in Orca; it reloads as you edit
@@ -248,11 +248,18 @@ The repository root is the plugin, and Orca installs every tracked file in it. `
 is flat with no symlinks (`pnpm-workspace.yaml`), because Orca refuses to load a folder that
 holds one. [DESIGN.md](DESIGN.md) explains how it works and why.
 
+CI runs the same checks on every push and pull request, with the Orca CLI from the Linux package
+of the Orca in `config.orcaVersion`. Every Monday it runs them on Orca's newest release too, and
+the Actions tab can run both by hand.
+
 ## Releasing
 
 1. Raise `version` in `orca-plugin.json` and `PLUGIN_VERSION` in `src/worker.ts` (a test keeps
    them equal), and add the version to `CHANGELOG.md`. When moving to a newer Orca, raise
-   `config.orcaVersion` in `package.json`, `TESTED_ORCA` and `engines.orca` together.
+   `config.orcaVersion` in `package.json`, `TESTED_ORCA` and `engines.orca` together, and set
+   `config.orcaDebSha512` to the sha512 that release's `latest-linux.yml` gives
+   `orca-ide_<version>_amd64.deb` (`gh release download v<version> -R stablyai/orca -p
+   latest-linux.yml -O -`).
 2. `pnpm verify`, then commit.
 3. Tag the commit and push the tag:
 
@@ -260,8 +267,9 @@ holds one. [DESIGN.md](DESIGN.md) explains how it works and why.
    git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0
    ```
 
-The repository has the `orca-plugin` topic, so Orca's plugin directory lists the newest `vX.Y.Z`
-tag, pinned to its commit and file hash. A listed version never changes, and tags cannot be moved.
+Orca's plugin directory lists a repository with the `orca-plugin` topic at its newest `vX.Y.Z`
+tag, pinned to its commit and file hash. This one has no topic yet, so it is not listed. Once it
+is, a listed version never changes, and its tag cannot be moved.
 
 ### Screenshots and listing art
 

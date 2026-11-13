@@ -1,0 +1,61 @@
+name: Set up the Orca CLI
+description: >-
+  Puts the `orca` command of an Orca release on PATH, from its Linux .deb, after checking the
+  download's sha512. `orca plugin test`, `validate` and `types` need the desktop app's CLI: the
+  server tarball has neither the typings nor orca/testing. Nothing is installed or started; the
+  CLI runs in Electron's Node mode, like `orca` on a Mac.
+
+inputs:
+  version:
+    description: >-
+      `tested`, the Orca in package.json (config.orcaVersion, checked against
+      config.orcaDebSha512), or `newest`, Orca's newest release.
+    required: true
+
+outputs:
+  version:
+    description: The Orca version now on PATH.
+    value: ${{ steps.orca.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: orca
+      shell: bash
+      env:
+        WANT: ${{ inputs.version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        case "$WANT" in
+          tested)
+            version=$(node -p "require('./package.json').config.orcaVersion")
+            sha512=$(node -p "require('./package.json').config.orcaDebSha512")
+            ;;
+          newest)
+            version=$(gh release view --repo stablyai/orca --json tagName --jq '.tagName | ltrimstr("v")')
+            # A release that is not out yet cannot be pinned: its hash comes from the release's own
+            # latest-linux.yml, which catches a broken download, not a changed release.
+            sha512=$(gh release download "v$version" --repo stablyai/orca --pattern latest-linux.yml --output - |
+              awk -v deb="orca-ide_${version}_amd64.deb" '$NF == deb { getline; print $2; exit }')
+            ;;
+          *)
+            echo "::error::version is tested or newest, not $WANT"
+            exit 1
+            ;;
+        esac
+        deb="orca-ide_${version}_amd64.deb"
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/$deb" "https://github.com/stablyai/orca/releases/download/v$version/$deb"
+        actual=$(openssl dgst -sha512 -binary "$RUNNER_TEMP/$deb" | base64 -w0)
+        if [ -z "$sha512" ] || [ "$actual" != "$sha512" ]; then
+          echo "::error::$deb does not match its sha512"
+          exit 1
+        fi
+        dpkg-deb -x "$RUNNER_TEMP/$deb" "$RUNNER_TEMP/orca"
+        rm "$RUNNER_TEMP/$deb"
+        mkdir -p "$RUNNER_TEMP/orca-bin"
+        ln -s "$RUNNER_TEMP/orca/opt/Orca/resources/bin/orca-ide" "$RUNNER_TEMP/orca-bin/orca"
+        echo "$RUNNER_TEMP/orca-bin" >> "$GITHUB_PATH"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+    - shell: bash
+      run: orca --version

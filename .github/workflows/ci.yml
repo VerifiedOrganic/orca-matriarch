@@ -5,20 +5,31 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # Mondays, on Orca's newest release: a change in Orca that breaks Matriarch shows up here
+  # before it reaches people who updated Orca.
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
 
 # It only reads the repository.
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  checks:
-    name: Typecheck and contents
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  verify:
+    name: Orca ${{ matrix.orca }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pushes and PRs: the Orca it was tested with (config.orcaVersion). The weekly run: Orca's
+        # newest release. Run by hand: both.
+        orca: ${{ fromJSON(github.event_name == 'schedule' && '["newest"]' || github.event_name == 'workflow_dispatch' && '["tested", "newest"]' || '["tested"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -29,10 +40,13 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # Orca's directory refuses a release that carries binaries other than images, or symlinks.
+      # Orca refuses a plugin folder that holds binaries other than images, or symlinks.
       - run: pnpm binaries
-      # There is no Orca here: the typings come from the Orca repository at config.orcaVersion.
+      - uses: ./.github/actions/setup-orca
+        with:
+          version: ${{ matrix.orca }}
+      # Written by `orca plugin types`, so they match the Orca on PATH.
       - run: pnpm types
       - run: pnpm typecheck
-      # The tests and `orca plugin validate` need Orca itself, so they run before each release
-      # (pnpm verify); see README, Releasing.
+      - run: pnpm test
+      - run: pnpm validate
