@@ -107,7 +107,7 @@ input.switch:checked { background: var(--m-blue); }
 input.switch:checked::before { transform: translateX(12px); }
 input.switch:focus-visible { outline: 2px solid color-mix(in srgb, var(--m-blue) 50%, transparent); outline-offset: 2px; }
 
-/* Settings: who does the work as cards, then the rules in groups. */
+/* Settings: who does the work as cards, then the rules in groups, with Save in a footer that stays in view. */
 .settings { container: settings / inline-size; --line: color-mix(in srgb, var(--orca-border) 75%, transparent);
   --panel: color-mix(in srgb, var(--orca-muted, var(--orca-secondary)) 50%, var(--orca-background));
   display: flex; flex-direction: column; gap: 8px; max-width: 920px; padding: 10px 8px 0; background: var(--panel);
@@ -223,12 +223,16 @@ button.add-row:hover { color: var(--m-blue); border-color: var(--m-blue); backgr
 button.quiet-danger { background: transparent; color: var(--m-red); border-color: color-mix(in srgb, var(--m-red) 40%, transparent); }
 button.quiet-danger:hover { background: color-mix(in srgb, var(--m-red) 10%, transparent); }
 
-.settings-foot { display: flex; align-items: center; gap: 6px; margin: 2px -8px 0; padding: 8px;
-  border-top: 1px solid var(--orca-border); }
+.settings-foot { position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center; gap: 6px; margin: 2px -8px 0; padding: 8px;
+  background: var(--panel); border-top: 1px solid var(--orca-border); border-radius: 0 0 calc(var(--orca-radius, 6px) + 2px) calc(var(--orca-radius, 6px) + 2px);
+  box-shadow: 0 -8px 12px -12px rgb(0 0 0 / .35); }
 .settings-foot button { padding: 4px 12px; }
 .settings-foot button.primary { font-weight: 600; min-width: 64px; }
-.foot-status { flex: 1; min-width: 0; font-size: 11px; color: var(--orca-muted-foreground); }
+.foot-status { flex: 1; min-width: 0; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--orca-muted-foreground); }
+.foot-status.dirty { color: var(--orca-foreground); }
+.foot-status.dirty::before { content: ''; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--m-fixing); }
 .foot-status.ok { color: var(--m-ready); }
+.foot-status.bad a { color: var(--m-red); }
 .picker-panel { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--orca-ring);
   border-radius: var(--orca-radius, 6px); padding: 6px; background: var(--orca-card); }
 .picker-search { width: 100%; }

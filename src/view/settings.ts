@@ -1,7 +1,8 @@
 // A project's settings as a form. Who does the work comes first: the supervisor, the workers and
 // the reviewers, each a card with its agent, model and effort on one line. The rules follow in
 // groups that stay closed until clicked, each saying its current values in one line. It edits a
-// draft; Save sends it to the worker, which checks it and writes the project's .orca/matriarch.json.
+// draft; Save, in a footer that stays in view, sends it to the worker, which checks it and writes
+// the project's .orca/matriarch.json.
 import type { MatriarchConfig, ReviewerSpec, RoleSpec, Severity } from '../config.ts'
 import type { AgentOption } from '../protocol.ts'
 import { checkbox, el, select, textInput, toggle, type Child } from './dom.ts'
@@ -19,6 +20,10 @@ export interface SettingsState {
   confirmOff: boolean
   /** The rule groups the person opened; the others show a one-line summary. */
   open: Record<string, boolean>
+  /** The settings as loaded or last saved, to tell when there are unsaved changes. */
+  baseline: string
+  /** What Save sent, until the answer is in. */
+  sending: string | null
 }
 
 export interface SettingsActions {
@@ -32,10 +37,12 @@ export interface SettingsActions {
 
 export function settingsState(repo: string, config: MatriarchConfig, agents: AgentOption[], errors: string[], warnings: string[]): SettingsState {
   const draft = structuredClone(config)
-  return {
+  const s: SettingsState = {
     repo, draft, tiers: Object.entries(draft.workers.tiers).map(([name, role]) => ({ name, role })), agents, errors, warnings,
-    saved: false, confirmOff: false, open: {}
+    saved: false, confirmOff: false, open: {}, baseline: '', sending: null
   }
+  s.baseline = snapshot(s)
+  return s
 }
 
 /** The draft as a config to save, or the problems that stop it. */
@@ -49,6 +56,13 @@ export function draftConfig(s: SettingsState): { config: MatriarchConfig; proble
     else tiers[name] = t.role
   }
   return { config: { ...s.draft, workers: { ...s.draft.workers, tiers } }, problems }
+}
+
+/** The draft as text with its keys sorted, so the same settings always read the same. */
+function snapshot(s: SettingsState): string {
+  const sorted = (_key: string, v: unknown): unknown =>
+    v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : v
+  return JSON.stringify({ ...s.draft, workers: { default: s.draft.workers.default, tiers: s.tiers } }, sorted)
 }
 
 const option = (s: SettingsState, id: string): AgentOption | undefined => s.agents.find((a) => a.id === id)
@@ -224,8 +238,13 @@ const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' 
 
 export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElement {
   const d = s.draft
-  // What shows a value outside the control that sets it (the summaries) follows every edit, without
-  // re-drawing the form under the person's cursor.
+  // A Save that has its answer: what it sent is now what is saved.
+  if (s.sending !== null && !act.busy) {
+    if (s.saved) s.baseline = s.sending
+    s.sending = null
+  }
+  // What shows a value outside the control that sets it (summaries, the unsaved cue) follows every
+  // edit, without re-drawing the form under the person's cursor.
   const live: (() => void)[] = []
 
   /** A rule group: closed, its header says the current values; open, it shows the settings. */
@@ -359,9 +378,33 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
           el('button', { class: 'danger', type: 'button', onclick: () => act.turnOff() }, 'Confirm: turn off here'))
       : el('button', { class: 'quiet-danger', type: 'button', title: 'Stops Matriarch for this project; its settings are kept for next time', onclick: () => { s.confirmOff = true; act.redraw() } }, 'Turn off'))
 
-  const status = s.saved ? el('span', { class: 'foot-status ok' }, 'Saved. Takes effect on the next check.') : el('span', { class: 'foot-status' })
-  const cancel = el('button', { class: 'ghost', type: 'button', onclick: () => act.cancel() }, s.saved ? 'Close' : 'Cancel')
-  const save = el('button', { class: 'primary', type: 'button', disabled: act.busy, onclick: () => act.save() }, act.busy ? 'Saving…' : 'Save')
+  // The footer stays in view while the form scrolls: what is unsaved, Save and Cancel.
+  const status = el('span', { class: 'foot-status' })
+  const cancel = el('button', { class: 'ghost', type: 'button', onclick: () => act.cancel() })
+  const save = el('button', {
+    class: 'primary', type: 'button', disabled: act.busy,
+    onclick: () => {
+      s.sending = snapshot(s)
+      s.saved = false
+      act.save()
+    }
+  }, act.busy && s.sending !== null ? 'Saving…' : 'Save')
+  live.push(() => {
+    const dirty = snapshot(s) !== s.baseline
+    cancel.textContent = dirty ? 'Cancel' : 'Close'
+    status.className = 'foot-status'
+    if (act.busy && s.sending !== null) status.replaceChildren()
+    else if (s.errors.length) {
+      status.classList.add('bad')
+      status.replaceChildren(el('a', { onclick: () => problems?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }) }, `${plural(s.errors.length, 'problem')} to fix`))
+    } else if (dirty) {
+      status.classList.add('dirty')
+      status.replaceChildren('Unsaved changes')
+    } else if (s.saved) {
+      status.classList.add('ok')
+      status.replaceChildren('Saved. Takes effect on the next check.')
+    } else status.replaceChildren()
+  })
 
   const refresh = () => live.forEach((f) => f())
   const form = el(
