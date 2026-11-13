@@ -1,16 +1,26 @@
-// Styles from Orca's theme variables; lane colors get light and dark variants.
+// Surfaces, borders and text follow Orca's theme. Matriarch's colors (lanes, dots, the primary
+// button, links) are its own, with light and dark variants: many Orca themes make `primary` black or
+// white, which would leave every lane the same color.
 export const CSS = `
 :root {
-  --m-active: var(--orca-primary);
+  --m-blue: #2563eb;
+  --m-blue-fg: #ffffff;
+  --m-red: #dc2626;
+  --m-red-fg: #ffffff;
+  --m-active: var(--m-blue);
   --m-waiting: color-mix(in srgb, var(--orca-muted-foreground) 55%, transparent);
   --m-fixing: #d97706;
   --m-review: #7c3aed;
-  --m-blocked: var(--orca-destructive);
+  --m-blocked: var(--m-red);
   --m-ready: #059669;
   --m-quiet: color-mix(in srgb, var(--orca-muted-foreground) 25%, transparent);
   --m-done: color-mix(in srgb, var(--orca-muted-foreground) 70%, transparent);
 }
 html.dark {
+  --m-blue: #60a5fa;
+  --m-blue-fg: #0b0b0e;
+  --m-red: #f87171;
+  --m-red-fg: #0b0b0e;
   --m-fixing: #f59e0b;
   --m-review: #a78bfa;
   --m-ready: #34d399;
@@ -21,11 +31,11 @@ html, body { margin: 0; padding: 0; background: var(--orca-background); color: v
 button { font: inherit; color: inherit; background: var(--orca-secondary); border: 1px solid var(--orca-border);
   border-radius: var(--orca-radius, 6px); padding: 3px 8px; cursor: pointer; }
 button:hover { background: var(--orca-accent); }
-button.primary { background: var(--orca-primary); color: var(--orca-primary-foreground); border-color: transparent; }
-button.danger { background: var(--orca-destructive); color: var(--orca-destructive-foreground); border-color: transparent; }
+button.primary { background: var(--m-blue); color: var(--m-blue-fg); border-color: transparent; }
+button.danger { background: var(--m-red); color: var(--m-red-fg); border-color: transparent; }
 button.ghost { background: transparent; border-color: transparent; }
 button[aria-pressed="true"] { background: var(--orca-accent); border-color: var(--orca-ring); }
-a { color: var(--orca-primary); text-decoration: none; cursor: pointer; }
+a { color: var(--m-blue); text-decoration: none; cursor: pointer; }
 a:hover { text-decoration: underline; }
 .app { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
 .header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
@@ -35,6 +45,8 @@ a:hover { text-decoration: underline; }
   border: 1px solid var(--orca-border); background: var(--orca-card); white-space: nowrap; font-size: 11px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+/* A long agent or model name wraps inside its card instead of running past it. */
+.card .pill { white-space: normal; overflow-wrap: anywhere; max-width: 100%; }
 .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--orca-border); padding-bottom: 6px; align-items: center; }
 .tabs .spacer { flex: 1; }
 .callout { border: 1px solid var(--orca-border); border-left: 3px solid var(--m-blocked); background: var(--orca-card);
@@ -48,7 +60,7 @@ a:hover { text-decoration: underline; }
 .sup { border: 1px solid var(--orca-border); border-radius: var(--orca-radius, 6px); padding: 6px 8px; background: var(--orca-card); display: flex; flex-direction: column; gap: 4px; }
 .sup-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .sup-head .spacer { flex: 1; }
-.sup summary { cursor: pointer; color: var(--orca-primary); }
+.sup summary { cursor: pointer; color: var(--m-blue); }
 .sup-hint { color: var(--m-fixing); font-size: 11px; min-height: 0; }
 .sup-hint:empty { display: none; }
 .badge { font-size: 11px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--orca-border); white-space: nowrap; }
@@ -115,7 +127,7 @@ select:disabled { opacity: .5; }
 .picker-row { display: flex; flex-direction: column; padding: 3px 6px; border-radius: 4px; cursor: pointer; min-width: 0; }
 .picker-row:hover, .picker-row.active { background: var(--orca-accent); }
 .picker-row.chosen .picker-main::after { content: ' ✓'; color: var(--m-ready); }
-.picker-row.custom .picker-main { color: var(--orca-primary); }
+.picker-row.custom .picker-main { color: var(--m-blue); }
 .picker-main { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-sub { font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-group { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--orca-muted-foreground); padding: 6px 6px 2px; }

@@ -4,14 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  /* Stand-ins for Orca's theme variables (light), overridden for dark below. */
+  /* Stand-ins for Orca's theme variables, as Orca's default themes set them: `primary` is near-black
+     (white in dark), so the preview shows what a monochrome theme does to the panel. */
   :root { --orca-background:#ffffff; --orca-foreground:#18181b; --orca-card:#ffffff; --orca-card-foreground:#18181b;
-    --orca-popover:#ffffff; --orca-primary:#2563eb; --orca-primary-foreground:#ffffff; --orca-secondary:#f4f4f5;
+    --orca-popover:#ffffff; --orca-primary:#18181b; --orca-primary-foreground:#fafafa; --orca-secondary:#f4f4f5;
     --orca-secondary-foreground:#18181b; --orca-muted:#f4f4f5; --orca-muted-foreground:#71717a; --orca-accent:#e4e4e7;
     --orca-accent-foreground:#18181b; --orca-destructive:#dc2626; --orca-destructive-foreground:#ffffff;
     --orca-border:#e4e4e7; --orca-input:#e4e4e7; --orca-ring:#a1a1aa; --orca-radius:6px; }
   html.dark { --orca-background:#0b0b0e; --orca-foreground:#e4e4e7; --orca-card:#141418; --orca-card-foreground:#e4e4e7;
-    --orca-primary:#60a5fa; --orca-primary-foreground:#0b0b0e; --orca-secondary:#1c1c22; --orca-secondary-foreground:#e4e4e7;
+    --orca-primary:#fafafa; --orca-primary-foreground:#18181b; --orca-secondary:#1c1c22; --orca-secondary-foreground:#e4e4e7;
     --orca-muted:#1c1c22; --orca-muted-foreground:#a1a1aa; --orca-accent:#27272a; --orca-destructive:#f87171;
     --orca-destructive-foreground:#0b0b0e; --orca-border:#27272a; --orca-input:#27272a; --orca-ring:#52525b; }
 </style>
@@ -63,7 +64,7 @@
         segments: segs([['building', 340], ['awaiting-ci', 250], ['fixing-ci', 238], ['awaiting-ci', 220], ['ai-review', 205], ['fixing-review', 185], ['working', 175], ['awaiting-ci', 150], ['ai-review', 135], ['ready', 110]]),
         marks: [mark('ci-sent', 238, 'CI failure sent'), mark('review-start', 205, 'review round 1'), mark('comments-sent', 185, '4 findings sent'), mark('review-start', 135, 'review round 2')] }),
       track({ key: 'docs-revamp', lane: 'building', reason: 'the agent is working; no PR yet', pr: null,
-        owner: { agent: 'grok', model: 'grok-4.7', activity: 'working', supervised: true },
+        owner: { agent: 'opencode', model: 'deepinfra/deepseek-ai/DeepSeek-V4-Pro', activity: 'working', supervised: true },
         segments: segs([['building', 90]]) }),
       track({ key: 'flaky-test', lane: 'merged', reason: 'merged',
         pr: { number: 39, title: 'Fix flaky checkout test', url: '#', sha: 'f'.repeat(40), base: 'main', ci: 'passing', failing: [], openThreads: 0 },

@@ -76,6 +76,21 @@ document.head.append(style)
 const root = el('div', { class: 'app' })
 document.body.append(root)
 
+// Orca hands frames its theme's colors but not whether the theme is dark: tell from the background,
+// and again whenever Orca changes the variables in place.
+function syncDark(): void {
+  if (!getComputedStyle(document.documentElement).getPropertyValue('--orca-background').trim()) return
+  const probe = document.createElement('span')
+  probe.style.color = 'var(--orca-background)'
+  document.body.append(probe)
+  const rgb = getComputedStyle(probe).color.match(/\d+(\.\d+)?/g)?.slice(0, 3).map(Number)
+  probe.remove()
+  if (!rgb || rgb.length < 3) return
+  document.documentElement.classList.toggle('dark', 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2] < 128)
+}
+syncDark()
+new MutationObserver(syncDark).observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] })
+
 async function request<T>(fn: () => Promise<T>): Promise<T | null> {
   state.busy = true
   render(true)
@@ -405,7 +420,8 @@ function card(t: TrackView): HTMLElement {
     el('div', { class: 'top' },
       pr ? el('a', { title: 'Open the PR on GitHub', onclick: () => openPr(pr.url) }, `#${pr.number}`) : null,
       el('span', { class: 'name', title: pr?.title ?? t.workspace.name }, t.role === 'supervisor' ? 'Supervisor' : pr?.title || t.workspace.name)),
-    el('div', { class: 'muted' }, el('a', { title: 'Open the worktree in Orca', onclick: () => openTrack(t) }, t.workspace.name), t.workspace.branch ? ` · ${t.workspace.branch}` : ''),
+    // Without a PR the title already is the worktree's name, so it is not repeated here.
+    el('div', { class: 'muted' }, el('a', { title: 'Open the worktree in Orca', onclick: () => openTrack(t) }, pr || t.role === 'supervisor' ? t.workspace.name : 'Open the worktree'), t.workspace.branch ? ` · ${t.workspace.branch}` : ''),
     el('div', { class: 'chips' },
       el('span', { class: 'pill' }, lane.label),
       pr ? el('span', { class: 'pill', title: pr.failing.join(', ') }, `CI ${pr.ci}${pr.failing.length ? ` (${pr.failing.length})` : ''}`) : null,
@@ -604,7 +620,7 @@ function projectPage(b: Board, r: RepoView): HTMLElement[] {
     // With the form open, its own notes replace the project's.
     problems(b, [open ? { ...r, warnings: [] } : r], false),
     supervisorCard(r),
-    tracks.length ? chips(tracks, b) : null,
+    tracks.length ? chips(tracks.filter((t) => !isIdle(t)), b) : null,
     ...(tracks.some((t) => !isIdle(t))
       ? work(tracks.filter((t) => !isIdle(t)), b, false)
       : [el('div', { class: 'empty muted' }, tracks.length ? 'Nothing in flight right now.' : 'No work here yet. Open the supervisor chat and tell it what to build: each worker shows up here as a worktree, then as a PR.')]),
@@ -614,7 +630,7 @@ function projectPage(b: Board, r: RepoView): HTMLElement[] {
 
 function allPage(b: Board): HTMLElement[] {
   return [
-    chips(b.tracks, b),
+    chips(b.tracks.filter((t) => !isIdle(t)), b),
     attention(b, null),
     problems(b, b.repos, true),
     ...(b.tracks.some((t) => !isIdle(t)) ? work(b.tracks.filter((t) => !isIdle(t)), b, true) : [el('div', { class: 'empty muted' }, 'Nothing in flight in any project.')]),
@@ -671,6 +687,7 @@ function addPage(b: Board): HTMLElement[] {
 }
 
 function render(force = false): void {
+  syncDark()
   // Re-rendering replaces the DOM; never do it under the person's cursor unless they acted.
   const active = document.activeElement
   if (!force && active && root.contains(active) && (active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement || active instanceof HTMLSelectElement)) {
