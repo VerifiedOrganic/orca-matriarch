@@ -172,7 +172,16 @@ export function plan(input: PlanInput): Plan {
 
   if (pr.state === 'MERGED') return { lane: 'merged', reason: 'merged', actions: [] }
   if (pr.state === 'CLOSED') return { lane: 'closed', reason: 'closed without merging', actions: [] }
-  if (pr.draft) return { lane: 'draft', reason: 'draft PR', actions: [] }
+  if (pr.draft) {
+    // A draft is still being built: its worker's turn shows as work, and a worker stuck on a
+    // prompt is a stall, as on any PR. Only a draft nobody is working on is quiet.
+    if (owner?.activity === 'working') return { lane: 'working', reason: 'draft PR; the worker is mid-turn', actions: [] }
+    if (owner?.activity === 'waiting' || owner?.activity === 'blocked') {
+      const e = escalate(input, `input:${owner.since}`, `the worker on draft #${pr.number} is waiting for input`)
+      return { lane: 'needs-you', reason: `draft PR; the worker is ${owner.activity} on input`, actions: e.actions }
+    }
+    return { lane: 'draft', reason: 'draft PR', actions: [] }
+  }
 
   if (ledger.merge?.sha === sha) {
     if (ledger.merge.status === 'requested' && input.now - ledger.merge.at > MERGE_TIMEOUT_MS) {

@@ -18,6 +18,10 @@ describe('lanes before any action', () => {
     assert.equal(plan(input({ pr: pr({ state: 'MERGED' }) })).lane, 'merged')
     assert.equal(plan(input({ pr: pr({ state: 'CLOSED' }) })).lane, 'closed')
     assert.equal(plan(input({ pr: pr({ draft: true }) })).lane, 'draft')
+    // A draft someone is working on is work, not idle; a draft whose worker is stuck needs someone.
+    assert.equal(plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'working' }) })).lane, 'working')
+    assert.equal(plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'waiting' }) })).lane, 'needs-you')
+    assert.equal(plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'done' }) })).lane, 'draft')
   })
 
   test('a worker waiting for input escalates to the supervisor first', () => {
