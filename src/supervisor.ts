@@ -73,6 +73,8 @@ export function supervisorBrief({ repo, root, objective, tag, base, config }: Br
     '   removes each PR\'s worktree itself once the PR merges.',
     '5. Matriarch runs the PR lifecycle: CI failures, review comments and conflicts go back to the',
     '   worker that owns the branch, and its review crew reviews every PR. Do not review or merge PRs yourself.',
+    '   It takes up a PR only once it is ready: keep one as a draft only while it waits on something, and mark it',
+    '   ready (gh pr ready <number>) as soon as its work is done.',
     config.merge.mode === 'auto'
       ? '   Matriarch merges each PR itself once its review passes. Never ask the user to merge: wait for the PR to show MERGED (gh pr view <n> --json state) before starting work that depends on it.'
       : '   The user merges each PR once Matriarch marks it ready. Say in this chat which PR is ready and what waits on it, and keep other independent tasks moving meanwhile.',

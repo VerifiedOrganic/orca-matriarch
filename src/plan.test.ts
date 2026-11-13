@@ -1,6 +1,6 @@
 import { assert, describe, test } from 'orca/testing'
 import { emptyLedger, record, type PrLedger } from './ledger.ts'
-import { CI_GRACE_MS, MERGE_TIMEOUT_MS, plan, selectReviewers, type Action } from './plan.ts'
+import { CI_GRACE_MS, DRAFT_NUDGE_MS, MERGE_TIMEOUT_MS, plan, selectReviewers, type Action } from './plan.ts'
 import { check, config, input, owner, pr, SHA, thread } from './testing/fixtures.ts'
 
 const kinds = (actions: Action[]) => actions.map((a) => a.kind)
@@ -22,6 +22,23 @@ describe('lanes before any action', () => {
     assert.equal(plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'working' }) })).lane, 'working')
     assert.equal(plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'waiting' }) })).lane, 'needs-you')
     assert.equal(plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'done' }) })).lane, 'draft')
+  })
+
+  test('a draft nobody works on gets the supervisor asked once per commit to mark it ready', () => {
+    const quiet = (over: Partial<Parameters<typeof input>[0]>) =>
+      plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'done' }), ledger: { ...emptyLedger(), heads: { [SHA]: 0 } }, ...over }))
+    // Too soon, or no supervisor to ask: nothing.
+    assert.deepEqual(quiet({ now: DRAFT_NUDGE_MS - 1, supervisor: 'run:r1' }).actions, [])
+    assert.deepEqual(quiet({ now: DRAFT_NUDGE_MS, supervisor: null }).actions, [])
+    // Then the supervisor, never you.
+    const asked = quiet({ now: DRAFT_NUDGE_MS, supervisor: 'run:r1' })
+    assert.equal(asked.lane, 'draft')
+    assert.deepEqual(asked.actions.map((a) => [a.kind, a.kind === 'escalate' ? a.to : null]), [['escalate', 'supervisor']])
+    assert.ok(asked.actions[0].kind === 'escalate' && asked.actions[0].reason.includes('mark it ready (gh pr ready 12)'))
+    // Once per commit.
+    const again = plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'done' }), supervisor: 'run:r1', now: DRAFT_NUDGE_MS * 4,
+      ledger: { ...emptyLedger(), heads: { [SHA]: 0 }, escalations: { [`draft:${SHA}:supervisor`]: { to: 'supervisor', at: 1, reason: 'r' } } } }))
+    assert.deepEqual(again.actions, [])
   })
 
   test('a worker mid-turn is building the PR, or fixing it, and the board says which', () => {

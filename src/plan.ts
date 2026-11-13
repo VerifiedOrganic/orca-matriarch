@@ -190,6 +190,9 @@ function workingLane(input: PlanInput): Plan {
   return { lane: 'working', reason: `${draft}the worker is mid-turn`, actions: [] }
 }
 
+/** How long a draft sits with nobody working on it before the supervisor is asked about it. */
+export const DRAFT_NUDGE_MS = 15 * 60_000
+
 export function plan(input: PlanInput): Plan {
   const { pr, owner, ledger, config } = input
   const sha = pr.headSha
@@ -203,6 +206,23 @@ export function plan(input: PlanInput): Plan {
     if (owner?.activity === 'waiting' || owner?.activity === 'blocked') {
       const e = escalate(input, `input:${owner.since}`, `the worker on draft #${pr.number} is waiting for input`)
       return { lane: 'needs-you', reason: `draft PR; the worker is ${owner.activity} on input`, actions: e.actions }
+    }
+    // Matriarch takes a PR through CI, review and merge only once it is ready. A draft nobody is
+    // working on waits for someone to mark it so: ask the supervisor, once per commit, to mark it
+    // ready if its work is done or leave it if it waits on something (a check of its own). Never
+    // you: a draft you keep on purpose is yours, and without a supervisor nothing is sent.
+    const quietFor = input.now - (ledger.heads[sha] ?? input.now)
+    if (input.supervisor && quietFor >= DRAFT_NUDGE_MS) {
+      const key = `draft:${sha}:supervisor`
+      if (ledger.escalations[key]) return { lane: 'draft', reason: 'draft PR; the supervisor was asked to mark it ready or say why it waits', actions: [] }
+      return {
+        lane: 'draft',
+        reason: 'draft PR; asking the supervisor to mark it ready or say why it waits',
+        actions: [{
+          kind: 'escalate', to: 'supervisor', key, address: input.supervisor,
+          reason: `#${pr.number} has been a draft for ${Math.round(quietFor / 60_000)} min with nobody working on it. Matriarch takes a PR through CI, review and merge only once it is ready. If its work is done, mark it ready (gh pr ready ${pr.number}); if it waits on something, leave it as a draft.`
+        }]
+      }
     }
     return { lane: 'draft', reason: 'draft PR', actions: [] }
   }
