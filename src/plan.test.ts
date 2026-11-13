@@ -24,6 +24,21 @@ describe('lanes before any action', () => {
     assert.equal(plan(input({ pr: pr({ draft: true }), owner: owner({ activity: 'done' }) })).lane, 'draft')
   })
 
+  test('a worker mid-turn is building the PR, or fixing it, and the board says which', () => {
+    const busy = owner({ activity: 'working' })
+    const lane = (ledger: PrLedger, o = busy, draft = false) => plan(input({ pr: pr({ draft }), owner: o, ledger })).lane
+    // Its builder's first turn: still building.
+    assert.equal(lane({ ...emptyLedger(), builder: { address: 'dispatch:d1', done: false } }), 'working')
+    // What Matriarch sent it for this commit.
+    assert.equal(lane({ ...emptyLedger(), ci: { [SHA]: { at: 1, signature: 's' } } }), 'fixing-ci')
+    assert.equal(lane({ ...emptyLedger(), conflicts: { [SHA]: { at: 1 } } }), 'fixing-conflict')
+    assert.equal(lane({ ...emptyLedger(), reviews: { [SHA]: { round: 1, status: 'done', startedAt: 1, endedAt: 2, verdict: 'changes', findings: 1, delivered: true } } }), 'fixing-review')
+    // Another worker took it over (a heavier tier after a failed gate), or the builder came back.
+    assert.equal(lane({ ...emptyLedger(), builder: { address: 'dispatch:d0', done: true } }), 'fixing')
+    assert.equal(lane({ ...emptyLedger(), builder: { address: 'dispatch:d1', done: true } }, busy, true), 'fixing')
+    assert.ok(plan(input({ pr: pr({ draft: true }), owner: busy, ledger: { ...emptyLedger(), builder: { address: 'dispatch:d0', done: true } } })).reason.startsWith('draft PR; codex is fixing it'))
+  })
+
   test('a worker waiting for input escalates to the supervisor first', () => {
     const p = plan(input({ owner: owner({ activity: 'waiting', since: 42 }), supervisor: 'run:r1' }))
     assert.equal(p.lane, 'needs-you')

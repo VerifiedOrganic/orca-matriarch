@@ -301,3 +301,18 @@ describe('a nearly full disk', () => {
     assert.equal((await tick(h.deps, { autopilot: false })).attention.some((a) => a.key === 'disk'), false, 'unknown is not low')
   })
 })
+
+describe("a PR's builder", () => {
+  test('is the first worker seen on it, and is marked done once it finishes a turn', async () => {
+    const h = harness([pr({ number: 12 })])
+    let state = 'ready'
+    h.deps.workers = async () => [{ dispatchId: 'd1', worktreeId: 'ws-login', taskId: 't', runId: 'r', agent: 'opencode', model: null, state, live: true }]
+    await tick(h.deps, { autopilot: false })
+    const first = h.store.get(ledgerKey('acme/app', 12)) as { builder?: { address: string; done: boolean } }
+    assert.equal(first.builder?.address, 'dispatch:d1')
+    // Another worker later on the PR does not replace its builder.
+    h.deps.workers = async () => [{ dispatchId: 'd2', worktreeId: 'ws-login', taskId: 't2', runId: 'r', agent: 'codex', model: null, state, live: true }]
+    await tick(h.deps, { autopilot: false })
+    assert.equal((h.store.get(ledgerKey('acme/app', 12)) as { builder?: { address: string } }).builder?.address, 'dispatch:d1')
+  })
+})

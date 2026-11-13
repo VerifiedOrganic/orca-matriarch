@@ -20,6 +20,7 @@ export const LANES: Record<Lane, { label: string; group: Group }> = {
   'fixing-ci': { label: 'Fixing CI', group: 'fixing' },
   'fixing-conflict': { label: 'Fixing conflicts', group: 'fixing' },
   'fixing-review': { label: 'Fixing review', group: 'fixing' },
+  fixing: { label: 'Fixing', group: 'fixing' },
   'ai-review': { label: 'AI review', group: 'review' },
   working: { label: 'Working', group: 'active' },
   building: { label: 'Building', group: 'active' },

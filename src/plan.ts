@@ -15,6 +15,7 @@ export type Lane =
   | 'fixing-ci'
   | 'fixing-conflict'
   | 'fixing-review'
+  | 'fixing' // a worker is changing the PR after its first version, for a reason Matriarch did not send
   | 'ai-review'
   | 'needs-you'
   | 'ready'
@@ -166,6 +167,29 @@ function fixStep(
   }
 }
 
+/**
+ * What a worker mid-turn on a PR is doing. Fixing what Matriarch sent it for this commit (failing
+ * checks, conflicts, review findings or comments); fixing it for some other reason, when another
+ * worker took the PR over or its builder came back after finishing; or still building it.
+ */
+function workingLane(input: PlanInput): Plan {
+  const { pr, owner, ledger } = input
+  const sha = pr.headSha
+  const who = owner?.agent ?? 'the worker'
+  const draft = pr.draft ? 'draft PR; ' : ''
+  if (ledger.ci[sha]) return { lane: 'fixing-ci', reason: `${draft}${who} is fixing the failing checks it was sent`, actions: [] }
+  if (ledger.conflicts[sha]) return { lane: 'fixing-conflict', reason: `${draft}${who} is resolving the conflicts with ${pr.baseRef}`, actions: [] }
+  const review = ledger.reviews[sha]
+  if ((review?.verdict === 'changes' && (review.delivered || review.published)) || ledger.comments[sha]) {
+    return { lane: 'fixing-review', reason: `${draft}${who} is addressing the review`, actions: [] }
+  }
+  const b = ledger.builder
+  if (b && owner?.address && (b.address !== owner.address || b.done)) {
+    return { lane: 'fixing', reason: `${draft}${who} is fixing it after its first version`, actions: [] }
+  }
+  return { lane: 'working', reason: `${draft}the worker is mid-turn`, actions: [] }
+}
+
 export function plan(input: PlanInput): Plan {
   const { pr, owner, ledger, config } = input
   const sha = pr.headSha
@@ -175,7 +199,7 @@ export function plan(input: PlanInput): Plan {
   if (pr.draft) {
     // A draft is still being built: its worker's turn shows as work, and a worker stuck on a
     // prompt is a stall, as on any PR. Only a draft nobody is working on is quiet.
-    if (owner?.activity === 'working') return { lane: 'working', reason: 'draft PR; the worker is mid-turn', actions: [] }
+    if (owner?.activity === 'working') return workingLane(input)
     if (owner?.activity === 'waiting' || owner?.activity === 'blocked') {
       const e = escalate(input, `input:${owner.since}`, `the worker on draft #${pr.number} is waiting for input`)
       return { lane: 'needs-you', reason: `draft PR; the worker is ${owner.activity} on input`, actions: e.actions }
@@ -195,7 +219,7 @@ export function plan(input: PlanInput): Plan {
     }
   }
 
-  if (owner?.activity === 'working') return { lane: 'working', reason: 'the worker is mid-turn', actions: [] }
+  if (owner?.activity === 'working') return workingLane(input)
   if (owner?.activity === 'waiting' || owner?.activity === 'blocked') {
     const e = escalate(input, `input:${owner.since}`, `the worker on #${pr.number} is waiting for input`)
     return { lane: 'needs-you', reason: `the worker is ${owner.activity} on input`, actions: e.actions }

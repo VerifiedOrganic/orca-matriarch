@@ -106,6 +106,7 @@ const LANE_ORDER: Lane[] = [
   'fixing-ci',
   'fixing-conflict',
   'fixing-review',
+  'fixing',
   'ai-review',
   'merging',
   'ready',
@@ -548,6 +549,17 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       const ws = item.ws
       const worker = ws ? byWorktree.get(ws) : undefined
       const owner = ws ? ownerFor(ws, worker, deps.activity(ws.id, ws.path)) : null
+      // Who built the PR: the first worker seen on it, and whether it finished a turn since.
+      if (owner?.address) {
+        const b = item.ledger.builder
+        const next = !b
+          ? { address: owner.address, done: owner.activity === 'done' }
+          : b.address === owner.address && owner.activity === 'done' && !b.done ? { ...b, done: true } : null
+        if (next) {
+          item.ledger = { ...item.ledger, builder: next }
+          await deps.store.set(ledgerKey(repoKey, snap.number), item.ledger as unknown as JsonValue)
+        }
+      }
       const run = deps.crew ? await deps.crew.get(repoKey, snap.number, snap.headSha).catch(() => null) : null
       const p = plan({
         pr: snap,

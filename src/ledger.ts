@@ -39,6 +39,11 @@ export interface PrLedger {
   heads: Record<string, number>
   /** CI checks have shown up on this PR at least once: "no checks" is then a gap, not "no CI". */
   ciSeen?: boolean
+  /**
+   * The worker that built the PR (the first one seen on it), and whether it has finished a turn
+   * since. Work by another worker, or by this one after that, is a fix.
+   */
+  builder?: { address: string; done: boolean }
 }
 
 export const ledgerKey = (repo: string, number: number): string => `pr:${repo}#${number}`
@@ -66,7 +71,8 @@ export function loadLedger(raw: unknown): PrLedger {
     notified: { ...rec(r.notified) },
     merge: typeof merge.sha === 'string' ? (merge as unknown as PrLedger['merge']) : base.merge,
     heads: { ...rec(r.heads) },
-    ...(r.ciSeen === true ? { ciSeen: true } : {})
+    ...(r.ciSeen === true ? { ciSeen: true } : {}),
+    ...(typeof rec(r.builder).address === 'string' ? { builder: { address: rec(r.builder).address as string, done: rec(r.builder).done === true } } : {})
   }
 }
 
