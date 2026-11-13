@@ -15,9 +15,9 @@ import { forgeTerms, gitlabRef, parseRemote, repoKey, type ForgeReader, type Rep
 import { createGitHub, parseGitHubRemote, type GitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
 import { ledgerKey, loadLedger, record, roundsUsed } from './ledger.ts'
-import { createdTerminal, createOrcaCli, listWorkers, OrcaRefusal, OrcaUnavailable, type OrcaCli } from './orca-cli.ts'
+import { createdTerminal, createOrcaCli, listWorkers, OrcaRefusal, OrcaUnavailable, sendMessage, type OrcaCli } from './orca-cli.ts'
 import { selectReviewers, type Activity, type Lane } from './plan.ts'
-import { findTaggedRun, supervisorBrief, supervisorLaunchArgs, supervisorTag } from './supervisor.ts'
+import { findTaggedRun, supervisorBrief, supervisorLaunchArgs, supervisorTag, workerSettingsMessage } from './supervisor.ts'
 import { emptyBoard, type Board, type ProjectInfo } from './protocol.ts'
 
 export interface WorkerOptions {
@@ -718,7 +718,16 @@ export function createWorker(options: WorkerOptions = {}) {
       if (!root) return { saved: false, errors: [`${repo} is not on.`], warnings: [] }
       const checked = validateConfig(config)
       if (checked.errors.length > 0) return { saved: false, errors: checked.errors, warnings: checked.warnings }
+      const before = await deps.readConfig(root).catch(() => null)
       await writeConfig(root, checked.config)
+      // A running supervisor got its worker commands in its brief, when its chat began: tell it the
+      // new ones, so the next worker it starts runs on the new agent, model and thinking level.
+      const run = board.repos.find((r) => r.repo === repo)?.supervisor.run
+      if (run && JSON.stringify(before?.config.workers ?? null) !== JSON.stringify(checked.config.workers)) {
+        const m = workerSettingsMessage(checked.config)
+        await sendMessage(cli, { to: run, subject: m.subject, body: m.body, from: await mailboxFor(repo, root) })
+          .catch((error: Error) => orca.log(`${repo}: could not tell the supervisor about the new worker settings: ${error.message}`))
+      }
       // The forge setting decides which forge the project is read from: look it up again.
       repoOf = createRepoResolver(exec)
       await runTick()

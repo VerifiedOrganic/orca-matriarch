@@ -2,7 +2,7 @@ import { assert, test } from 'orca/testing'
 import { validateConfig } from './config.ts'
 import { tick, type EngineDeps } from './engine.ts'
 import type { Action } from './plan.ts'
-import { findTaggedRun, supervisorBrief, supervisorLaunchArgs, supervisorTag, workerStart } from './supervisor.ts'
+import { findTaggedRun, supervisorBrief, supervisorLaunchArgs, supervisorTag, workerSettingsMessage, workerStart } from './supervisor.ts'
 import { check, config, pr } from './testing/fixtures.ts'
 
 test('the brief tags the Run, gives exact worker settings per tier and the PR contract', () => {
@@ -138,4 +138,15 @@ test('a new project names no models: each agent runs its own default until one i
   assert.equal(d.workers.default.model, undefined)
   assert.ok(d.reviewers.every((r) => r.model === undefined))
   assert.ok(supervisorBrief({ repo: 'acme/app', objective: 'x', tag: 't', base: 'main', config: d }).includes("--agent 'codex' --json"))
+})
+
+test('a running supervisor is told the new worker commands when Settings change them', () => {
+  const c = config((x) => {
+    x.workers.default = { agent: 'omp', model: 'deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017', effort: 'max' }
+    x.workers.tiers = { heavy: { agent: 'codex', model: 'gpt-6.1-sol', effort: 'xhigh' } }
+  })
+  const m = workerSettingsMessage(c)
+  assert.equal(m.subject, 'Worker settings changed')
+  assert.ok(m.body.includes("default: orca orchestration worker-start --task <taskId> --worktree path:<worktree path> --agent 'omp' --model 'deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017' --effort 'max' --json"))
+  assert.ok(m.body.includes("heavy: orca orchestration worker-start --task <taskId> --worktree path:<worktree path> --agent 'codex' --model 'gpt-6.1-sol' --effort 'xhigh' --json"))
 })

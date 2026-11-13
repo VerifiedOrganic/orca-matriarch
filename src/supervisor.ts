@@ -97,6 +97,20 @@ export function supervisorBrief({ repo, root, objective, tag, base, config, forg
   ].join('\n')
 }
 
+/** What a running supervisor is told when the worker settings change in Settings. */
+export function workerSettingsMessage(config: MatriarchConfig): { subject: string; body: string } {
+  const tiers = Object.entries(config.workers.tiers)
+  return {
+    subject: 'Worker settings changed',
+    body: [
+      'The user changed the worker settings. From now on, start every worker with exactly these, instead of the ones in your brief:',
+      `- default: ${workerStart(config.workers.default)}`,
+      ...tiers.map(([name, role]) => `- ${name}: ${workerStart(role)}`),
+      'Workers already running keep their settings. Pass the --effort shown; do not change the agent or the model.'
+    ].join('\n')
+  }
+}
+
 /** The Run whose objective starts with the tag, from `orca orchestration run-list --json`. */
 export function findTaggedRun(result: unknown, tag: string): string | null {
   const r = typeof result === 'object' && result !== null ? (result as Record<string, unknown>) : {}
