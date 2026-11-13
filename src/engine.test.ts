@@ -1,6 +1,6 @@
 import { assert, describe, test } from 'orca/testing'
 import { validateConfig } from './config.ts'
-import { tick, type EngineDeps, type Workspace } from './engine.ts'
+import { FINISHED_GRACE_MS, tick, type EngineDeps, type Workspace } from './engine.ts'
 import type { Executor } from './executor.ts'
 import type { GitHub, PrSnapshot } from './github.ts'
 import { ledgerKey } from './ledger.ts'
@@ -314,5 +314,50 @@ describe("a PR's builder", () => {
     h.deps.workers = async () => [{ dispatchId: 'd2', worktreeId: 'ws-login', taskId: 't2', runId: 'r', agent: 'codex', model: null, state, live: true }]
     await tick(h.deps, { autopilot: false })
     assert.equal((h.store.get(ledgerKey('acme/app', 12)) as { builder?: { address: string } }).builder?.address, 'dispatch:d1')
+  })
+})
+
+describe("a finished worktree that never became a PR", () => {
+  const gate = { id: 'ws-gate', kind: 'worktree' as const, name: 'P1 gate review', path: '/r/wt/gate', branch: null, hostId: null }
+  const mine = { id: 'ws-mine', kind: 'worktree' as const, name: 'my spike', path: '/r/wt/mine', branch: 'spike', hostId: null }
+  const setup = () => {
+    const h = harness([], { workspaces: [gate, mine] })
+    const removed: { path: string; keepBranch?: boolean }[] = []
+    h.deps.removeWorktree = async (path, options) => (removed.push({ path, keepBranch: options?.keepBranch }), { removed: true })
+    h.deps.workers = async () => [
+      { dispatchId: 'd-gate', worktreeId: 'ws-gate', taskId: 't', runId: 'r1', agent: 'codex', model: null, state: 'succeeded', live: false },
+      // A worktree some other Run used: a person's, or another supervisor's.
+      { dispatchId: 'd-mine', worktreeId: 'ws-mine', taskId: 't2', runId: 'other', agent: 'codex', model: null, state: 'succeeded', live: false }
+    ]
+    return { h, removed }
+  }
+
+  test("goes an hour after the supervisor's last worker there finished, keeping its branch", async () => {
+    const { h, removed } = setup()
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(removed, [], 'not yet: its worker just finished')
+    h.advance(FINISHED_GRACE_MS)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(removed, [{ path: '/r/wt/gate', keepBranch: true }], "only the supervisor's own worktree")
+  })
+
+  test('stays in dry run, while a worker is live there, and when the setting is off', async () => {
+    const dry = setup()
+    await tick(dry.h.deps, { autopilot: false })
+    dry.h.advance(FINISHED_GRACE_MS)
+    await tick(dry.h.deps, { autopilot: false })
+    assert.deepEqual(dry.removed, [])
+    const live = setup()
+    live.h.deps.workers = async () => [{ dispatchId: 'd-gate', worktreeId: 'ws-gate', taskId: 't', runId: 'r1', agent: 'codex', model: null, state: 'ready', live: true }]
+    await tick(live.h.deps, { autopilot: true })
+    live.h.advance(FINISHED_GRACE_MS)
+    await tick(live.h.deps, { autopilot: true })
+    assert.deepEqual(live.removed, [])
+    const off = setup()
+    off.h.deps.readConfig = async () => validateConfig({ review: { enabled: false }, merge: { removeFinishedWorktrees: false } })
+    await tick(off.h.deps, { autopilot: true })
+    off.h.advance(FINISHED_GRACE_MS)
+    await tick(off.h.deps, { autopilot: true })
+    assert.deepEqual(off.removed, [])
   })
 })

@@ -378,11 +378,22 @@ export function createWorker(options: WorkerOptions = {}) {
         const s = await statfs(path)
         return Number(s.bavail) * Number(s.bsize)
       },
-      removeWorktree: async (path) => {
+      removeWorktree: async (path, options) => {
         // Only a clean worktree goes: anything uncommitted, even an untracked file, keeps it.
         const status = await exec('git', ['-C', path, 'status', '--porcelain'], { timeoutMs: 15_000 })
         if (status.code !== 0) return { removed: false, reason: 'git status failed there' }
         if (status.stdout.trim()) return { removed: false, reason: 'it has uncommitted changes' }
+        if (options?.keepBranch) {
+          // A worktree that never became a PR keeps its branch, and goes only if every commit on that
+          // branch is on a remote. One on a detached commit (a gate checking a PR) has none of its own.
+          const onBranch = (await exec('git', ['-C', path, 'symbolic-ref', '-q', 'HEAD'], { timeoutMs: 10_000 })).code === 0
+          if (onBranch) {
+            const unpushed = await exec('git', ['-C', path, 'rev-list', '--count', 'HEAD', '--not', '--remotes'], { timeoutMs: 15_000 })
+            if (unpushed.code !== 0 || unpushed.stdout.trim() !== '0') return { removed: false, reason: 'it has commits that are not pushed' }
+          }
+          await cli.run(['worktree', 'rm', '--worktree', `path:${path}`])
+          return { removed: true }
+        }
         await cli.run(['worktree', 'rm', '--worktree', `path:${path}`, '--delete-branch'])
         return { removed: true }
       },

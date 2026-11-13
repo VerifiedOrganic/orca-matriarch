@@ -99,6 +99,11 @@ export interface MatriarchConfig {
     deleteBranch: boolean
     /** Removes a merged PR's worktree once no worker runs there and it has nothing uncommitted. */
     removeWorktree: boolean
+    /**
+     * Removes a worktree the supervisor's workers used that never became a PR (a gate, an audit, a
+     * spike), an hour after its last worker finished, when nothing in it is uncommitted or unpushed.
+     */
+    removeFinishedWorktrees: boolean
   }
   escalation: { supervisorFirst: boolean; humanAfterMinutes: number }
   limits: { maxConcurrentReviews: number }
@@ -142,7 +147,8 @@ export function defaultConfig(): MatriarchConfig {
       updateBranch: 'rebase',
       onBaseRed: 'pause',
       deleteBranch: true,
-      removeWorktree: true
+      removeWorktree: true,
+      removeFinishedWorktrees: true
     },
     escalation: { supervisorFirst: true, humanAfterMinutes: 30 },
     limits: { maxConcurrentReviews: 2 }
@@ -416,7 +422,8 @@ export function validateConfig(raw: unknown): ConfigResult {
     updateBranch: r.oneOf(mg, 'updateBranch', ['rebase', 'merge', 'off'] as const, d.merge.updateBranch, 'merge'),
     onBaseRed: r.oneOf(mg, 'onBaseRed', ['pause', 'fix-forward', 'revert'] as const, d.merge.onBaseRed, 'merge'),
     deleteBranch: r.bool(mg, 'deleteBranch', d.merge.deleteBranch, 'merge'),
-    removeWorktree: r.bool(mg, 'removeWorktree', d.merge.removeWorktree, 'merge')
+    removeWorktree: r.bool(mg, 'removeWorktree', d.merge.removeWorktree, 'merge'),
+    removeFinishedWorktrees: r.bool(mg, 'removeFinishedWorktrees', d.merge.removeFinishedWorktrees, 'merge')
   }
 
   const es = r.section(raw, 'escalation', 'config')

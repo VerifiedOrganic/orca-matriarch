@@ -79,7 +79,7 @@ export interface EngineDeps {
    * Removes a merged PR's worktree when it is safe: answers why not (uncommitted changes, Orca
    * refused) otherwise. Absent where nothing is removed (tests of other parts).
    */
-  removeWorktree?: (path: string) => Promise<{ removed: boolean; reason?: string }>
+  removeWorktree?: (path: string, options?: { keepBranch?: boolean }) => Promise<{ removed: boolean; reason?: string }>
   /** Bytes free on the disk holding a path; null when it cannot tell. */
   freeSpace?: (path: string) => Promise<number | null>
 }
@@ -96,6 +96,8 @@ interface PendingCleanup {
   kept?: string
 }
 const CLEANUP_GIVE_UP_MS = 7 * 24 * 3600_000
+/** How long a worktree that never became a PR stays after its last worker finished. */
+export const FINISHED_GRACE_MS = 60 * 60_000
 
 export interface TickOptions {
   autopilot: boolean
@@ -564,6 +566,33 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         if (res.reason && res.reason !== c.kept) view.warnings.push(`Kept the worktree of merged #${c.number} (${ws.name}): ${res.reason}.`)
       }
       if (still.length !== pending.length || still.some((c, i) => c.kept !== pending[i]?.kept)) await deps.store.set(`cleanup:${repoKey}`, still as unknown as JsonValue)
+    }
+
+    // Worktrees the supervisor's workers used that never became a PR (a gate, an audit, a spike):
+    // removed an hour after Matriarch first sees no worker live there, when nothing in them is
+    // uncommitted or unpushed. Only worktrees of the supervisor's own Run, never one a person made.
+    if (acting && listed && deps.removeWorktree && config.merge.removeFinishedWorktrees && supervisor) {
+      const prBranches = new Set(summaries.map((s) => s.headRef))
+      const merging = new Set((((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []).map((c) => c.path))
+      const finishedKey = `finished:${repoKey}`
+      const seen = ((await deps.store.get(finishedKey)) as Record<string, number> | null) ?? {}
+      const still: Record<string, number> = {}
+      for (const ws of repoWorkspaces) {
+        if (ws.path === info.root || merging.has(ws.path) || prBranches.has(branchName(ws.branch) ?? '')) continue
+        const row = byWorktree.get(ws)
+        if (!row?.runId || `run:${row.runId}` !== supervisor || row.live !== false) continue
+        const act = deps.activity(ws.id, ws.path)
+        if (act && ['working', 'waiting', 'blocked'].includes(act.activity)) continue
+        const since = seen[ws.path] ?? now
+        if (now - since < FINISHED_GRACE_MS) {
+          still[ws.path] = since
+          continue
+        }
+        const res = await deps.removeWorktree(ws.path, { keepBranch: true }).catch((error: Error) => ({ removed: false, reason: error.message }))
+        if (res.removed) deps.log(`${repoKey}: removed ${ws.name}, a finished worktree that never became a PR (${ws.path})`)
+        else still[ws.path] = since
+      }
+      if (JSON.stringify(still) !== JSON.stringify(seen)) await deps.store.set(finishedKey, still as unknown as JsonValue)
     }
 
     const seenWorkspaces = new Set<string>()
