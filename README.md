@@ -6,8 +6,8 @@ A supervisor for your pod of coding agents in [Orca](https://www.onorca.dev). Yo
 supervisor agent what to build; it plans the work and starts workers, each in its own worktree,
 on the agents and models you picked. Matriarch then drives every PR they open (a merge request,
 on GitLab) through CI, review comments, conflicts, an AI review by a crew of reviewers on several
-providers, fixes, and merge, and shows all of it on one timeline. Projects can be on GitHub, on
-gitlab.com, or on a GitLab of your own.
+providers, fixes, and merge, and shows all of it on one timeline. Projects can be on GitHub or,
+**experimentally**, on gitlab.com or a GitLab of your own (see [Limits](#limits)).
 
 It starts in **dry run**: it watches and shows what it would do until you turn on autopilot.
 
@@ -37,10 +37,15 @@ permission prompt for you: those show as **Needs you**.
 - Orca **1.4.257** or newer, with orchestration turned on (Settings → Experimental), so the
   supervisor can start and message workers.
 - For projects on GitHub: the GitHub CLI, `gh`, signed in. Only github.com (not GitHub Enterprise).
-- For projects on GitLab, gitlab.com or self-hosted: the GitLab CLI, `glab`, signed in to that
+- **Experimental:** for projects on GitLab, gitlab.com or self-hosted: the GitLab CLI, `glab`, signed in to that
   host (`glab auth login --hostname <host>`). glab keeps the token; Matriarch never sees it.
 - The agents you want to use, installed and signed in. Any agent Orca can start works as the
   supervisor or a worker; reviewers start read-only only on **Claude Code** and **Codex**.
+  - Orca starts a worker on the thinking level you pick for Claude Code, Codex, Cursor,
+    Antigravity, Grok, Muse and **Oh My Pi**. OpenCode workers get the model you pick but run at
+    OpenCode's own default thinking level until Orca can pass one
+    ([orca#19980](https://github.com/stablyai/orca/issues/19980)). For DeepSeek, Ollama or another
+    provider at a chosen thinking level, use Oh My Pi.
 - `git`, and `sqlite3` to read your Orca settings (macOS includes it).
 
 Matriarch has been run on macOS. It should work wherever Orca and these tools do, but Linux and
@@ -212,7 +217,7 @@ it.
 
 - GitHub (github.com) and GitLab (gitlab.com or self-hosted), and only PRs you opened from an Orca
   workspace's branch.
-- On GitLab:
+- On GitLab (**experimental**):
   - every check reads the open merge requests: GitLab has no free "nothing changed" answer, and
     counts a 304 against its rate limit like any request;
   - `merge.method` decides only whether to squash; the project's merge method in GitLab decides
