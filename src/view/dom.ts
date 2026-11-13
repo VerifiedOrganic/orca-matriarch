@@ -43,7 +43,7 @@ export function checkbox(checked: boolean, label: string, onchange: (on: boolean
     el('input', { type: 'checkbox', checked, onchange: (e) => onchange((e.target as HTMLInputElement).checked) }), label)
 }
 
-/** A labelled form field: the label above, then the control and an optional hint. */
-export function field(label: string, control: Child, hint?: string): HTMLElement {
-  return el('label', { class: 'field' }, el('span', { class: 'field-label' }, label), control, hint ? el('span', { class: 'muted hint' }, hint) : null)
+/** An on/off switch: a checkbox drawn as a switch, labelled by whatever points at its id. */
+export function toggle(checked: boolean, onchange: (on: boolean) => void, attrs: Attrs = {}): HTMLElement {
+  return el('input', { type: 'checkbox', role: 'switch', class: 'switch', checked, ...attrs, onchange: (e) => onchange((e.target as HTMLInputElement).checked) })
 }
