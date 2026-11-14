@@ -9,7 +9,7 @@
 // pipeline status moved, or every few minutes (QUIET_REFRESH_MS) for what the list cannot show.
 // Merge requests are read into the same PrSnapshot as GitHub's PRs, so the planner reads both.
 import type { Exec, ExecOptions, ExecResult } from './exec.ts'
-import { ISSUE_PAGES, issueText, projectPath, repoKey, tailLog, type Forge, type ForgeReview, type IssueInfo, type LabelCheck, type Outcome, type RepoRef } from './forge.ts'
+import { ISSUE_PAGES, issueText, projectPath, repoKey, tailLog, type Forge, type ForgeReview, type IssueInfo, type LabelCheck, type Outcome, type RepoRef, type FileMoves } from './forge.ts'
 import {
   ciStateOf,
   OUR_MARKER,
@@ -351,6 +351,9 @@ export function reviewNote(review: ForgeReview): string {
   return [review.body, '', '#### Blocking findings', '', ...findings].join('\n')
 }
 
+/** Pages of 100 files read for a merge request's moves: more than this, and it cannot say. */
+const MAX_DIFF_PAGES = 30
+
 export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'glab'): Forge {
   /** Each project's default branch as GitLab last named it, to read that branch's pipelines. */
   const defaults = new Map<string, string>()
@@ -439,6 +442,36 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     return res.stdout
   }
 
+  /** A REST read with its status and headers; null when glab gave nothing to read. */
+  async function restResponse(repo: RepoRef, path: string): Promise<{ status: number | null; headers: Record<string, string>; body: unknown } | null> {
+    const res = await glab(repo, ['-i', path], { timeoutMs: 60_000 }).catch(() => null)
+    if (!res || res.code === 127) return null
+    const { status, headers, body } = splitInclude(res.stdout)
+    let parsed: unknown = null
+    try {
+      parsed = JSON.parse(body)
+    } catch {
+      parsed = null
+    }
+    return { status: status ?? (res.code === 0 ? 200 : null), headers, body: parsed }
+  }
+
+  /** Old and new paths from GitLab's per-file diff entries, or null when one is malformed. */
+  function movesOf(entries: readonly unknown[]): FileMoves | null {
+    const renamed: string[] = []
+    const paths = new Set<string>()
+    for (const e of entries) {
+      const o = obj(e)
+      const from = str(o.old_path)
+      const to = str(o.new_path)
+      if (!from || !to || typeof o.renamed_file !== 'boolean') return null
+      paths.add(from)
+      paths.add(to)
+      if (o.renamed_file) renamed.push(to)
+    }
+    return { renamed, paths: [...paths] }
+  }
+
   async function act(repo: RepoRef, what: string, args: string[]): Promise<Outcome> {
     const res = await glab(repo, args, { timeoutMs: 120_000 })
     return res.code === 0 ? { ok: true } : { ok: false, error: `glab api ${what}: ${(res.stderr || res.stdout).trim().slice(0, 400)}` }
@@ -477,6 +510,29 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
         if (m.mergeable !== 'UNKNOWN') pr = { ...pr, ...m }
       }
       return { pr, rate }
+    },
+    // Each file's old and new path, from the merge request's diffs (GitLab 15.7 and later), else
+    // from its changes on an older GitLab. Anything short of the whole list answers null.
+    async fileMoves(repo, number) {
+      const base = rest(projectPath(repo), `merge_requests/${number}`)
+      const entries: unknown[] = []
+      for (let page = 1; page <= MAX_DIFF_PAGES; page++) {
+        const res = await restResponse(repo, `${base}/diffs?per_page=100&page=${page}`)
+        if (!res) return null
+        if (res.status === 404 && page === 1) {
+          // No diffs endpoint here: the older changes endpoint lists every file, unless it overflowed.
+          const old = await restResponse(repo, `${base}/changes`)
+          const body = obj(old?.body)
+          if (old?.status !== 200 || body.overflow === true || !Array.isArray(body.changes)) return null
+          return movesOf(body.changes)
+        }
+        if (res.status !== 200 || !Array.isArray(res.body)) return null
+        entries.push(...res.body)
+        const next = res.headers['x-next-page']
+        if (!next) return movesOf(entries)
+      }
+      // More files than Matriarch reads one by one.
+      return null
     },
     // Pinned to the reviewed commit: GitLab refuses the merge when `sha` is no longer the head.
     merge: (repo, pr, sha, method, deleteBranch) =>

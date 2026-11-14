@@ -135,9 +135,18 @@ export function selectReviewers(config: MatriarchConfig, authorAgent: string | n
  * globs that matched, to say why, or null. Anything the forge cannot say counts against it.
  */
 export function lightChange(config: MatriarchConfig, pr: PrSnapshot): string[] | null {
+  if (!Array.isArray(pr.renamed) || pr.renamed.length > 0) return null
+  return lightPaths(config, pr)
+}
+
+/**
+ * The light test without renames: the forge listed every file, each matches the light paths and
+ * none always gets the full crew. A PR that passes it but whose forge cannot say what was renamed
+ * (GitLab) is worth asking file by file. Answers the globs that matched, or null.
+ */
+export function lightPaths(config: MatriarchConfig, pr: PrSnapshot): string[] | null {
   const { paths } = config.review.light
-  if (pr.filesTruncated || !Array.isArray(pr.renamed) || pr.renamed.length > 0) return null
-  if (!everyPathMatches(paths, pr.files) || matchingGlobs(ALWAYS_FULL_REVIEW, pr.files).length > 0) return null
+  if (pr.filesTruncated || !everyPathMatches(paths, pr.files) || matchingGlobs(ALWAYS_FULL_REVIEW, pr.files).length > 0) return null
   return matchingGlobs(paths, pr.files)
 }
 

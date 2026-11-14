@@ -195,11 +195,16 @@ export interface AdviceState {
   /** Worktrees of finished questions that could not be removed yet. */
   leftovers: string[]
   last: { question: string; at: number; answered: boolean; note: string } | null
+  /** The project's main checkout, so the poll can send from its mailbox when no tick sees it. */
+  root: string | null
 }
 
 export function emptyAdviceState(): AdviceState {
-  return { v: 1, queue: [], running: null, seen: [], outbox: [], told: null, leftovers: [], last: null }
+  return { v: 1, queue: [], running: null, seen: [], outbox: [], told: null, leftovers: [], last: null, root: null }
 }
+
+/** Something to look after even when no tick sees the project: an advisor at work, mail, a worktree. */
+const needsTending = (state: AdviceState): boolean => state.running !== null || state.leftovers.length > 0 || state.outbox.length > 0
 
 function loadState(raw: unknown): AdviceState {
   const r = obj(raw)
@@ -213,7 +218,8 @@ function loadState(raw: unknown): AdviceState {
     outbox: list<{ subject: string; body: string }>(r.outbox),
     told: r.told && typeof r.told === 'object' ? (r.told as AdviceState['told']) : null,
     leftovers: list<string>(r.leftovers).filter((s) => typeof s === 'string'),
-    last: r.last && typeof r.last === 'object' ? (r.last as AdviceState['last']) : null
+    last: r.last && typeof r.last === 'object' ? (r.last as AdviceState['last']) : null,
+    root: typeof r.root === 'string' ? r.root : null
   }
 }
 
@@ -261,6 +267,21 @@ export interface AdviceStepInput {
   /** The default branch the advisor reads; null when the forge could not be read this tick. */
   base: string | null
   forge?: ForgeKind
+  /**
+   * Who the supervisor sends mail as: its chat's `orca_session_id:<id>`, its terminal's handle,
+   * the handle its Run is bound to. Only questions from one of these are answered; asked only
+   * when a question came.
+   */
+  supervisorSenders: () => Promise<readonly string[]>
+}
+
+export interface AdvicePollInput {
+  /** Projects this tick already stepped (or stopped): left alone here. */
+  skip: ReadonlySet<string>
+  /** Autopilot is on: answers and notices may be sent. */
+  acting: boolean
+  /** The supervisor's Run mailbox for a project, when one is known. */
+  supervisor(repo: string): Promise<string | null>
 }
 
 export interface AdvisorDeps extends Pick<CrewDeps, 'orca' | 'exec' | 'now' | 'log' | 'store' | 'readFile' | 'workspaceIdFor' | 'lockdown' | 'lockConfirmMs'> {
@@ -285,6 +306,12 @@ export interface Advisor {
    * project's advisor state cleared. Nothing to do costs one storage read.
    */
   stop(input: { repo: string; root: string; supervisor: () => Promise<string | null>; acting: boolean }): Promise<void>
+  /**
+   * Looks after every project with an advisor at work, mail waiting or a worktree left, that this
+   * tick did not step (its workspaces closed, say): timeouts, terminal checks, removals and mail
+   * go on, as review rounds are polled. New questions start only in a step. Answers each one's view.
+   */
+  poll(input: AdvicePollInput): Promise<{ repo: string; view: AdvisorView }[]>
   /** Records what a supervisor's brief said about the advisor, when its chat starts. */
   briefed(repo: string, advisor: { role: AdvisorSpec; address: string } | null): Promise<void>
   /** Workspaces and paths of advisors at work, for the read-only hooks (no await there). */
@@ -358,15 +385,25 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     state.running = null
   }
 
-  /** Reads the mailbox: new questions are saved before the batch is marked read. */
-  async function intake(state: AdviceState, repo: string, address: string, save: () => Promise<void>): Promise<void> {
-    const take = (items: MailItem[]) => {
+  /**
+   * Reads the mailbox: new questions are saved before the batch is marked read. Each is the full
+   * record (`--full`), so its sender is the address Orca stored, and only the supervisor's are
+   * taken. Anything else is dropped and logged; nobody is told, so the mailbox is no way in.
+   */
+  async function intake(state: AdviceState, repo: string, address: string, senders: () => Promise<readonly string[]>, save: () => Promise<void>): Promise<void> {
+    let known: ReadonlySet<string> | null = null
+    const take = async (items: MailItem[]): Promise<boolean> => {
       // A message is read once: its subject and body taken as Orca gave them.
       const fresh = items.filter((m) => m.complete && !state.seen.includes(m.id))
       for (const m of items) if (!m.complete) deps.log(`${repo}: a message in Matriarch's mailbox came without its subject or body (${m.id})`)
       if (fresh.length === 0) return false
       state.seen = [...state.seen, ...fresh.map((m) => m.id)].slice(-MAX_SEEN)
       for (const q of adviceQuestions(fresh, deps.now())) {
+        known ??= new Set(await senders().catch(() => []))
+        if (!q.from || !known.has(q.from)) {
+          deps.log(`${repo}: dropped a question for the advisor from ${q.from ?? 'an unknown sender'}, which is not the supervisor: "${clip(q.question, 80)}"`)
+          continue
+        }
         // The one about to start does not wait: it does not count against the queue.
         if (state.queue.length >= MAX_QUEUED + (state.running ? 0 : 1)) state.outbox.push(noAnswerMessage(q, `${MAX_QUEUED} questions already wait for it; ask again once some are answered`))
         else state.queue.push(q)
@@ -375,18 +412,18 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     }
     let peeked: MailItem[]
     try {
-      peeked = parseMail(await deps.orca.run(['orchestration', 'check', '--terminal', address, '--peek']))
+      peeked = parseMail(await deps.orca.run(['orchestration', 'check', '--terminal', address, '--peek', '--full']))
     } catch (error) {
       noteGone(repo, address, error)
       deps.log(`${repo}: could not read Matriarch's mailbox: ${(error as Error).message}`)
       return
     }
     if (peeked.length === 0) return
-    if (take(peeked)) await save()
+    if (await take(peeked)) await save()
     // Only Matriarch reads its own mailbox: marking the batch read keeps the next look short. Mail
     // that arrived since the peek comes in this batch, with its subject and body.
-    const consumed = await deps.orca.run(['orchestration', 'check', '--terminal', address]).catch(() => null)
-    if (consumed && take(parseMail(consumed))) await save()
+    const consumed = await deps.orca.run(['orchestration', 'check', '--terminal', address, '--full']).catch(() => null)
+    if (consumed && (await take(parseMail(consumed)))) await save()
   }
 
   /**
@@ -542,6 +579,35 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     deps.log(`${input.repo}: the advisor (${advisorName(role)}) is answering "${q.question}"`)
   }
 
+  /** What the board shows of a project's advisor. */
+  function viewOf(state: AdviceState, shown: AdvisorSpec | null, usable: boolean, at: { acting: boolean; supervisor: string | null; waitingForBase: boolean }): AdvisorView {
+    const run = state.running
+    return {
+      agent: shown?.agent ?? run?.agent ?? '',
+      model: shown?.model ?? run?.model ?? null,
+      effort: shown?.effort ?? run?.effort ?? null,
+      usable,
+      answering: run
+        ? {
+            question: run.question,
+            since: run.startedAt,
+            blocked: run.blocked,
+            terminal: run.blocked ? run.blockedTerminal : null,
+            workspaceId: run.worktree?.workspaceId ?? null,
+            lock: run.lock ? LOCK_LABEL[run.lock] : null
+          }
+        : null,
+      queued: state.queue.length,
+      waiting:
+        state.queue.length === 0 && state.outbox.length === 0 ? null
+        : !at.acting ? 'autopilot is off'
+        : !at.supervisor ? 'no supervisor is running to answer'
+        : at.waitingForBase ? 'waiting to read the default branch'
+        : null,
+      last: state.last
+    }
+  }
+
   /** Sends what waits in the outbox, in order; what fails stays for the next tick. */
   async function flush(state: AdviceState, repo: string, root: string, supervisor: string): Promise<void> {
     if (state.outbox.length === 0) return
@@ -597,8 +663,9 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       const still: string[] = []
       for (const p of state.leftovers) if (!(await removeWorktree(p))) still.push(p)
       if (still.length > 0) {
-        // Kept only to finish removing its worktrees; nothing more is sent.
+        // Kept only to finish removing its worktrees (the poll retries them); nothing more is sent.
         await deps.store.set(key, { ...emptyAdviceState(), leftovers: still } as unknown as JsonValue)
+        await setActive(repo, true)
         return
       }
       await deps.store.set(key, null)
@@ -609,6 +676,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       const key = stateKey(input.repo)
       const state = loadState(await deps.store.get(key))
       const before = JSON.stringify(state)
+      state.root = input.root
       const save = async () => {
         await deps.store.set(key, state as unknown as JsonValue)
       }
@@ -664,7 +732,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
             }
           }
         }
-        if (address) await intake(state, input.repo, address, save)
+        if (address) await intake(state, input.repo, address, input.supervisorSenders, save)
         if (state.running) await advance(state, input.repo)
         if (!state.running && state.queue.length > 0 && input.acting && input.supervisor && input.base) await start(state, input, role, input.base, save)
       }
@@ -672,36 +740,39 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       // Answers and refusals go out once Matriarch may send mail.
       if (canSend) await flush(state, input.repo, input.root, input.supervisor!)
       state.outbox = state.outbox.slice(-MAX_OUTBOX)
-      if (!state.running) await setActive(input.repo, state.leftovers.length > 0)
+      await setActive(input.repo, needsTending(state))
       if (JSON.stringify(state) !== before) await save()
 
       if (!role && !state.running && state.outbox.length === 0) return null
-      const shown = role ?? advisor
-      const run = state.running
-      return {
-        agent: shown?.agent ?? run?.agent ?? '',
-        model: shown?.model ?? run?.model ?? null,
-        effort: shown?.effort ?? run?.effort ?? null,
-        usable: role !== null,
-        answering: run
-          ? {
-              question: run.question,
-              since: run.startedAt,
-              blocked: run.blocked,
-              terminal: run.blocked ? run.blockedTerminal : null,
-              workspaceId: run.worktree?.workspaceId ?? null,
-              lock: run.lock ? LOCK_LABEL[run.lock] : null
-            }
-          : null,
-        queued: state.queue.length,
-        waiting:
-          state.queue.length === 0 && state.outbox.length === 0 ? null
-          : !input.acting ? 'autopilot is off'
-          : !input.supervisor ? 'no supervisor is running to answer'
-          : !input.base && !run ? 'waiting to read the default branch'
-          : null,
-        last: state.last
+      return viewOf(state, role ?? advisor, role !== null, {
+        acting: input.acting,
+        supervisor: input.supervisor,
+        waitingForBase: !input.base && !state.running
+      })
+    },
+
+    async poll({ skip, acting, supervisor: supervisorOf }) {
+      const v = await deps.store.get(ACTIVE)
+      const repos = (Array.isArray(v) ? v : []).filter((r): r is string => typeof r === 'string' && !skip.has(r))
+      const views: { repo: string; view: AdvisorView }[] = []
+      for (const repo of repos) {
+        const key = stateKey(repo)
+        const state = loadState(await deps.store.get(key))
+        const before = JSON.stringify(state)
+        if (state.leftovers.length > 0) {
+          const still: string[] = []
+          for (const p of state.leftovers) if (!(await removeWorktree(p))) still.push(p)
+          state.leftovers = still
+        }
+        if (state.running) await advance(state, repo)
+        const supervisor = acting && state.outbox.length > 0 ? await supervisorOf(repo).catch(() => null) : null
+        if (supervisor && state.root) await flush(state, repo, state.root, supervisor)
+        state.outbox = state.outbox.slice(-MAX_OUTBOX)
+        await setActive(repo, needsTending(state))
+        if (JSON.stringify(state) !== before) await deps.store.set(key, state as unknown as JsonValue)
+        if (state.running || state.outbox.length > 0) views.push({ repo, view: viewOf(state, null, true, { acting, supervisor, waitingForBase: false }) })
       }
+      return views
     }
   }
 }

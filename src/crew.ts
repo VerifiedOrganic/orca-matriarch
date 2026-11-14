@@ -238,6 +238,15 @@ export async function launchLocked(
   }
 }
 
+/**
+ * The Orca session a chat launch opened (`outcome.kind` "structured"): the id its orchestration
+ * mail is sent as, `orca_session_id:<id>`. Null for a terminal launch.
+ */
+export function launchedSession(result: unknown): string | null {
+  const outcome = obj(obj(result).outcome)
+  return outcome.kind === 'structured' ? str(outcome.sessionId) : null
+}
+
 export interface StartInput {
   pr: PrSnapshot
   /** The repository's main checkout. */

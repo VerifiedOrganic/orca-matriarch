@@ -72,8 +72,10 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
               // A PR changing only these files gets "one" reviewer (the first must-approve one) or "none".
               // Never for agents' instructions and tools' config (ALWAYS_FULL_REVIEW in config.ts:
               // AGENTS.md, CLAUDE.md, SKILL.md, .github/**, .claude/** …), renamed or copied files,
-              // a cut-short file list, or GitLab, whose file list does not say what was renamed. A
-              // round already on the commit (running, or asking for changes) still decides.
+              // old paths that are not light, or a cut-short file list. GitLab's file list cannot
+              // say what was renamed: a merge request that would be light is read file by file
+              // (REST diffs, or changes before 15.7), once per commit; no answer means full review.
+              // A round already on the commit (running, or asking for changes) still decides.
               "light": { "paths": ["**/*.md", "**/*.rst", "**/*.adoc"], "crew": "one" } },
   "fix": { "ci": { "enabled": true, "maxRounds": 3, "rerunFlaky": true }, "comments": { "enabled": true, "maxRounds": 3 },
            "conflicts": { "enabled": true, "maxRounds": 2 } },
@@ -360,11 +362,20 @@ supervisor chooses to ask.
   lost in a restart), Matriarch drops it and makes a new one. It records what each supervisor was
   told (its Run, the address, the advisor) and mails it again when any of these change, or when
   the advisor is turned off.
-- **Reading.** Each tick, `orchestration check --terminal <mailbox> --peek` reads new mail;
-  questions (`Advice: …`, also `Re: Advice: …`) are saved, by message id, before a plain `check`
-  marks the batch read, so a crash in between loses nothing and nothing is taken twice. Mail that
-  came between the two is taken from that batch. A message is marked read only once its subject or
-  body was read. Mail that is not a question is dropped.
+- **Reading.** Each tick, `orchestration check --terminal <mailbox> --peek --full` reads new mail
+  as Orca stores it; questions (`Advice: …`, also `Re: Advice: …`) are saved, by message id,
+  before a plain `check --full` marks the batch read, so a crash in between loses nothing and
+  nothing is taken twice. Mail that came between the two is taken from that batch. A message is
+  marked read only once its subject or body was read. Mail that is not a question is dropped.
+- **Only the supervisor.** A question counts only when its `from_handle` is one of the
+  supervisor's addresses; anything else is dropped and logged, and nobody is told. Orca 1.4.257
+  stores a sender as its caller's address: a chat (an Orca agent session) as
+  `orca_session_id:<id>`, the root id that survives `/clear`; a terminal agent as its terminal
+  handle. Matriarch keeps the session id from the chat's launch receipt (`outcome.sessionId` when
+  `outcome.kind` is `structured`) and the terminal from a terminal launch, and reads the handle
+  the Run is bound to now (`run-show --full`: `coordinator_handle`; Orca hides a Run's coordinator
+  session id). A supervisor Matriarch did not launch is known only by that handle, so a chat
+  started by hand gets no answers.
 - **Answering.** One question at a time per project, up to 10 waiting: a throwaway worktree of
   the default branch (a `matriarch/review-` branch, so the board skips it), the advisor launched
   there exactly as a reviewer is (same lockdown, same launch confirmation, same tool guard), and
@@ -379,6 +390,10 @@ supervisor chooses to ask.
   answer.
 - **Dry run.** Like automatic reviews it starts only with autopilot on. In dry run questions wait,
   and the board says so; answers and notices to the supervisor wait in an outbox until autopilot.
+- **Polled.** Like review rounds, every project with an advisor at work, mail waiting or a
+  worktree left (`advice:active`) is looked after each tick, also when no tick sees the project
+  (its workspaces closed): timeouts, terminal checks, removals and mail go on. Only a step, for a
+  project the tick sees, starts a new question.
 - **Turned off.** Turning the advisor off stops the question being answered and drops the waiting
   ones, and the supervisor is told both. Turning Matriarch off for the project does the same,
   removes the worktree and clears the project's advisor state.

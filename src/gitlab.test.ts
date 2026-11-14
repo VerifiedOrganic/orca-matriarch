@@ -3,7 +3,7 @@
 // glab answers in the shapes gitlab.com gives (src/testing/gitlab.ts); nothing reaches a network.
 import { assert, describe, test } from 'orca/testing'
 import { forgeSettingOf, validateConfig } from './config.ts'
-import { tick, type EngineDeps, type Workspace } from './engine.ts'
+import { MOVES_RETRY_MS, tick, type EngineDeps, type Workspace } from './engine.ts'
 import { createExecutor, type Executor } from './executor.ts'
 import { forgeTerms, gitlabRef, parseRemote, repoKey, type ForgeReader } from './forge.ts'
 import { actionableThreads, type PrSnapshot } from './github.ts'
@@ -389,5 +389,114 @@ describe('agent-facing commands come from the forge', () => {
     const m = commentsMessage(pr({ forge: 'gitlab' }), [thread('gid://gitlab/Discussion/1')], 1, 3)
     assert.ok(m.body.includes('discussionToggleResolve'))
     assert.ok(commentsMessage(pr(), [thread('T1')], 1, 3).body.includes('GraphQL resolveReviewThread'))
+  })
+})
+
+describe('GitLab renames, for a light review', () => {
+  const restReply = (body: unknown, headers: Record<string, string> = {}, status = '200 OK') =>
+    `HTTP/2.0 ${status}\r\nContent-Type: application/json\r\n${Object.entries(headers).map(([k, v]) => `${k}: ${v}\r\n`).join('')}\r\n${JSON.stringify(body)}`
+  const entry = (from: string, to: string, renamed = false) => ({ old_path: from, new_path: to, renamed_file: renamed, deleted_file: false, new_file: false, diff: '@@ -1 +1 @@' })
+  const pathOf = (args: readonly string[]) => args[args.indexOf('-i') + 1]
+
+  test("reads every page of the merge request's diffs: renamed files, and old and new paths", async () => {
+    const g = fakeGlab((args) => {
+      const path = pathOf(args)
+      if (path.endsWith('/diffs?per_page=100&page=1')) return { stdout: restReply([entry('docs/a.md', 'docs/a.md')], { 'X-Next-Page': '2' }) }
+      if (path.endsWith('/diffs?per_page=100&page=2')) return { stdout: restReply([entry('src/auth/session.ts', 'docs/session.md', true)], { 'X-Next-Page': '' }) }
+      return { code: 1, stdout: '' }
+    })
+    const moves = await createGitLab(g.exec).fileMoves!(REPO, 12)
+    assert.deepEqual(moves, { renamed: ['docs/session.md'], paths: ['docs/a.md', 'src/auth/session.ts', 'docs/session.md'] })
+    assert.ok(pathOf(g.calls[0].args).startsWith(`projects/${encodeURIComponent(PATH)}/merge_requests/12/diffs`))
+    assert.deepEqual(g.calls[0].args.slice(0, 3), ['api', '--hostname', HOST])
+  })
+
+  test('an older GitLab without the diffs endpoint is read from its changes; an overflow, an error or a bad entry cannot say', async () => {
+    const older = (changes: unknown) =>
+      fakeGlab((args) => {
+        const path = pathOf(args)
+        if (path.includes('/diffs?')) return { code: 1, stdout: restReply({ message: '404 Not found' }, {}, '404 Not Found') }
+        if (path.endsWith('/changes')) return { stdout: restReply(changes) }
+        return { code: 1 }
+      })
+    assert.deepEqual(await createGitLab(older({ changes: [entry('a.md', 'b.md', true)], overflow: false }).exec).fileMoves!(REPO, 12), { renamed: ['b.md'], paths: ['a.md', 'b.md'] })
+    assert.equal(await createGitLab(older({ changes: [entry('a.md', 'a.md')], overflow: true }).exec).fileMoves!(REPO, 12), null)
+    const broken = fakeGlab(() => ({ code: 1, stdout: restReply({ message: '500' }, {}, '500 Internal Server Error') }))
+    assert.equal(await createGitLab(broken.exec).fileMoves!(REPO, 12), null)
+    const odd = fakeGlab(() => ({ stdout: restReply([{ old_path: 'a.md', new_path: 'a.md' }]) }))
+    assert.equal(await createGitLab(odd.exec).fileMoves!(REPO, 12), null, 'an entry without renamed_file')
+    const silent = fakeGlab(() => ({ code: 1, stdout: '', stderr: 'glab: connection refused' }))
+    assert.equal(await createGitLab(silent.exec).fileMoves!(REPO, 12), null)
+  })
+
+  describe('in a tick', () => {
+    const T0 = 1_800_000_000_000
+    function tickHarness(moves: () => Promise<{ renamed: string[]; paths: string[] } | null>, files: string[]) {
+      const store = new Map<string, unknown>([[ledgerKey(KEY, 12), { heads: { [SHA]: 0 } }]])
+      const executed: Action[] = []
+      let now = T0
+      let asked = 0
+      const snap = pr({ forge: 'gitlab', repo: KEY, url: `https://${HOST}/${PATH}/-/merge_requests/12`, files, renamed: null })
+      const gitlab: ForgeReader = {
+        listOpen: async () => ({ viewer: 'me', rate: null, base: { name: 'main', sha: BASE_SHA, rollup: 'SUCCESS' }, prs: [{ number: 12, headRef: snap.headRef, headSha: snap.headSha, baseRef: 'main', author: 'me', updatedAt: snap.updatedAt, rollup: 'SUCCESS' }] }),
+        detail: async () => ({ pr: snap, rate: null }),
+        fileMoves: async () => (asked++, moves())
+      }
+      const deps: EngineDeps = {
+        now: () => now,
+        log: () => {},
+        workspaces: async () => [{ id: 'ws-login', kind: 'worktree', name: 'login', path: '/lab/wt/login', branch: 'refs/heads/feature/login', hostId: 'local' }],
+        repoOf: async () => ({ ref: REPO, key: KEY, root: '/lab' }),
+        // With crew "none" a light change skips the review, so a full review shows as one starting.
+        readConfig: async () => validateConfig({ review: { light: { crew: 'none' } } }),
+        github: { listOpen: async () => ({ viewer: 'me', prs: [], rate: null }), detail: async () => ({ pr: null, rate: null }) },
+        gitlab,
+        workers: async () => [{ dispatchId: 'd-login', worktreeId: 'ws-login', taskId: 't1', runId: 'r1', agent: 'opencode', model: null, state: 'idle' }],
+        activity: () => null,
+        supervisor: async () => null,
+        store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) },
+        executor: { execute: async (action) => (executed.push(action), { ok: true }) }
+      }
+      return { deps, executed, store, asked: () => asked, advance: (ms: number) => (now += ms) }
+    }
+    const reviewed = (executed: Action[]) => executed.some((a) => a.kind === 'start-review')
+
+    test('a docs-only merge request with no renames is a light change, read once per commit', async () => {
+      const h = tickHarness(async () => ({ renamed: [], paths: ['docs/guide.md'] }), ['docs/guide.md'])
+      const board = await tick(h.deps, { autopilot: true })
+      assert.equal(board.tracks[0].lane, 'ready')
+      assert.ok(board.tracks[0].reason.includes('AI review skipped: a light change'))
+      assert.ok(!reviewed(h.executed))
+      await tick(h.deps, { autopilot: true })
+      assert.equal(h.asked(), 1, 'the answer is kept for the commit')
+    })
+
+    test('a rename into docs, or an old path outside the light paths, gets the full crew', async () => {
+      const renamed = tickHarness(async () => ({ renamed: ['docs/session.md'], paths: ['src/auth/session.ts', 'docs/session.md'] }), ['docs/session.md'])
+      await tick(renamed.deps, { autopilot: true })
+      assert.ok(reviewed(renamed.executed))
+      // GitLab may list a moved file only by its new path; its old path counts too.
+      const moved = tickHarness(async () => ({ renamed: [], paths: ['src/auth/session.ts', 'docs/session.md'] }), ['docs/session.md'])
+      await tick(moved.deps, { autopilot: true })
+      assert.ok(reviewed(moved.executed))
+    })
+
+    test('a failed read gets the full crew, and is tried again later; a change that is not light is never read', async () => {
+      let answer: { renamed: string[]; paths: string[] } | null = null
+      const h = tickHarness(async () => answer, ['docs/guide.md'])
+      await tick(h.deps, { autopilot: true })
+      assert.ok(reviewed(h.executed), 'no answer: full review')
+      assert.equal(h.asked(), 1)
+      answer = { renamed: [], paths: ['docs/guide.md'] }
+      await tick(h.deps, { autopilot: true })
+      assert.equal(h.asked(), 1, 'not again at once')
+      h.advance(MOVES_RETRY_MS + 1)
+      await tick(h.deps, { autopilot: true })
+      assert.equal(h.asked(), 2)
+      const code = tickHarness(async () => ({ renamed: [], paths: ['src/a.ts'] }), ['src/a.ts'])
+      await tick(code.deps, { autopilot: true })
+      assert.equal(code.asked(), 0)
+      assert.ok(reviewed(code.executed))
+    })
   })
 })

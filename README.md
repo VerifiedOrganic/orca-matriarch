@@ -46,7 +46,8 @@ model (Claude on Fable at max effort, say). The supervisor asks it for a second 
 chooses to: a risky plan, a reviewer and a worker who disagree, being stuck, a step that is hard
 to undo. Matriarch runs it read-only in a throwaway worktree of the main branch, locked down like
 a reviewer, and mails its answer back to the supervisor's chat. It answers one question at a time,
-only with autopilot on, and costs nothing until the supervisor asks.
+only with autopilot on, only questions from the project's supervisor (anything else that reaches
+Matriarch's mailbox is dropped), and costs nothing until the supervisor asks.
 
 ## Requirements
 
@@ -201,8 +202,9 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
   full crew, even when they match: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`,
   `*.prompt.md`, `copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, and anything in a
   `.claude`, `.cursor`, `.github`, `.agents`, `.codex`, `.omp` or `.opencode` folder. So does a PR
-  that renames or copies a file, and on GitLab every merge request, since its file list does not
-  say which files were renamed;
+  that renames or copies a file, or whose old paths are not light. GitLab's file list does not say
+  what was renamed, so a merge request that looks light is read file by file, once per commit;
+  when that read fails, it gets the full crew;
 - **Reviews at once** (default 2) limits how many review crews run together.
 - **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
   supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
@@ -288,7 +290,8 @@ are not changed.
 | `orca terminal create` | once per project: a terminal titled "Matriarch mailbox" (`cat > /dev/null`), which Orca requires as the sender of Matriarch's messages |
 | `orca orchestration worker-list`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
 | `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations, labeled issues and the advisor's answers to the supervisor |
-| `orca orchestration check --terminal <mailbox> --peek`, then `check --terminal <mailbox>` | with an advisor: read the supervisor's questions sent to Matriarch's mailbox, then mark them read |
+| `orca orchestration check --terminal <mailbox> --peek --full`, then `check --terminal <mailbox> --full` | with an advisor: read the questions sent to Matriarch's mailbox, with their senders, then mark them read |
+| `orca orchestration run-show --id <run> --full` | with an advisor, when a question came: the handle the supervisor's Run is bound to, to tell its questions from anyone else's |
 | `orca orchestration worker-stop --dispatch <id>` | autopilot: stop a supervisor's worker that started over the project's worker limits (its worktree is kept) |
 | `git fetch origin …`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | a review round: a throwaway worktree at the PR head, one agent per reviewer, removed afterwards |
 | `git fetch origin <main>`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | autopilot, with an advisor: one throwaway worktree of the main branch per question, the advisor in it, removed once it answers |
@@ -306,6 +309,7 @@ are not changed.
 | `glab api --hostname <host> projects/<project>/jobs/<id>/trace` | GitLab, autopilot: the tail of a failed job's log, for the worker |
 | `glab api --hostname <host> projects/<project>/jobs/<id>`, `…/trace` | GitLab, once per failed job and commit: its failure reason and log, whether it failed on the infrastructure |
 | `glab api --hostname <host> -X POST …/jobs/<id>/retry` | GitLab, autopilot: retry, once, a job that failed on the infrastructure |
+| `glab api --hostname <host> -i …/merge_requests/<n>/diffs?per_page=100&page=<p>` | GitLab: once per commit, only for a merge request whose files all look light: which files it renamed, and their old paths (`…/changes` on a GitLab older than 15.7) |
 | `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n> -f target_branch=<branch>` | GitLab, autopilot: move a stacked merge request to where its parent merged |
