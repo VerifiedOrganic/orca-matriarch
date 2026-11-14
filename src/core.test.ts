@@ -233,7 +233,8 @@ describe('executor', () => {
     const action = { kind: 'send-rebase', to: 'dispatch:d1', sha: SHA, base: 'main', round: 1 } as const
     // Known finished: straight to the supervisor.
     const finished = { ...ctx, supervisor: 'run:r1', worktree: '/r/wt/login', ownerLive: false }
-    assert.deepEqual(await ex.execute(action, finished), { ok: true })
+    // The activity log says who got it, and why the supervisor did.
+    assert.deepEqual(await ex.execute(action, finished), { ok: true, sent: { to: 'supervisor', subject: '#12 needs a follow-up: #12 conflicts with main, round 1/2', note: 'its worker had finished, so the supervisor got it' } })
     const first = sent.at(-1)!
     assert.equal(first[first.indexOf('--to') + 1], 'run:r1')
     assert.ok(!first.includes('--type'), 'plain mail: Orca takes --type escalation only from a worker')
@@ -241,7 +242,7 @@ describe('executor', () => {
     assert.equal(first[first.indexOf('--from') + 1], 'term_mailbox')
     // Not known to be finished: Orca refuses, and it goes to the supervisor after all.
     sent.length = 0
-    assert.deepEqual(await ex.execute(action, { ...finished, ownerLive: null }), { ok: true })
+    assert.equal((await ex.execute(action, { ...finished, ownerLive: null })).sent?.to, 'supervisor')
     assert.deepEqual(sent.map((a) => a[a.indexOf('--to') + 1]), ['dispatch:d1', 'run:r1'])
   })
 
@@ -257,7 +258,7 @@ describe('executor', () => {
     const f = fakeExec((file, args) => (file === 'gh' ? { stdout: '2026-11-10T10:00:00.1Z step 1\n2026-11-10T10:00:01.2Z \u001b[31mError: boom\u001b[0m\n' } : args[0] === 'orchestration' ? { stdout: '{"ok":true,"result":{}}' } : {}))
     const ex = createExecutor({ exec: f.exec, orca: createOrcaCli(f.exec), notify: async () => {} })
     const out = await ex.execute({ kind: 'send-ci-failure', to: 'dispatch:d1', sha: SHA, round: 1, checks: [check('test', 'failure', 99)], signature: 'test' }, ctx)
-    assert.deepEqual(out, { ok: true })
+    assert.deepEqual(out, { ok: true, sent: { to: 'worker', subject: 'CI failed on #12 (a1b2c3d), round 1/3' } })
     assert.deepEqual(f.calls[0].args, ['api', 'repos/acme/app/actions/jobs/99/logs'])
     const send = f.calls[1].args
     const body = send[send.indexOf('--body') + 1]

@@ -92,13 +92,14 @@ export function createExecutor(deps: ExecutorDeps): Executor {
       const m = forSupervisor(ctx, to, subject, body)
       // Not --type escalation: Orca takes that only from a worker ("No active Dispatch belongs to this message sender").
       await sendMessage(deps.orca, { to: ctx.supervisor!, subject: m.subject, body: m.body, from })
-      return { ok: true }
+      return { ok: true, sent: { to: 'supervisor', subject: m.subject, note: 'its worker had finished, so the supervisor got it' } }
     }
     try {
       if (to.startsWith('dispatch:') && ctx.ownerLive === false && ctx.supervisor) return await viaSupervisor()
       // Matriarch is not a worker, so an escalation goes as plain mail with the word in its subject.
-      await sendMessage(deps.orca, { to, subject: type === 'escalation' && !/escalat/i.test(subject) ? `Escalation: ${subject}` : subject, body, from })
-      return { ok: true }
+      const sentSubject = type === 'escalation' && !/escalat/i.test(subject) ? `Escalation: ${subject}` : subject
+      await sendMessage(deps.orca, { to, subject: sentSubject, body, from })
+      return { ok: true, sent: { to: to.startsWith('dispatch:') ? 'worker' : 'supervisor', subject: sentSubject } }
     } catch (error) {
       const message = (error as Error).message
       if (to.startsWith('dispatch:') && ctx.supervisor && COORDINATOR_ONLY.test(message)) {
@@ -152,8 +153,9 @@ export function createExecutor(deps: ExecutorDeps): Executor {
             return send(ctx, action.address, m.subject, m.body, 'escalation')
           }
           try {
-            await deps.notify(`${pr.repo} #${pr.number} needs you`, action.reason)
-            return { ok: true }
+            const title = `${pr.repo} #${pr.number} needs you`
+            await deps.notify(title, action.reason)
+            return { ok: true, sent: { to: 'you', subject: title } }
           } catch (error) {
             return { ok: false, error: `notification: ${(error as Error).message}` }
           }
@@ -161,7 +163,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
         case 'notify':
           try {
             await deps.notify(action.title, action.body)
-            return { ok: true }
+            return { ok: true, sent: { to: 'you', subject: action.title } }
           } catch (error) {
             return { ok: false, error: `notification: ${(error as Error).message}` }
           }

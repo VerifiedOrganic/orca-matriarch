@@ -35,6 +35,26 @@ export interface Mark {
   label: string
 }
 
+/**
+ * One line of a track's activity log: something Matriarch did there (only what it carried out,
+ * never what dry run would do), a new commit, a review that finished, or a lane change with why.
+ */
+export interface LogEntry {
+  at: number
+  /** The action's kind (send-ci-failure, merge, ...), or `lane`, `push`, `review-done`, `cleanup`. */
+  kind: string
+  /** What happened, as a sentence. */
+  text: string
+  /** For a lane change: the lane it moved to. */
+  lane?: Lane
+  /** Who a message went to. */
+  to?: 'worker' | 'supervisor' | 'you'
+  /** The subject of the message it sent. */
+  subject?: string
+  /** It was tried and failed: why. */
+  error?: string
+}
+
 export interface ReviewerView {
   name: string
   agent: string
@@ -188,6 +208,8 @@ declare module 'orca' {
     'autopilot.set': { input: { on: boolean }; output: Board }
     /** Shows a track's workspace in Orca. */
     'track.open': { input: { key: string }; output: { opened: boolean } }
+    /** A track's activity log, newest first: what Matriarch did there and why. Read on demand, so the board stays light. */
+    'track.log': { input: { key: string }; output: { key: string; entries: LogEntry[] } }
     /** Brings a terminal to the front, such as a reviewer waiting on a prompt. */
     'terminal.focus': { input: { handle: string }; output: { opened: boolean } }
     /** Opens the repo's supervisor as a briefed chat; the objective is optional, the chat asks for it. */

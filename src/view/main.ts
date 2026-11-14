@@ -3,7 +3,7 @@
 // the top picks one (or all of them, or adding a new one), and each project shows its
 // supervisor, its settings and its own work as a swimlane timeline or a board by lane.
 import type { MatriarchConfig } from '../config.ts'
-import type { Board, ProjectInfo, RepoView, TrackView } from '../protocol.ts'
+import type { Board, LogEntry, ProjectInfo, RepoView, TrackView } from '../protocol.ts'
 import { el, sv } from './dom.ts'
 import { ago, bars, byGroup, concurrency, GROUPS, LANES, marksIn, scale, summary, ticks, type Group } from './layout.ts'
 import { draftConfig, settingsForm, settingsState, type SettingsState } from './settings.ts'
@@ -59,7 +59,9 @@ const state = {
   /** The project of the workspace focused in Orca, as the worker could tell it. */
   focus: null as { repo: string | null; root: string | null; enabled: boolean; name: string | null; candidates: string[] } | null,
   /** A render was skipped while the person typed. */
-  deferred: false
+  deferred: false,
+  /** The track whose activity log is open (one at a time), and what the worker answered. */
+  log: null as { key: string; entries: LogEntry[] | null; error: string | null } | null
 }
 
 const PAGE_KEY = 'matriarch.page'
@@ -308,6 +310,69 @@ function openTrack(t: TrackView): void {
   void request(() => orca.plugin.request('track.open', { key: t.workspace.id }))
 }
 
+/** Reads a track's log from the worker; the board does not carry it. */
+async function loadLog(key: string): Promise<void> {
+  try {
+    const res = await orca.plugin.request('track.log', { key })
+    if (state.log?.key === key) state.log = { key, entries: res.entries, error: null }
+  } catch (error) {
+    if (state.log?.key === key) state.log = { ...state.log, error: (error as Error).message }
+  }
+  render()
+}
+
+/** Opens (or closes) a track's activity log; `open` says which, else it flips. */
+function toggleLog(t: TrackView, open?: boolean): void {
+  const want = open ?? state.log?.key !== t.key
+  if (!want) {
+    if (state.log?.key === t.key) {
+      state.log = null
+      render(true)
+    }
+    return
+  }
+  if (state.log?.key === t.key) return
+  state.log = { key: t.key, entries: null, error: null }
+  render(true)
+  void loadLog(t.key)
+}
+
+/** A time of day, with the weekday when it was not today. */
+function clock(at: number): string {
+  const d = new Date(at)
+  const today = new Date().toDateString() === d.toDateString()
+  return today ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : d.toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+}
+
+/** What Matriarch did on a track and why, newest first. */
+function logList(t: TrackView): HTMLElement {
+  const l = state.log?.key === t.key ? state.log : null
+  if (l?.error && !l.entries) return el('div', { class: 'warn-text' }, `Could not read the log: ${l.error}`)
+  if (!l?.entries) return el('div', { class: 'muted log-note' }, 'Loading…')
+  if (!l.entries.length) return el('div', { class: 'muted log-note' }, 'Nothing yet. Each lane change shows here with why, and everything Matriarch does about it.')
+  return el('ol', { class: 'log' },
+    ...l.entries.map((e) =>
+      el('li', { class: e.error ? 'failed' : e.kind === 'lane' ? 'lane' : '' },
+        el('time', { title: new Date(e.at).toLocaleString() }, clock(e.at)),
+        el('div', { class: 'log-text' },
+          e.lane ? el('span', { class: 'dot', style: `background:${LANES[e.lane] ? COLOR[LANES[e.lane].group] : 'var(--m-quiet)'};margin-right:5px` }) : null,
+          e.lane ? el('b', {}, `${LANES[e.lane]?.label ?? e.lane}: `) : null,
+          e.text,
+          e.subject ? el('div', { class: 'muted' }, `“${e.subject}”`) : null,
+          e.error ? el('div', { class: 'warn-text' }, e.error) : null))))
+}
+
+/** A timeline row's log, under the row: what Matriarch did there, and a way to the worktree. */
+function rowLog(t: TrackView): HTMLElement {
+  return el('div', { class: 'row-log' },
+    el('div', { class: 'row-log-head' },
+      el('b', {}, 'What Matriarch did'),
+      el('span', { class: 'muted' }, t.pr ? `#${t.pr.number} · ${t.workspace.name}` : t.workspace.name),
+      t.key.startsWith('pr:') ? null : el('button', { class: 'ghost', title: 'Show the worktree in Orca', onclick: () => openTrack(t) }, 'Open the worktree'),
+      el('button', { class: 'ghost', title: 'Close the log', onclick: () => toggleLog(t, false) }, 'Close')),
+    logList(t))
+}
+
 function openPr(url: string): void {
   void orca.shell?.openExternal(url)
 }
@@ -397,12 +462,14 @@ function timeline(tracks: TrackView[], b: Board, headers: boolean): HTMLElement 
       ),
       sv('line', { x1: '99.7%', x2: '99.7%', y1: 0, y2: 26, class: 'now-line' })
     )
+    const open = state.log?.key === t.key
     rows.push(
-      el('div', { class: 'row' },
-        el('div', { class: 'label', title: `${LANES[t.lane].label}: ${t.reason}\nClick to open the worktree`, onclick: () => openTrack(t) },
+      el('div', { class: open ? 'row selected' : 'row' },
+        el('div', { class: 'label', title: `${LANES[t.lane].label}: ${t.reason}\nClick for what Matriarch did here`, 'aria-expanded': open ? 'true' : 'false', onclick: () => toggleLog(t) },
           el('span', { class: 'dot', style: `background:${COLOR[LANES[t.lane].group]};margin-right:6px` }), rowLabel(t)),
         svg)
     )
+    if (open) rows.push(rowLog(t))
   }
 
   return el(
@@ -466,7 +533,11 @@ function card(t: TrackView): HTMLElement {
     t.next.length ? el('div', { class: 'next' }, el('span', { class: 'muted' }, 'Would do next:'), el('ul', {}, ...t.next.map((n) => el('li', {}, n)))) : null,
     pr && t.review?.status !== 'running' && ['ai-review', 'ready', 'fixing-review', 'needs-you', 'awaiting-ci'].includes(t.lane)
       ? el('div', {}, el('button', { class: 'ghost', title: 'Run the review crew on this commit now; findings stay on this board until autopilot is on', onclick: () => void runReview(t) }, 'Run AI review now'))
-      : null
+      : null,
+    // Opening it reads the log from the worker; one log is open at a time.
+    el('details', { class: 'log-details', open: state.log?.key === t.key, ontoggle: (e) => toggleLog(t, (e.currentTarget as HTMLDetailsElement).open) },
+      el('summary', {}, 'What Matriarch did'),
+      state.log?.key === t.key ? logList(t) : null)
   )
 }
 
@@ -730,6 +801,8 @@ orca.on('workspace.changed', () => void followFocus())
 orca.plugin.on('board.changed', (b) => {
   state.board = b
   render()
+  // An open log follows the board: a new check may have added to it.
+  if (state.log) void loadLog(state.log.key)
 })
 // Keeps "updated … ago" and the open bars current; the layout itself follows resizes in CSS.
 setInterval(() => render(), 15_000)

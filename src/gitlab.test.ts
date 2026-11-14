@@ -226,7 +226,7 @@ describe('acting on GitLab', () => {
 
   test('GitLab cannot merge the base into a branch: the worker that owns it is asked instead', async () => {
     const { g, ex } = lab()
-    assert.deepEqual(await ex.execute({ kind: 'update-branch', sha: SHA, method: 'merge' }, { ...ctx, owner: 'dispatch:d1' }), { ok: true })
+    assert.deepEqual(await ex.execute({ kind: 'update-branch', sha: SHA, method: 'merge' }, { ...ctx, owner: 'dispatch:d1' }), { ok: true, sent: { to: 'worker', subject: '#12 is behind main: bring it up to date' } })
     assert.ok(!g.calls.some((c) => c.file === 'glab'))
     const send = g.calls[0].args
     assert.equal(send[send.indexOf('--to') + 1], 'dispatch:d1')
@@ -256,7 +256,7 @@ describe('acting on GitLab', () => {
     const g = fakeGlab((args) => (args.at(-1)?.endsWith('/trace') ? { stdout: trace } : { stdout: '{"ok":true,"result":{}}' }))
     const ex = createExecutor({ exec: g.exec, orca: createOrcaCli(g.exec), notify: async () => {} })
     const failing = snap.checks.filter((c) => c.state === 'failure')
-    assert.deepEqual(await ex.execute({ kind: 'send-ci-failure', to: 'dispatch:d1', sha: SHA, round: 1, checks: failing, signature: 'x' }, ctx), { ok: true })
+    assert.equal((await ex.execute({ kind: 'send-ci-failure', to: 'dispatch:d1', sha: SHA, round: 1, checks: failing, signature: 'x' }, ctx)).sent?.to, 'worker')
     assert.deepEqual(g.calls[0].args, ['api', '--hostname', HOST, 'projects/forks%2Fme%2Fapp/jobs/16152393446/trace'])
     assert.equal(jobProject(`https://${HOST}/group/sub/app/-/jobs/1`), 'group/sub/app')
     assert.equal(traceTail(trace), 'Executing "step_script"\nDownloading 100%\nFAIL: TestLogin')

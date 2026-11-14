@@ -98,6 +98,11 @@ manages only PRs you opened from a branch that belongs to an Orca workspace.
 - **Board:** cards by state with the agent and model, CI, comments and rounds used, and in dry
   run what Matriarch would do next. **Run AI review now** on any card runs the crew on that
   commit, in dry run too.
+- **What Matriarch did:** click a timeline row, or open **What Matriarch did** on a card, for
+  that PR's log, newest first: each lane it entered and why, new commits, finished reviews, and
+  every message it sent (to the worker, the supervisor or you, with its subject), branch update,
+  merge and cleanup, including what failed and why. Only what it did: dry run's plans stay in
+  **Would do next**. Kept for a week.
 - **Supervisor:** each project's chat, with the Run it coordinates and how many workers it has.
 - **Needs you:** a reviewer waiting on a prompt, an escalation that reached you, a nearly full
   disk. The status bar shows the same at a glance.

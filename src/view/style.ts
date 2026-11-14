@@ -258,6 +258,27 @@ button.quiet-danger:hover { background: color-mix(in srgb, var(--m-red) 10%, tra
 .grid-line { stroke: var(--orca-border); stroke-width: 1; }
 .mark { stroke: var(--orca-background); stroke-width: 1; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; }
+.row.selected { background: color-mix(in srgb, var(--orca-accent) 70%, transparent); }
+
+/* A track's activity log: under its timeline row, or folded at the foot of its card. */
+.row-log { border: 1px solid var(--orca-border); border-top: 0; background: var(--orca-card); padding: 6px 8px 8px; margin-bottom: 4px;
+  border-radius: 0 0 var(--orca-radius, 6px) var(--orca-radius, 6px); }
+.row-log-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.row-log-head > b, .row-log-head > button { flex: none; white-space: nowrap; }
+.row-log-head > button { padding: 2px 6px; }
+.row-log-head .muted { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+ol.log { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow-y: auto; font-size: 11.5px; }
+ol.log li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; padding: 3px 0; border-top: 1px solid color-mix(in srgb, var(--orca-border) 50%, transparent); }
+ol.log li:first-child { border-top: 0; }
+ol.log time { color: var(--orca-muted-foreground); font-variant-numeric: tabular-nums; white-space: nowrap; }
+ol.log .log-text { overflow-wrap: anywhere; }
+ol.log li.lane .log-text { color: var(--orca-muted-foreground); }
+ol.log li.lane .log-text b { color: var(--orca-foreground); font-weight: 500; }
+ol.log li.failed time { color: var(--m-fixing); }
+.log-note { font-size: 11px; padding: 2px 0; }
+.log-details { border-top: 1px dashed var(--orca-border); padding-top: 3px; font-size: 11px; }
+.log-details summary { cursor: pointer; color: var(--orca-muted-foreground); }
+.log-details[open] summary { margin-bottom: 3px; }
 
 /* Board */
 .columns { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); align-items: start; }

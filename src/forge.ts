@@ -42,6 +42,8 @@ export interface Outcome {
   error?: string
   /** Set when the action was deliberately not carried out (not built yet, say). */
   skipped?: string
+  /** The message it sent, for the activity log: who to, its subject, and why it went there. */
+  sent?: { to: 'worker' | 'supervisor' | 'you'; subject: string; note?: string }
 }
 
 /** Reads a forge's open PRs cheaply, and one PR in full. */

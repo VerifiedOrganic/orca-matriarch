@@ -1,12 +1,14 @@
 // A worktree's history: lane segments and point marks, kept in plugin storage and pruned to a
 // week. It is what the timeline draws, so it must survive worker restarts.
 import type { Lane } from './plan.ts'
-import type { Mark, Segment } from './protocol.ts'
+import type { LogEntry, Mark, Segment } from './protocol.ts'
 
 export interface TrackHistory {
   v: 1
   segments: Segment[]
   marks: Mark[]
+  /** What Matriarch did on this track and why, oldest first; read by the panel on demand. */
+  log: LogEntry[]
   /** The PR head commit last seen, to mark pushes. */
   lastSha?: string
   /** When the engine last saw this track's workspace; pruning goes by it. */
@@ -17,9 +19,10 @@ export const historyKey = (trackKey: string): string => `track:${trackKey}`
 export const KEEP_MS = 7 * 24 * 3600_000
 const MAX_SEGMENTS = 400
 const MAX_MARKS = 300
+const MAX_LOG = 300
 
 export function emptyHistory(): TrackHistory {
-  return { v: 1, segments: [], marks: [] }
+  return { v: 1, segments: [], marks: [], log: [] }
 }
 
 export function loadHistory(raw: unknown): TrackHistory {
@@ -28,12 +31,18 @@ export function loadHistory(raw: unknown): TrackHistory {
     v: 1,
     segments: Array.isArray(r.segments) ? r.segments.filter((s) => typeof s?.from === 'number') : [],
     marks: Array.isArray(r.marks) ? r.marks.filter((m) => typeof m?.at === 'number') : [],
+    // Histories saved before the log existed have none.
+    log: Array.isArray(r.log) ? r.log.filter((e) => typeof e?.at === 'number' && typeof e?.text === 'string') : [],
     ...(typeof r.lastSha === 'string' ? { lastSha: r.lastSha } : {}),
     ...(typeof r.seenAt === 'number' ? { seenAt: r.seenAt } : {})
   }
 }
 
-/** Records that the track is in `lane` now: extends the open segment or starts a new one. */
+/**
+ * Records that the track is in `lane` now: extends the open segment or starts a new one. A new
+ * lane goes in the log with its reason; a new reason within the same lane does not, since some
+ * reasons change every check (how long an agent has waited, say).
+ */
 export function noteLane(h: TrackHistory, lane: Lane, reason: string, now: number): TrackHistory {
   const segments = h.segments.slice()
   const last = segments[segments.length - 1]
@@ -44,11 +53,15 @@ export function noteLane(h: TrackHistory, lane: Lane, reason: string, now: numbe
   }
   if (last && last.to === null) segments[segments.length - 1] = { ...last, to: Math.max(now, last.from) }
   segments.push({ lane, from: now, to: null, reason })
-  return { ...h, segments }
+  return { ...h, segments, log: [...h.log, { at: now, kind: 'lane', lane, text: reason }] }
 }
 
 export function addMark(h: TrackHistory, mark: Mark): TrackHistory {
   return { ...h, marks: [...h.marks, mark] }
+}
+
+export function addLog(h: TrackHistory, entry: LogEntry): TrackHistory {
+  return { ...h, log: [...h.log, entry] }
 }
 
 /** Drops what ended before `now - keepMs` and caps the counts. */
@@ -56,8 +69,9 @@ export function prune(h: TrackHistory, now: number, keepMs = KEEP_MS): TrackHist
   const cutoff = now - keepMs
   const segments = h.segments.filter((s) => s.to === null || s.to >= cutoff).slice(-MAX_SEGMENTS)
   const marks = h.marks.filter((m) => m.at >= cutoff).slice(-MAX_MARKS)
-  if (segments.length === h.segments.length && marks.length === h.marks.length) return h
-  return { ...h, segments, marks }
+  const log = h.log.filter((e) => e.at >= cutoff).slice(-MAX_LOG)
+  if (segments.length === h.segments.length && marks.length === h.marks.length && log.length === h.log.length) return h
+  return { ...h, segments, marks, log }
 }
 
 /** The part of the history that overlaps `[since, ∞)`, segments clipped to start at `since`. */

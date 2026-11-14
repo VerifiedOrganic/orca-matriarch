@@ -3,19 +3,20 @@
 // and answer the board. Every dependency is injected, so a tick runs in tests without Orca, git,
 // GitHub or GitLab.
 import type { JsonValue } from 'orca/host'
+import { logEntry, markEntry } from './activity.ts'
 import { defaultConfig, type ConfigResult } from './config.ts'
 import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
 import type { Executor } from './executor.ts'
 import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
-import { addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
+import { addLog, addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
 import { ledgerKey, loadLedger, record, roundsUsed, type PrLedger } from './ledger.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
 import { MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
 import { supervisorTagPrefix } from './supervisor.ts'
-import type { Board, Mark, RepoView, TrackView } from './protocol.ts'
+import type { Board, LogEntry, Mark, RepoView, TrackView } from './protocol.ts'
 
 export interface Workspace {
   id: string
@@ -577,6 +578,11 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         const res = await deps.removeWorktree(ws.path).catch((error: Error) => ({ removed: false, reason: error.message }))
         if (res.removed) {
           deps.log(`${repoKey}: removed the worktree of merged #${c.number} (${ws.path})`)
+          // The merged PR stays on the board for a while under its own key once its worktree is
+          // gone: its timeline and activity log go with it.
+          const h = loadHistory(await deps.store.get(historyKey(ws.id)))
+          const entry: LogEntry = { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: no agent ran there and nothing in it was uncommitted` }
+          await deps.store.set(historyKey(`pr:${repoKey}#${c.number}`), addLog(h, entry) as unknown as JsonValue)
           continue
         }
         still.push({ ...c, kept: res.reason ?? 'not removed' })
@@ -659,6 +665,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
 
       let ledger = item.ledger
       const marks: Mark[] = []
+      // What was carried out (or tried) this tick, for the track's activity log.
+      const logged: LogEntry[] = []
       const ownerRow = item.ws ? byWorktree.get(item.ws) : undefined
       const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null, owner: owner?.address ?? null }
       const run1 = async (a: Action) => {
@@ -685,21 +693,25 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         if (outcome.ok) {
           ledger = record(ledger, action, now)
           marks.push(markFor(action, now, kind))
+          logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
           // Saved after each success, so a later failure in this tick cannot make it run twice.
           await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
           if (baseRedKey && escKey) await deps.store.set(baseRedKey, escKey)
           continue
         }
         if (outcome.skipped) continue
+        logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
         view.errors.push(`#${snap.number} ${action.kind}: ${outcome.error ?? 'failed'}`)
         if (action.kind === 'merge') ledger = { ...ledger, merge: { sha: action.sha, at: now, status: 'failed', error: outcome.error } }
         // A supervisor that cannot be reached: tell the person now, and forget a Run Orca lost.
         if (action.kind === 'escalate' && action.to === 'supervisor') {
           if (/run_not_found|dispatch_not_found|not found/i.test(outcome.error ?? '')) await deps.store.set(`supervisor:${repoKey}`, '')
           const human: Action = { kind: 'escalate', to: 'human', key: action.key.replace(/:supervisor$/, ':human'), reason: `${action.reason} (the supervisor could not be reached)`, address: null }
-          if ((await run1(human)).ok) {
+          const told = await run1(human)
+          if (told.ok) {
             ledger = record(record(ledger, action, now), human, now)
             marks.push(markFor(human, now, kind))
+            logged.push(logEntry(human, told, now, kind, describe(human, kind)))
             await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
           }
         }
@@ -709,11 +721,19 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       const trackKey = ws?.id ?? `pr:${repoKey}#${snap.number}`
       let history = loadHistory(await deps.store.get(historyKey(trackKey)))
       if (history.lastSha !== snap.headSha) {
-        if (history.lastSha) history = addMark(history, { at: now, kind: 'push', label: `pushed ${short(snap.headSha)}` })
+        if (history.lastSha) {
+          const push: Mark = { at: now, kind: 'push', label: `pushed ${short(snap.headSha)}` }
+          history = addLog(addMark(history, push), markEntry(push))
+        }
         history = { ...history, lastSha: snap.headSha }
       }
-      for (const m of [...(crewMarks.get(`${repoKey}#${snap.number}`) ?? []), ...marks]) history = addMark(history, m)
-      history = { ...prune(noteLane(history, p.lane, p.reason, now), now), seenAt: now }
+      // In the log, in the order they lead to each other: what came in (a commit, a finished
+      // review), the lane that put the PR in, then what Matriarch did about it.
+      for (const m of crewMarks.get(`${repoKey}#${snap.number}`) ?? []) history = addLog(addMark(history, m), markEntry(m))
+      history = noteLane(history, p.lane, p.reason, now)
+      for (const m of marks) history = addMark(history, m)
+      for (const e of logged) history = addLog(history, e)
+      history = { ...prune(history, now), seenAt: now }
       await deps.store.set(historyKey(trackKey), history as unknown as JsonValue)
       if (ws) seenWorkspaces.add(ws.id)
 

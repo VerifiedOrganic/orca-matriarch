@@ -18,7 +18,8 @@ import { ledgerKey, loadLedger, record, roundsUsed } from './ledger.ts'
 import { createdTerminal, createOrcaCli, listWorkers, OrcaRefusal, OrcaUnavailable, sendMessage, type OrcaCli } from './orca-cli.ts'
 import { selectReviewers, type Activity, type Lane } from './plan.ts'
 import { findTaggedRun, supervisorBrief, supervisorLaunchArgs, supervisorTag, workerSettingsMessage } from './supervisor.ts'
-import { emptyBoard, type Board, type ProjectInfo } from './protocol.ts'
+import { historyKey, loadHistory } from './history.ts'
+import { emptyBoard, type Board, type LogEntry, type ProjectInfo } from './protocol.ts'
 
 export interface WorkerOptions {
   /** Orca's data folder, for the person's profile and model catalog; Orca's default when unset. */
@@ -511,6 +512,12 @@ export function createWorker(options: WorkerOptions = {}) {
     orca.panels.handle('track.open', async ({ key }) => {
       await orca.host.call('workspace.open', { workspaceId: key })
       return { opened: true }
+    })
+    // Read only when the panel opens a track's log, so the board posted every tick stays small.
+    orca.panels.handle('track.log', async ({ key }) => {
+      const history = loadHistory(await orca.storage.get(historyKey(key)))
+      // Orca accepts only plain JSON from a worker: no undefined fields.
+      return JSON.parse(JSON.stringify({ key, entries: history.log.slice(-200).reverse() })) as { key: string; entries: LogEntry[] }
     })
 
     // Opens the supervisor as a native Orca chat, briefed: the person describes the work there.
