@@ -391,7 +391,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
     row('Hand labeled issues to the supervisor', null, toggle(d.issues.enabled, (on) => (d.issues.enabled = on))),
     dependent(
       row('Label', 'The label that hands an issue over.', textInput(d.issues.label, (v) => (d.issues.label = v.trim()), { placeholder: 'matriarch' })),
-      row('Comment on the issue', 'One short comment saying the supervisor took it up.', toggle(d.issues.comment, (on) => (d.issues.comment = on)))))
+      row('Comment on the issue', 'One short comment, posted as you, saying Matriarch handed it to the supervisor.', toggle(d.issues.comment, (on) => (d.issues.comment = on)))))
 
   const project = group('project', 'Project', () =>
     d.forge?.kind === 'gitlab' ? `GitLab${d.forge.host ? ` on ${d.forge.host}` : ", on the origin's host"}` : d.forge?.kind === 'github' ? 'GitHub' : 'GitHub or GitLab, found from its origin',
