@@ -1,11 +1,12 @@
 // The worker ⇄ view contract, shared by src/worker.ts and src/view/*. Also the stored shapes
 // of a track's history.
+import type { AlertFormat, AlertsSave, AlertsView } from './alerts.ts'
 import type { MatriarchConfig } from './config.ts'
 import type { ForgeKind } from './forge.ts'
 import type { CiState } from './github.ts'
 import type { Activity, Lane } from './plan.ts'
 
-export type { Activity, CiState, ForgeKind, Lane }
+export type { Activity, AlertFormat, AlertsSave, AlertsView, CiState, ForgeKind, Lane }
 
 /** A span of time a worktree spent in one lane. `to` is null while it is still there. */
 export interface Segment {
@@ -34,6 +35,26 @@ export interface Mark {
   at: number
   kind: MarkKind
   label: string
+}
+
+/**
+ * One line of a track's activity log: something Matriarch did there (only what it carried out,
+ * never what dry run would do), a new commit, a review that finished, or a lane change with why.
+ */
+export interface LogEntry {
+  at: number
+  /** The action's kind (send-ci-failure, merge, ...), or `lane`, `push`, `review-done`, `cleanup`. */
+  kind: string
+  /** What happened, as a sentence. */
+  text: string
+  /** For a lane change: the lane it moved to. */
+  lane?: Lane
+  /** Who a message went to. */
+  to?: 'worker' | 'supervisor' | 'you'
+  /** The subject of the message it sent. */
+  subject?: string
+  /** It was tried and failed: why. */
+  error?: string
 }
 
 export interface ReviewerView {
@@ -241,6 +262,8 @@ declare module 'orca' {
     'autopilot.set': { input: { on: boolean }; output: Board }
     /** Shows a track's workspace in Orca. */
     'track.open': { input: { key: string }; output: { opened: boolean } }
+    /** A track's activity log, newest first: what Matriarch did there and why. Read on demand, so the board stays light. */
+    'track.log': { input: { key: string }; output: { key: string; entries: LogEntry[] } }
     /** Brings a terminal to the front, such as a reviewer waiting on a prompt. */
     'terminal.focus': { input: { handle: string }; output: { opened: boolean } }
     /** Opens the repo's supervisor as a briefed chat; the objective is optional, the chat asks for it. */
@@ -274,6 +297,12 @@ declare module 'orca' {
     'config.get': { input: { repo: string }; output: { config: MatriarchConfig; errors: string[]; warnings: string[]; agents: AgentOption[] } }
     /** Checks and saves a project's settings; nothing is written when there are errors. */
     'config.save': { input: { repo: string; config: MatriarchConfig }; output: { saved: boolean; errors: string[]; warnings: string[] } }
+    /** The away-alert settings, for every project: the webhook's host, never its URL. */
+    'alerts.get': { output: AlertsView }
+    /** Saves the away-alert settings; the URL goes to Orca's encrypted secrets. `url` absent keeps the saved one, empty removes it. */
+    'alerts.save': { input: AlertsSave; output: { saved: boolean; error: string | null; alerts: AlertsView } }
+    /** Posts a test alert now, to the URL given (not saved yet) or the saved one. */
+    'alerts.test': { input: { url?: string; format?: AlertFormat | 'auto' }; output: { ok: boolean; error: string | null } }
   }
   interface PluginPanelEvents {
     /** Posted after every tick and every autopilot change. */

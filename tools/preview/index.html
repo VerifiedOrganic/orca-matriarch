@@ -119,7 +119,30 @@
   // ?clean=1: no sample warnings, and the focused project is known (for screenshots).
   const clean = params.get('clean') === '1'
   if (clean) for (const r of board.repos) r.warnings = []
+  // A track's activity log, newest first, as the worker answers track.log (the search-api PR's).
+  const log = [
+    { at: now - 40 * M, kind: 'escalate', text: 'Told you: conflicts with main; 2/2 rounds used', to: 'you', subject: 'acme/app #42 needs you' },
+    { at: now - 40 * M, kind: 'lane', lane: 'needs-you', text: 'conflicts with main; 2/2 rounds used, escalated to you' },
+    { at: now - 55 * M, kind: 'escalate', text: 'Escalated to the supervisor: conflicts with main; 2/2 rounds used', to: 'supervisor', subject: 'Escalation: acme/app #42 needs a decision' },
+    { at: now - 70 * M, kind: 'send-rebase', text: 'Asked the supervisor to rebase onto main, round 2 (its worker had finished, so the supervisor got it)', to: 'supervisor', subject: '#42 needs a follow-up: Rebase #42 onto main (round 2 of 2)' },
+    { at: now - 70 * M, kind: 'lane', lane: 'fixing-conflict', text: 'conflicts with main; asking the worker to rebase (round 2/2)' },
+    { at: now - 95 * M, kind: 'push', text: 'New commit: 4b1e0c2' },
+    { at: now - 120 * M, kind: 'send-rebase', text: 'Asked the worker to rebase onto main, round 1', to: 'worker', subject: 'Rebase #42 onto main (round 1 of 2)' },
+    { at: now - 170 * M, kind: 'review-done', text: 'AI review finished: 2 of 2 approve' },
+    { at: now - 200 * M, kind: 'send-ci-failure', text: 'Sent the worker 1 failing check (test), round 1', to: 'worker', subject: 'CI failed on #42 (round 1 of 3)' },
+    { at: now - 202 * M, kind: 'update-branch', text: 'Tried to update the branch from its base (rebase)', error: 'GitHub: the branch was updated by someone else; trying again next check' }
+  ]
+  // Away alerts: ?alerts=off has no webhook yet, ?alerts=failed shows a failed post.
+  const alertsView = {
+    format: 'auto', events: { 'needs-you': true, ready: true, merged: false },
+    host: params.get('alerts') === 'off' ? null : 'hooks.slack.com', detected: params.get('alerts') === 'off' ? null : 'slack',
+    lastError: params.get('alerts') === 'failed' ? { at: now - 35 * M, message: 'hooks.slack.com answered HTTP 404' } : null, secure: true
+  }
   const replies = {
+    'track.log': () => ({ key: 'search-api', entries: log }),
+    'alerts.get': () => alertsView,
+    'alerts.save': () => ({ saved: true, error: null, alerts: alertsView }),
+    'alerts.test': () => ({ ok: true, error: null }),
     'projects.list': () => ({ projects }),
     'project.enable': () => ({ ok: true, message: 'on', repo: 'acme/app' }),
     'config.get': () => ({ config: structuredClone(config), errors: [], warnings: clean ? [] : ['reviewers[2]: Matriarch can start only claude and codex reviewers read-only, so "style" (grok) is not started.'], agents }),
@@ -162,7 +185,14 @@
       if (params.get('scroll')) window.scrollTo(0, Number(params.get('scroll')))
     }, 100)
   }, 600)
+  // ?log=1 opens the first row's activity log (on the board: the first card's).
+  if (params.get('log') === '1') setTimeout(() => {
+    const card = document.querySelector('.log-details')
+    if (params.get('view') === 'board' && card) card.open = true
+    else document.querySelector('.row .label[aria-expanded]')?.click()
+  }, 400)
   if (params.get('page') === 'add') setTimeout(() => click('+ Add project'), 200)
+  if (params.get('page') === 'alerts') setTimeout(() => click('Alerts'), 200)
   if (params.get('page') === 'all') setTimeout(() => click('All'), 200)
 </script>
 </body>

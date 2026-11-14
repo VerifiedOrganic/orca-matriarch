@@ -58,7 +58,8 @@ export interface Executor {
 export interface ExecutorDeps {
   exec: Exec
   orca: OrcaCli
-  notify(title: string, body: string): Promise<void>
+  /** Tells the person, in Orca and on the away webhook; `about` says what kind of alert it is. */
+  notify(title: string, body: string, about?: { kind: 'needs-you' | 'ready'; repo: string; number: number; url: string }): Promise<void>
   crew?: Crew
   ghBin?: string
   glabBin?: string
@@ -92,13 +93,14 @@ export function createExecutor(deps: ExecutorDeps): Executor {
       const m = forSupervisor(ctx, to, subject, body)
       // Not --type escalation: Orca takes that only from a worker ("No active Dispatch belongs to this message sender").
       await sendMessage(deps.orca, { to: ctx.supervisor!, subject: m.subject, body: m.body, from })
-      return { ok: true }
+      return { ok: true, sent: { to: 'supervisor', subject: m.subject, note: 'its worker had finished, so the supervisor got it' } }
     }
     try {
       if (to.startsWith('dispatch:') && ctx.ownerLive === false && ctx.supervisor) return await viaSupervisor()
       // Matriarch is not a worker, so an escalation goes as plain mail with the word in its subject.
-      await sendMessage(deps.orca, { to, subject: type === 'escalation' && !/escalat/i.test(subject) ? `Escalation: ${subject}` : subject, body, from })
-      return { ok: true }
+      const sentSubject = type === 'escalation' && !/escalat/i.test(subject) ? `Escalation: ${subject}` : subject
+      await sendMessage(deps.orca, { to, subject: sentSubject, body, from })
+      return { ok: true, sent: { to: to.startsWith('dispatch:') ? 'worker' : 'supervisor', subject: sentSubject } }
     } catch (error) {
       const message = (error as Error).message
       if (to.startsWith('dispatch:') && ctx.supervisor && COORDINATOR_ONLY.test(message)) {
@@ -160,16 +162,18 @@ export function createExecutor(deps: ExecutorDeps): Executor {
             return send(ctx, action.address, m.subject, m.body, 'escalation')
           }
           try {
-            await deps.notify(`${pr.repo} #${pr.number} needs you`, action.reason)
-            return { ok: true }
+            const title = `${pr.repo} #${pr.number} needs you`
+            await deps.notify(title, action.reason, { kind: 'needs-you', repo: pr.repo, number: pr.number, url: pr.url })
+            return { ok: true, sent: { to: 'you', subject: title } }
           } catch (error) {
             return { ok: false, error: `notification: ${(error as Error).message}` }
           }
         }
         case 'notify':
           try {
-            await deps.notify(action.title, action.body)
-            return { ok: true }
+            // A ready PR is its own kind of alert; every other notice is something that needs you.
+            await deps.notify(action.title, action.body, { kind: action.key.startsWith('ready:') ? 'ready' : 'needs-you', repo: pr.repo, number: pr.number, url: pr.url })
+            return { ok: true, sent: { to: 'you', subject: action.title } }
           } catch (error) {
             return { ok: false, error: `notification: ${(error as Error).message}` }
           }

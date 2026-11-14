@@ -126,14 +126,41 @@ manages only PRs you opened from a branch that belongs to an Orca workspace.
 - **Board:** cards by state with the agent and model, CI, comments and rounds used, and in dry
   run what Matriarch would do next. **Run AI review now** on any card runs the crew on that
   commit, in dry run too.
+- **What Matriarch did:** click a timeline row, or open **What Matriarch did** on a card, for
+  that PR's log, newest first: each lane it entered and why, new commits, finished reviews, and
+  every message it sent (to the worker, the supervisor or you, with its subject), branch update,
+  merge and cleanup, including what failed and why. Only what it did: dry run's plans stay in
+  **Would do next**. Kept for a week.
 - **Supervisor:** each project's chat, with the Run it coordinates, how many of its workers
   are running against the project's limit, the labeled issues it took or that wait, and its
   advisor: the question it is answering, or the last one it answered.
 - **Needs you:** a reviewer waiting on a prompt, an escalation that reached you, a nearly full
   disk, a supervisor that went over its worker limits. The status bar shows the same at a glance.
+- **Alerts:** the same notices on Slack, Discord, ntfy or any webhook, for when you are away. See
+  [Away alerts](#away-alerts).
 - **Full tab:** tab bar **+** → **Matriarch board**.
 
 <img src="docs/picker.png" width="400" alt="Settings: picking a worker's model on OpenCode, with the list filtered as you type and grouped by provider.">
+
+## Away alerts
+
+What reaches you in Orca's notifications can also go to a webhook, so you hear about it away from
+your desk. Open **Alerts** (next to **+ Add project**), paste the webhook URL, pick what to send, and
+**Send a test**. It applies to every project.
+
+- **Where:** a Slack incoming webhook, a Discord channel webhook, ntfy (ntfy.sh, or your own
+  server: pick **ntfy** by hand), or any URL that takes a JSON POST with `kind`, `title`, `body`,
+  `repo`, `number` and `url`. Slack, Discord and ntfy.sh are told apart by their address.
+- **What:** **Needs you** (an escalation that reached you, a reviewer stuck on a prompt, a PR that
+  needs your merge or is blocked) and **Ready to merge** are on by default; **Merged** (a PR
+  Matriarch follows merged, by it or by anyone) is off.
+- **How:** each alert is posted once, with a 10-second limit, and never retried. Orca's own
+  notification comes either way. A post that fails shows on the Alerts page, without blocking
+  anything else.
+- **The URL is a secret:** anyone who has a Slack or Discord webhook URL can post to that channel.
+  Matriarch keeps it in Orca's encrypted secrets (your OS key store), not in plugin storage or a
+  project's settings, and shows and logs only its host. Where Orca has no OS key store, it does
+  not keep one.
 
 ## What it costs
 
@@ -179,6 +206,8 @@ start agents and read their state. It asks Orca for these capabilities:
 - **Own storage** (`storage:own`): keeps each PR's history and review state in the plugin's own
   storage.
 - **Own settings** (`settings:own`): autopilot on or off, and how often it checks GitHub and GitLab.
+- **Own secrets** (`secrets:own`): keeps the [away-alert](#away-alerts) webhook URL, when you set
+  one, in Orca's encrypted secrets.
 
 It also adds two **hooks**. They change nothing for agents outside a review worktree (a review
 round's, or the advisor's), except that a Claude Code agent's `orca orchestration worker-start`
@@ -266,7 +295,9 @@ replace them.
 ### Network and data
 
 Matriarch talks to the network only through `gh`, to GitHub, and `glab`, to the GitLab hosts your
-projects are on. It sends nothing anywhere else and has no telemetry. Each PR's history and
+projects are on, and, when you set one, to your [away-alert](#away-alerts) webhook: it posts the
+title and text of each alert you switched on, with the PR's project, number and link. It sends
+nothing anywhere else and has no telemetry. Each PR's history and
 review state stay in the plugin's own storage on your machine; each project's settings are in its
 `.orca/matriarch.json`; reviewers' notes and the advisor's answers are written in their throwaway
 worktree and removed with it.

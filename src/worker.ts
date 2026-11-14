@@ -19,7 +19,9 @@ import { ledgerKey, loadLedger, record, roundsUsed } from './ledger.ts'
 import { createdTerminal, createOrcaCli, listWorkers, OrcaRefusal, OrcaUnavailable, sendMessage, type OrcaCli } from './orca-cli.ts'
 import { selectReviewers, type Activity, type Lane } from './plan.ts'
 import { findTaggedRun, supervisorBrief, supervisorLaunchArgs, supervisorTag, workerSettingsMessage } from './supervisor.ts'
-import { emptyBoard, type Board, type ProjectInfo } from './protocol.ts'
+import { createAlerter, hostOf, type FetchLike } from './alerts.ts'
+import { historyKey, loadHistory } from './history.ts'
+import { emptyBoard, type Board, type LogEntry, type ProjectInfo } from './protocol.ts'
 
 export interface WorkerOptions {
   /** Orca's data folder, for the person's profile and model catalog; Orca's default when unset. */
@@ -33,6 +35,8 @@ export interface WorkerOptions {
   autoStart?: boolean
   crew?: Crew
   advisor?: Advisor
+  /** Posts away alerts; Node's fetch when unset (tests pass a fake: no test reaches a real webhook). */
+  fetch?: FetchLike
 }
 
 // The read-only guard lives in guard.ts; re-exported for the tests and callers that used it here.
@@ -237,6 +241,15 @@ export function createWorker(options: WorkerOptions = {}) {
     const github = options.github ?? githubForge
     const gitlab = options.gitlab ?? gitlabForge
     const activity = new ActivityTracker()
+    // Away alerts: off until the person sets a webhook URL, which is kept in Orca's encrypted secrets.
+    const alerter = createAlerter({
+      fetch: options.fetch ?? ((url, init) => fetch(url, init)),
+      secrets: orca.secrets,
+      storage: orca.storage,
+      secure: async () => (await orca.host.call('secrets.protection')).status === 'os-keyring',
+      log: (m) => orca.log(m),
+      now
+    })
     const lockdown = createLockdown(now, { get: (k) => orca.storage.get(k), set: (k, v) => orca.storage.set(k, v) })
     const readIfThere = async (path: string): Promise<string | null> => {
       try {
@@ -269,7 +282,9 @@ export function createWorker(options: WorkerOptions = {}) {
         // A reviewer stuck on a prompt: tell the person, and mark the worktree in Orca's own sidebar.
         alert: async (run, r) => {
           const message = `The ${r.name} reviewer (${r.agent}) on #${run.number} needs you: ${r.blocked}`
-          await orca.host.call('notifications.show', { title: `Matriarch: ${run.repo} #${run.number} needs you`, body: message }).catch(() => {})
+          const title = `Matriarch: ${run.repo} #${run.number} needs you`
+          await orca.host.call('notifications.show', { title, body: message }).catch(() => {})
+          alerter.send({ kind: 'needs-you', title, body: message, repo: run.repo, number: run.number })
           if (run.worktree) await cli.run(['worktree', 'set', '--worktree', `path:${run.worktree.path}`, '--unread', '--comment', `Matriarch: ${message}`]).catch(() => {})
           void runTick()
         },
@@ -417,6 +432,7 @@ export function createWorker(options: WorkerOptions = {}) {
       store: orca.storage,
       crew,
       advisor,
+      alert: (a) => alerter.send(a),
       freeSpace: async (path) => {
         const s = await statfs(path)
         return Number(s.bavail) * Number(s.bsize)
@@ -452,8 +468,10 @@ export function createWorker(options: WorkerOptions = {}) {
         crew,
         forges: { github: githubForge, gitlab: gitlabForge },
         mailbox: (ctx) => mailboxFor(ctx.pr.repo, ctx.root),
-        notify: async (title, body) => {
+        notify: async (title, body, about) => {
           await orca.host.call('notifications.show', { title, body })
+          // The webhook gets the same, without holding up the tick.
+          if (about) alerter.send({ ...about, title, body })
         }
       })
     }
@@ -561,6 +579,21 @@ export function createWorker(options: WorkerOptions = {}) {
     orca.panels.handle('track.open', async ({ key }) => {
       await orca.host.call('workspace.open', { workspaceId: key })
       return { opened: true }
+    })
+    // Away alerts, for every project. The URL travels from the panel to Orca's secrets once, on
+    // save; what comes back names only its host.
+    orca.panels.handle('alerts.get', () => alerter.view())
+    orca.panels.handle('alerts.save', async (input) => {
+      const error = await alerter.save(input)
+      if (!error) orca.log(`away alerts saved: ${input.url === undefined ? 'same webhook' : input.url.trim() ? `webhook on ${hostOf(input.url.trim())}` : 'webhook removed'}`)
+      return { saved: error === null, error, alerts: await alerter.view() }
+    })
+    orca.panels.handle('alerts.test', async ({ url, format }) => alerter.test(url, format))
+    // Read only when the panel opens a track's log, so the board posted every tick stays small.
+    orca.panels.handle('track.log', async ({ key }) => {
+      const history = loadHistory(await orca.storage.get(historyKey(key)))
+      // Orca accepts only plain JSON from a worker: no undefined fields.
+      return JSON.parse(JSON.stringify({ key, entries: history.log.slice(-200).reverse() })) as { key: string; entries: LogEntry[] }
     })
 
     // Opens the supervisor as a native Orca chat, briefed: the person describes the work there.

@@ -471,14 +471,16 @@ full width.
   - **At once** strip above the rows: how many worktrees were working, awaiting CI, fixing, in
     AI review, blocked on you or ready, at each moment. It shows when several things stall
     together.
-  - Hovering a bar or dot tells why. Clicking a row opens that worktree in Orca.
+  - Hovering a bar or dot tells why. Clicking a row opens its activity log under it (with a
+    button to open the worktree in Orca).
 - **Board.** Cards grouped by lane: Needs you, Fixing, AI review, Working, Awaiting CI,
   Ready / merging, Idle, Merged / closed. In the sidebar the groups stack into one column. A
   card shows:
   - the PR and its worktree, the agent with its model and activity;
   - CI state and failing checks, open comments;
   - the reason for its lane and the rounds used;
-  - in dry run, **Would do next**.
+  - in dry run, **Would do next**;
+  - **What Matriarch did**, folded: the same activity log as a timeline row's.
 - **Header.** Dry run or autopilot (turning autopilot on takes a second confirming click),
   counts per lane group, problems and config warnings, GitHub rate budget left.
 - **Status bar.** For example `Matriarch 1 need you · 1 fixing · 2 running (dry run)`. The
@@ -495,6 +497,15 @@ taught this: the only place to answer it was a terminal in a worktree you never 
 - **Orca's own surfaces.**
   - a desktop notification the moment it happens;
   - the unread dot on the review worktree in Orca's sidebar, with a comment saying why.
+- **Away from the desk.** With a webhook set under **Alerts**, the same notices also go to Slack,
+  Discord, ntfy or any JSON webhook, by kind: needs you, ready to merge, and (off by default)
+  merged. Each is posted once, never retried, with a 10-second limit raced against the request so
+  a hung webhook cannot hold anything up; at most four are in flight, and more are dropped and
+  logged rather than queued. A failed post is kept for the Alerts page until one works. The URL
+  is a secret (whoever has a Slack or Discord webhook can post to it): it lives in Orca's
+  encrypted secrets (`secrets:own`, the OS key store), is refused where Orca has none, and only
+  its host is ever shown or logged. A Discord post allows no mentions, so a PR titled
+  `@everyone` cannot ping a channel.
 - **Naming.** Review worktrees are named `Matriarch review · #<n> · <sha>` and linked to their
   PR, so they read as Matriarch's at a glance.
 - **Timing.** A reviewer is timed out only when it has been quiet for the whole limit: no
@@ -513,6 +524,14 @@ tick (`board.changed`), and the board carries the last 24 hours of history.
 
 - **Segments:** a lane plus from/to, recorded each time the planner's lane changes.
 - **Marks:** point events.
+- **Log:** what Matriarch did and why, in words: each new lane with its reason (not every new
+  reason within a lane, since some change each check), new commits, finished reviews, and every
+  action it carried out or tried, with the recipient and subject of each message the executor
+  sent and the error of each that failed. Dry run's plans are not logged. Capped at 300 lines and
+  pruned with the rest. It is not on the board: the panel asks for one track's log
+  (`track.log`) when it is opened, and again after each tick while it stays open. When a merged
+  PR's worktree is removed, its history moves to `track:pr:<repo>#<n>`, the key its card uses
+  from then on.
 
 Worktrees with no PR yet appear too: `building` while their agent works, `needs-you` while it
 waits for input, `idle` otherwise.
@@ -583,7 +602,7 @@ can be changed and checked without Orca.
   - workspace: `workspace.list`
   - agents: `agents.list`
   - UI: `notifications.show`, `statusBar.update`
-  - plugin data: `storage.*`, `settings.*`
+  - plugin data: `storage.*`, `settings.*`, `secrets.*` (the away-alert webhook URL)
 - **Events:** `agent.status.changed`, `workspace.created`, `workspace.removed`.
 - **Hooks:**
   - `agent.launch.before` (built): reviewers start locked down in their agent's own read-only mode;
