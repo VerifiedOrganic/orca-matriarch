@@ -133,11 +133,15 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - **Reviews at once** (default 2) limits how many review crews run together.
 - **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
   supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
-  The supervisor's brief states them, and a running supervisor is told when you change them.
-  Matriarch refuses a Claude Code supervisor's `worker-start` over a limit, with what to do
-  instead (wait for a worker to finish, for tomorrow, or for space). Orca lets a plugin stop only
-  Claude Code's tool calls, so a supervisor on another agent can go over; **Needs you** then says
-  so. Limits hold in dry run too: they guard your disk and accounts, not the PRs.
+  The supervisor's brief states them, and a running supervisor is told when you change them. A
+  start over a limit is refused, with what to do instead (wait for a worker to finish, for
+  tomorrow, or for space), when it comes from the supervisor's own terminal or one of its
+  workers' and that agent is Claude Code. Orca stops only Claude Code's tool calls, and reports
+  none for a session in a chat (the supervisor opens as one), so a supervisor in a chat or on
+  another agent can go over; **Needs you** then says so. A command that starts workers in a loop
+  is refused while a count limit is set, since how many it starts cannot be known. Limits hold in
+  dry run too: they guard your disk and accounts, not the PRs. Your own sessions are never
+  refused.
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback
 model you choose; otherwise it shows the reviewer as **Needs you**.
@@ -161,8 +165,10 @@ start agents and read their state. It asks Orca for these capabilities:
 - **Own settings** (`settings:own`): autopilot on or off, and how often it checks GitHub and GitLab.
 
 It also adds two **hooks**. They change nothing for agents outside a review worktree, except
-that a Claude Code agent's `orca orchestration worker-start` in one of your projects is refused
-when it would go over that project's worker limits (see [What it costs](#what-it-costs)):
+that a worker start (`orca orchestration worker-start` or `dispatch`, `orca agent launch`) from
+the supervisor's own terminal or one of its workers' is refused when it would go over the
+project's worker limits (see [What it costs](#what-it-costs)). Your own sessions are never
+judged:
 
 - **Before an agent launches** (`agent.launch.before`), a reviewer's command is rewritten so it
   starts read-only, whatever permission mode you chose in Orca:

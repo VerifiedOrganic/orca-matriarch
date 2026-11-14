@@ -1,12 +1,26 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { JsonValue } from 'orca/host'
 import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
 import { CONFIG_PATH, validateConfig } from './config.ts'
 import { tick, type EngineDeps } from './engine.ts'
 import type { GitHub } from './github.ts'
-import { countStarts, createLimitsGuard, dayOf, isWorkerStart, limitLines, limitsChanged, limitsMessage, startRefusal, type LimitState } from './limits.ts'
-import type { WorkerRow } from './orca-cli.ts'
+import {
+  countStarts,
+  createLimitsGuard,
+  dayOf,
+  isWorking,
+  limitLines,
+  limitsChanged,
+  limitsMessage,
+  PASSED_GRACE_MS,
+  startRefusal,
+  startsIn,
+  type LimitState,
+  type LimitsSnapshot
+} from './limits.ts'
+import { parseWorkerList, type WorkerRow } from './orca-cli.ts'
 import { supervisorBrief, supervisorTag } from './supervisor.ts'
 import { createWorker, deactivate } from './worker.ts'
 
@@ -18,79 +32,164 @@ const defaults = () => validateConfig({}).config.limits
 function state(over: Partial<LimitState> = {}): LimitState {
   return {
     repo: 'acme/app',
-    root: '/r',
-    workspaces: [{ id: 'ws-main', path: '/r' }, { id: 'ws-login', path: '/r/wt/login' }],
+    terminals: ['term_sup', 'term_w1'],
     live: 0,
     startsToday: 0,
     day: dayOf(T0),
     freeBytes: 100 * GB,
+    listedAt: T0,
     limits: defaults(),
     ...over
   }
 }
 
 const start = "orca orchestration worker-start --task t1 --worktree path:/r/wt/login --agent 'codex' --json"
-const bash = (command: string, workspaceId: string | null = 'repo1::/r') => ({ agent: 'claude', tool: 'Bash', workspaceId, input: { command } })
+const bash = (command: string, terminalId: string | undefined = 'term_sup') => ({ agent: 'claude', tool: 'Bash', workspaceId: 'repo1::/r', ...(terminalId ? { terminalId } : {}), input: { command } })
+const none = { running: 0, today: 0 }
+const one = { count: 1, repeats: false }
 
-describe('a worker start', () => {
-  test('is told apart from other commands, even inside a longer one', () => {
-    assert.equal(isWorkerStart(start), true)
-    assert.equal(isWorkerStart(`cd /r && ${start}`), true)
-    assert.equal(isWorkerStart(`ORCA_X=1 /opt/bin/orca orchestration worker-start --task t`), true)
-    assert.equal(isWorkerStart('orca orchestration worker-list --json'), false)
-    assert.equal(isWorkerStart('echo orca orchestration worker-start'), false)
-    assert.equal(isWorkerStart('orca worktree create --name x'), false)
+describe('reading a command for worker starts', () => {
+  test('finds a start in every shell form, failing closed', () => {
+    const forms = [
+      start,
+      `cd /r && ${start}`,
+      'cd /r && orca orchestration worker-start --task "$(cat t.md)" --json',
+      "orca orchestration worker-start --task t --spec - <<'EOF'\nDo the thing\nEOF",
+      'WT=$(orca worktree create --repo path:/r --name a --json | jq -r .path) && orca orchestration worker-start --task t --worktree "path:$WT"',
+      'OUT=$(orca orchestration worker-start --task t --json)',
+      'if true; then orca orchestration worker-start --task t; fi',
+      '( orca orchestration worker-start --task t )',
+      '{ orca orchestration worker-start --task t; }',
+      'env A=1 orca orchestration worker-start --task t',
+      'time nohup orca orchestration worker-start --task t &',
+      'bash -c "orca orchestration worker-start --task t"',
+      '"orca" orchestration worker-start --task t',
+      "'/Applications/Orca.app/Contents/Resources/bin/orca' 'orchestration' 'worker-start'",
+      'orca --json orchestration worker-start --task t',
+      'orca orchestration --json worker-start --task t',
+      'orca --environment local orchestration --environment check worker-start --task t',
+      'orca orchestration \\\n  worker-start \\\n  --task t',
+      'orca-ide orchestration worker-start --task t',
+      'orca-dev orchestration worker-start --task t',
+      '"$ORCA_CLI_COMMAND" orchestration worker-start --task t',
+      '${ORCA_CLI_COMMAND} orchestration worker-start --task t',
+      'orca orchestration worker"-"start --task t',
+      'orca orchestration $SUB --task t',
+      'orca orchestration dispatch --to term_x --task t',
+      "orca agent launch --agent codex --worktree path:/r/wt/a --prompt 'Do it'"
+    ]
+    for (const command of forms) assert.ok(startsIn(command).count >= 1, `not seen: ${command}`)
+    for (const command of ['orca orchestration worker-list --json', 'orca orchestration --json worker-list', 'orca worktree create --name x', 'git status', 'orca orchestration send --to run:r1 --subject s'])
+      assert.equal(startsIn(command).count, 0, `not a start: ${command}`)
   })
 
-  test('is refused at the cap, over the daily budget and under the disk floor, saying what to do', () => {
+  test('counts several starts in one call, and knows a loop can start more than it shows', () => {
+    assert.deepEqual(startsIn(`${start} && ${start.replace('t1', 't2')}`), { count: 2, repeats: false })
+    assert.equal(startsIn(`for t in a b c; do ${start}; done`).repeats, true)
+    assert.equal(startsIn(`printf 'a\\nb' | xargs -n1 ${start}`).repeats, true)
+    assert.equal(startsIn(`go() { ${start}; }; go; go`).repeats, true)
+    assert.equal(startsIn('for f in *.md; do cat $f; done').repeats, false, 'a loop with no start is nothing')
+  })
+})
+
+describe('a worker start', () => {
+  test('is refused when it would pass the cap, the daily budget or the disk floor, saying what to do', () => {
     const today = dayOf(T0)
-    assert.equal(startRefusal(state({ live: 3 }), { starts: 0 }, today), null)
-    assert.match(startRefusal(state({ live: 4 }), { starts: 0 }, today) ?? '', /4 of 4 workers are live in acme\/app.*Wait for one to finish/)
-    assert.match(startRefusal(state({ live: 3 }), { starts: 1 }, today) ?? '', /4 of 4/, 'a start let through since the tick counts')
-    const daily = state({ limits: { ...defaults(), maxWorkerStartsPerDay: 5 }, startsToday: 5 })
-    assert.match(startRefusal(daily, { starts: 0 }, today) ?? '', /started 5 workers today, its limit of 5 a day/)
-    assert.equal(startRefusal(daily, { starts: 0 }, dayOf(T0 + 24 * HOUR)), null, 'a new day starts the budget again')
-    assert.match(startRefusal(state({ freeBytes: 4 * GB }), { starts: 0 }, today) ?? '', /Only 4\.0 GB is free.*10 GB floor/)
-    assert.equal(startRefusal(state({ freeBytes: null }), { starts: 0 }, today), null, 'unknown free space is not low')
+    assert.equal(startRefusal(state({ live: 3 }), none, one, today), null)
+    assert.match(startRefusal(state({ live: 4 }), none, one, today) ?? '', /4 of 4 workers are running in acme\/app.*Wait for one to finish/)
+    assert.match(startRefusal(state({ live: 3 }), { running: 1, today: 1 }, one, today) ?? '', /4 of 4/, 'a start let through since the tick counts')
+    assert.match(startRefusal(state({ live: 3 }), none, { count: 2, repeats: false }, today) ?? '', /3 of 4 workers are running in acme\/app, and this would start 2 more/)
+    assert.equal(startRefusal(state({ live: 2 }), none, { count: 2, repeats: false }, today), null, 'two fit')
+    assert.match(startRefusal(state(), none, { count: 1, repeats: true }, today) ?? '', /in a loop.*its own worker-start call/)
+    const daily = state({ limits: { ...defaults(), maxWorkerStartsPerDay: 5 }, startsToday: 4 })
+    assert.equal(startRefusal(daily, none, one, today), null)
+    assert.match(startRefusal(daily, none, { count: 2, repeats: false }, today) ?? '', /started 4 workers today and this would start 2 more, over its limit of 5 a day/)
+    assert.equal(startRefusal(state({ ...daily, startsToday: 5 }), none, one, dayOf(T0 + 24 * HOUR)), null, 'a new day starts the budget again')
+    assert.match(startRefusal(state({ freeBytes: 4 * GB }), none, one, today) ?? '', /Only 4\.0 GB is free.*10 GB floor/)
+    assert.equal(startRefusal(state({ freeBytes: null }), none, one, today), null, 'unknown free space is not low')
     const off = state({ live: 40, freeBytes: 0, startsToday: 900, limits: { ...defaults(), maxWorkers: 0, maxWorkerStartsPerDay: 0, minFreeDiskGB: 0 } })
-    assert.equal(startRefusal(off, { starts: 5 }, today), null, '0 turns each limit off')
+    assert.equal(startRefusal(off, { running: 5, today: 5 }, { count: 3, repeats: true }, today), null, '0 turns each limit off, loops included')
   })
 })
 
 describe('the hook', () => {
-  test("refuses only a worker start from one of the project's own checkouts", () => {
-    const guard = createLimitsGuard(() => T0)
+  test("judges only the supervisor's terminal and its workers', never another session", () => {
+    const guard = createLimitsGuard({ now: () => T0 })
     guard.update(state({ live: 4 }))
-    assert.match(guard.decide(bash(start))?.deny ?? '', /4 of 4/, 'the supervisor in the main checkout')
-    assert.ok(guard.decide(bash(start, 'ws-login')), 'by workspace id')
-    assert.equal(guard.decide(bash(start, 'repo2::/elsewhere')), null, 'another project is not judged')
-    assert.equal(guard.decide(bash(start, null)), null)
+    assert.match(guard.decide(bash(start))?.deny ?? '', /4 of 4/, "the supervisor's terminal")
+    assert.ok(guard.decide(bash(start, 'term_w1')), 'a worker of its Run')
+    assert.equal(guard.decide(bash(start, 'term_mine')), null, "the person's own Claude session in the same checkout")
+    assert.equal(guard.decide({ agent: 'claude', tool: 'Bash', workspaceId: 'repo1::/r', input: { command: start } }), null, 'a call Orca could not tie to a terminal')
     assert.equal(guard.decide(bash('git status')), null)
-    assert.equal(guard.decide({ agent: 'claude', tool: 'Write', workspaceId: 'repo1::/r', input: { command: start } }), null)
+    assert.equal(guard.decide({ agent: 'claude', tool: 'Write', workspaceId: 'repo1::/r', terminalId: 'term_sup', input: { command: start } }), null)
   })
 
-  test('counts the starts it let through until the next tick sees them, then forgets a gone project', () => {
-    const guard = createLimitsGuard(() => T0)
-    guard.update(state({ live: 2 }))
-    assert.equal(guard.decide(bash(start)), null)
-    assert.equal(guard.decide(bash(start)), null)
-    assert.match(guard.decide(bash(start))?.deny ?? '', /4 of 4/, 'two let through on top of two live')
-    guard.update(state({ live: 3 }))
-    assert.equal(guard.decide(bash(start)), null, 'the next tick counts afresh')
-    guard.keep(new Set())
-    assert.equal(guard.decide(bash(start)), null, 'a project turned off is not judged')
+  test('counts every start it let through, until a worker list read well after them', () => {
+    let now = T0
+    const guard = createLimitsGuard({ now: () => now })
+    guard.update(state({ live: 1, listedAt: T0 }))
+    assert.equal(guard.decide(bash(`${start} && ${start}`)), null, 'two starts in one call')
+    assert.match(guard.decide(bash(`${start} && ${start}`))?.deny ?? '', /3 of 4 .*this would start 2 more/, 'they count as two')
+    now = T0 + 5_000
+    // A tick whose worker list was asked for before the starts: they are not in it, and still count.
+    guard.update(state({ live: 1, listedAt: T0 - 1_000 }))
+    assert.match(guard.decide(bash(`${start} && ${start}`))?.deny ?? '', /3 of 4/)
+    // A list read long after them has the workers: the tick counts them instead.
+    guard.update(state({ live: 3, listedAt: T0 + PASSED_GRACE_MS + 1 }))
+    assert.equal(guard.decide(bash(start)), null, 'the fourth fits')
+    assert.ok(guard.decide(bash(start)), 'not a fifth')
+  })
+
+  test('keeps its counts through a failed tick, forgets a project only a good tick did not see, and starts from storage', () => {
+    const saved: LimitsSnapshot[] = []
+    const guard = createLimitsGuard({ now: () => T0, save: (s) => saved.push(structuredClone(s)) })
+    guard.update(state({ live: 4 }))
+    guard.keep(new Set(['acme/app']))
+    assert.ok(guard.decide(bash(start)))
+    const restarted = createLimitsGuard({ now: () => T0 })
+    restarted.restore(saved.at(-1))
+    assert.ok(restarted.decide(bash(start)), 'a restart starts from the saved counts')
+    restarted.update(state({ live: 0 }))
+    restarted.restore({ states: { 'acme/app': state({ live: 4 }) }, passed: {} })
+    assert.equal(restarted.decide(bash(start)), null, "a tick's newer counts win over what was saved")
+    restarted.keep(new Set())
+    assert.equal(restarted.decide(bash(start)), null, 'a project a good tick did not see is forgotten')
+  })
+})
+
+describe('a worker Orca cannot vouch for', () => {
+  test('counts as running; only one that settled or exited does not', () => {
+    const rows = parseWorkerList({ workers: [
+      { dispatchId: 'new', runId: 'r1', workerState: 'ready', agentTerminalHandle: 'term_a', projection: { liveness: { verdict: 'unverifiable', reason: 'missing_status' } } },
+      { dispatchId: 'restored', runId: 'r1', workerState: 'running', projection: { liveness: { verdict: 'unverifiable', reason: 'restored_unconfirmed' } } },
+      { dispatchId: 'gone', runId: 'r1', workerState: 'running', projection: { liveness: { verdict: 'exited' } } },
+      { dispatchId: 'done', runId: 'r1', workerState: 'succeeded', projection: { liveness: { verdict: 'live' } } }
+    ] })
+    assert.deepEqual(rows.map((r) => [r.dispatchId, r.live, isWorking(r)]), [['new', false, true], ['restored', false, true], ['gone', false, false], ['done', true, false]])
+    assert.equal(rows[0].terminal, 'term_a')
   })
 })
 
 describe('starts a day', () => {
-  test('counts workers first seen today, once each, and starts again at midnight', () => {
-    const first = countStarts(null, ['d1', 'd2'], T0)
+  test("counts a Run's workers first seen today, once each, and starts again at midnight", () => {
+    const first = countStarts(null, 'run:r1', ['d1', 'd2'], T0)
     assert.equal(first.count, 0, 'workers already there when Matriarch first looks started at an unknown time')
-    const later = countStarts(first, ['d1', 'd2', 'd3'], T0 + HOUR)
+    const later = countStarts(first, 'run:r1', ['d3', 'd1', 'd2'], T0 + HOUR)
     assert.equal(later.count, 1)
-    assert.equal(countStarts(later, ['d1', 'd2', 'd3'], T0 + 2 * HOUR).count, 1, 'none counts twice')
-    const tomorrow = countStarts(later, ['d3', 'd4'], T0 + 24 * HOUR)
+    assert.equal(countStarts(later, 'run:r1', ['d3', 'd1', 'd2'], T0 + 2 * HOUR).count, 1, 'none counts twice')
+    const tomorrow = countStarts(later, 'run:r1', ['d4', 'd3'], T0 + 24 * HOUR)
     assert.deepEqual([tomorrow.day, tomorrow.count], [dayOf(T0 + 24 * HOUR), 1])
+  })
+
+  test('does not run high: a long list, newest first, or an older Run found again', () => {
+    const many = Array.from({ length: 900 }, (_, i) => `d${900 - i}`)
+    let rec = countStarts(null, 'run:r1', many, T0)
+    for (let n = 1; n <= 5; n++) rec = countStarts(rec, 'run:r1', many, T0 + n * 60_000)
+    assert.equal(rec.count, 0, 'past 500 workers, none is counted again tick after tick')
+    rec = countStarts(rec, 'run:r1', ['d901', ...many], T0 + HOUR)
+    assert.equal(rec.count, 1, 'the newest, at the head of the list, is the one counted')
+    const switched = countStarts(rec, 'run:r0', Array.from({ length: 30 }, (_, i) => `old${i}`), T0 + 2 * HOUR)
+    assert.equal(switched.count, 1, "an older Run's workers are not today's starts")
   })
 })
 
@@ -99,23 +198,24 @@ describe('the supervisor is told the limits', () => {
     const config = validateConfig({ limits: { maxWorkers: 3, maxWorkerStartsPerDay: 12 } }).config
     const brief = supervisorBrief({ repo: 'acme/app', objective: 'x', tag: supervisorTag('acme/app', 'n'), base: 'main', config })
     assert.ok(brief.includes('Limits in this project: at most 3 workers running at once; at most 12 worker starts a day; no new worker while the disk has under 10 GB free.'))
-    assert.ok(brief.includes('Matriarch refuses a worker-start over a limit'))
-    const none = validateConfig({ limits: { maxWorkers: 0, minFreeDiskGB: 0 } }).config
-    assert.deepEqual(limitLines(none.limits), [])
-    assert.ok(!supervisorBrief({ repo: 'acme/app', objective: 'x', tag: 't', base: 'main', config: none }).includes('Limits in this project'))
+    assert.ok(brief.includes('Start each worker with its own worker-start call, not in a loop'))
+    const off = validateConfig({ limits: { maxWorkers: 0, minFreeDiskGB: 0 } }).config
+    assert.deepEqual(limitLines(off.limits), [])
+    assert.ok(!supervisorBrief({ repo: 'acme/app', objective: 'x', tag: 't', base: 'main', config: off }).includes('Limits in this project'))
     assert.equal(limitsChanged(defaults(), defaults()), false)
     assert.equal(limitsChanged(defaults(), { ...defaults(), maxConcurrentReviews: 5 }), false, 'reviews at once are not the supervisor’s')
     assert.equal(limitsChanged(defaults(), config.limits), true)
     assert.match(limitsMessage(config.limits).body, /at most 3 workers running at once/)
-    assert.match(limitsMessage(none.limits).body, /turned the worker limits off/)
+    assert.match(limitsMessage(off.limits).body, /turned the worker limits off/)
   })
 })
 
 function engine(rows: WorkerRow[], over: Partial<EngineDeps> = {}) {
-  const store = new Map<string, unknown>()
+  const store = new Map<string, unknown>([['supervisor:terminal:acme/app', 'term_sup']])
   let now = T0
   const github: GitHub = { listOpen: async () => ({ viewer: 'me', prs: [], rate: null }), detail: async () => ({ pr: null, rate: null }) }
   const seen: LimitState[] = []
+  const projects: string[][] = []
   const deps: EngineDeps = {
     now: () => now,
     log: () => {},
@@ -129,22 +229,25 @@ function engine(rows: WorkerRow[], over: Partial<EngineDeps> = {}) {
     store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) },
     executor: null,
     onLimits: (s) => seen.push(s),
+    onProjects: (repos) => projects.push(repos),
     ...over
   }
-  return { deps, seen, advance: (ms: number) => (now += ms) }
+  return { deps, seen, projects, advance: (ms: number) => (now += ms) }
 }
 
-const row = (id: string, over: Partial<WorkerRow> = {}): WorkerRow => ({ dispatchId: id, worktreeId: `ws-${id}`, taskId: 't', runId: 'r1', agent: 'codex', model: null, state: 'running', live: true, ...over })
+const row = (id: string, over: Partial<WorkerRow> = {}): WorkerRow => ({ dispatchId: id, worktreeId: `ws-${id}`, taskId: 't', runId: 'r1', agent: 'codex', model: null, state: 'running', live: true, liveness: 'live', terminal: `term_${id}`, ...over })
 
 describe('each tick', () => {
-  test("counts the supervisor's running workers for its row and the hook", async () => {
-    const rows = [row('d1'), row('d2', { live: false }), row('d3', { state: 'succeeded' }), row('d4', { runId: 'other' })]
+  test("counts the supervisor's running workers for its row and the hook, with their terminals", async () => {
+    const rows = [row('d1'), row('d2', { live: false, liveness: 'exited' }), row('d3', { state: 'succeeded' }), row('d4', { runId: 'other' }), row('d5', { live: false, liveness: 'unverifiable' })]
     const e = engine(rows)
     const board = await tick(e.deps, { autopilot: false })
     const sup = board.repos[0].supervisor
-    assert.deepEqual([sup.workers, sup.live, sup.maxWorkers, sup.startsToday, sup.maxStarts], [3, 1, 2, 0, 3])
-    assert.equal(e.seen[0].live, 1)
-    assert.equal(e.seen[0].root, '/r')
+    assert.deepEqual([sup.workers, sup.live, sup.maxWorkers, sup.startsToday, sup.maxStarts], [4, 2, 2, 0, 3])
+    assert.equal(e.seen[0].live, 2)
+    assert.deepEqual(e.seen[0].terminals, ['term_sup', 'term_d1', 'term_d2', 'term_d3', 'term_d5'], 'only its own Run')
+    assert.equal(e.seen[0].listedAt, T0)
+    assert.deepEqual(e.projects, [['acme/app']])
     assert.ok(!board.attention.some((a) => a.key === 'limits:acme/app'))
   })
 
@@ -168,20 +271,24 @@ describe('each tick', () => {
     assert.ok(!(await tick(off.deps, { autopilot: false })).attention.some((a) => a.key === 'disk'))
   })
 
-  test('hands nothing to the hook while it cannot see the workers', async () => {
-    const e = engine([], { workers: async () => { throw new Error('runtime_unavailable') } })
-    await tick(e.deps, { autopilot: false })
-    assert.deepEqual(e.seen, [])
+  test('hands nothing to the hook while it cannot see the workers, and forgets nothing while it cannot see the workspaces', async () => {
+    const blind = engine([], { workers: async () => { throw new Error('runtime_unavailable') } })
+    await tick(blind.deps, { autopilot: false })
+    assert.deepEqual(blind.seen, [])
+    assert.deepEqual(blind.projects, [['acme/app']], 'the project is still there')
+    const down = engine([], { workspaces: async () => { throw new Error('runtime_unavailable') } })
+    await tick(down.deps, { autopilot: false })
+    assert.deepEqual(down.projects, [], 'a tick that saw no workspaces says nothing about projects')
   })
 })
 
-test("the worker refuses a Claude supervisor's worker start over the cap, once a tick counted them", async () => {
+test("the worker refuses a Claude supervisor's start over the cap, keeps refusing after a restart, and leaves the person's own sessions alone", async () => {
   const root = await mkdtemp(join(tmpdir(), 'matriarch-limits-'))
   await mkdir(join(root, '.orca'), { recursive: true })
   await writeFile(join(root, CONFIG_PATH), JSON.stringify({ version: 1 }))
   const orcaCli = {
     run: async (args: readonly string[]) => {
-      if (args[1] === 'worker-list') return { workers: [1, 2, 3, 4].map((n) => ({ dispatchId: `d${n}`, runId: 'r1', resource: { worktreeId: `w${n}` }, workerState: 'running' })) }
+      if (args[1] === 'worker-list') return { workers: [1, 2, 3, 4].map((n) => ({ dispatchId: `d${n}`, runId: 'r1', agentTerminalHandle: `term_w${n}`, resource: { worktreeId: `w${n}` }, workerState: 'running' })) }
       if (args[1] === 'run-list') return { runs: [{ id: 'r1', objective: '[matriarch:acme/app:n] x' }] }
       return {}
     }
@@ -193,31 +300,45 @@ test("the worker refuses a Claude supervisor's worker start over the cap, once a
     return { code: 0, stdout: '', stderr: '' }
   }
   const github: GitHub = { listOpen: async () => ({ viewer: 'me', prs: [], rate: null }), detail: async () => ({ pr: null, rate: null }) }
-  const host = mockHost({
-    capabilities: ['workspace:read', 'workspace:write', 'agent:read', 'notifications:show', 'storage:own', 'settings:own'],
-    results: {
-      'workspace.list': { workspaces: [{ id: 'ws-main', kind: 'worktree', name: 'main', path: root, branch: 'refs/heads/main', hostId: 'local' }], truncated: false },
-      'statusBar.update': { ok: true }
-    },
-    settings: { autopilot: false, pollSeconds: 45 },
-    storage: { 'supervisor:acme/app': 'run:r1' }
-  })
-  const worker = await mountWorker({ default: createWorker({ exec, github, orcaCli, autoStart: false }), deactivate }, {
-    host,
-    events: ['agent.status.changed', 'workspace.created', 'workspace.removed'],
-    commands: ['showBoard', 'refresh', 'toggleAutopilot'],
-    hooks: ['agent.tool.before', 'agent.launch.before']
-  })
+  const mount = (storage: Record<string, JsonValue>) => {
+    const host = mockHost({
+      capabilities: ['workspace:read', 'workspace:write', 'agent:read', 'notifications:show', 'storage:own', 'settings:own'],
+      results: {
+        'workspace.list': { workspaces: [{ id: 'ws-main', kind: 'worktree', name: 'main', path: root, branch: 'refs/heads/main', hostId: 'local' }], truncated: false },
+        'statusBar.update': { ok: true }
+      },
+      settings: { autopilot: false, pollSeconds: 45 },
+      storage
+    })
+    return mountWorker({ default: createWorker({ exec, github, orcaCli, autoStart: false }), deactivate }, {
+      host,
+      events: ['agent.status.changed', 'workspace.created', 'workspace.removed'],
+      commands: ['showBoard', 'refresh', 'toggleAutopilot'],
+      hooks: ['agent.tool.before', 'agent.launch.before']
+    })
+  }
+  const event = (terminalId: string) => ({ agent: 'claude', workspaceId: `repo1::${root}`, terminalId, tool: 'Bash', input: { command: start } })
+  const worker = await mount({ 'supervisor:acme/app': 'run:r1', 'supervisor:terminal:acme/app': 'term_sup' })
+  let storage: Record<string, unknown> = {}
   try {
-    const event = { agent: 'claude', workspaceId: `repo1::${root}`, tool: 'Bash', input: { command: start } }
-    assert.equal((await worker.hooks.fire('agent.tool.before', event)).kind, 'continue', 'nothing counted yet')
+    assert.equal((await worker.hooks.fire('agent.tool.before', event('term_sup'))).kind, 'continue', 'nothing counted yet')
     await worker.command('refresh')
-    const refused = await worker.hooks.fire('agent.tool.before', event)
+    const refused = await worker.hooks.fire('agent.tool.before', event('term_sup'))
     assert.equal(refused.kind, 'deny')
-    assert.match(refused.kind === 'deny' ? refused.reason : '', /4 of 4 workers are live/)
+    assert.match(refused.kind === 'deny' ? refused.reason : '', /4 of 4 workers are running/)
+    assert.equal((await worker.hooks.fire('agent.tool.before', event('term_w2'))).kind, 'deny', 'a worker of its Run')
+    assert.equal((await worker.hooks.fire('agent.tool.before', event('term_mine'))).kind, 'continue', "the person's own session")
     assert.ok(worker.logs.some((l) => l.includes('refused a worker start by claude')))
+    storage = worker.host.data().storage
   } finally {
     await worker.deactivate()
+  }
+  const again = await mount(storage as Record<string, JsonValue>)
+  try {
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal((await again.hooks.fire('agent.tool.before', event('term_sup'))).kind, 'deny', 'before its first tick, from storage')
+  } finally {
+    await again.deactivate()
     await rm(root, { recursive: true, force: true })
   }
 })

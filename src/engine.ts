@@ -86,6 +86,8 @@ export interface EngineDeps {
   freeSpace?: (path: string) => Promise<number | null>
   /** Each project's workers and disk against its limits, for the hook that refuses a worker start. */
   onLimits?: (state: LimitState) => void
+  /** The opted-in projects a tick saw, once it could read Orca's workspaces (not called otherwise). */
+  onProjects?: (repos: string[]) => void
   /** Sends the supervisor's Run a message from Matriarch's mailbox (a labeled issue). */
   tellSupervisor?: (repo: string, root: string, to: string, message: { subject: string; body: string }) => Promise<void>
   /** Posts a comment on an issue on the project's forge. */
@@ -305,6 +307,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
   let workers: WorkerRow[] = []
   // Without the worker list every owned PR would look orphaned: send nothing to workers then.
   let ownersKnown = true
+  // When the list was asked for: a worker started after this may not be in it yet.
+  const workersAt = deps.now()
   try {
     workers = await deps.workers()
   } catch (error) {
@@ -405,8 +409,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     const mine = supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor) : []
     const live = mine.filter(isWorking).length
     let starts = loadStarts(await deps.store.get(`starts:${repoKey}`))
-    if (ownersKnown) {
-      const next = countStarts(starts, mine.map((w) => w.dispatchId), now)
+    if (ownersKnown && supervisor) {
+      const next = countStarts(starts, supervisor, mine.map((w) => w.dispatchId), now)
       if (JSON.stringify(next) !== JSON.stringify(starts)) await deps.store.set(`starts:${repoKey}`, next as unknown as JsonValue)
       starts = next
     }
@@ -414,7 +418,9 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     view.supervisor.live = live
     view.supervisor.startsToday = startsToday
     if (ownersKnown) {
-      deps.onLimits?.({ repo: repoKey, root: info.root, workspaces: repoWorkspaces.map((w) => ({ id: w.id, path: w.path })), live, startsToday, day: dayOf(now), freeBytes: free, limits })
+      // Only the supervisor's own terminal and its workers' are judged by the hook.
+      const terminals = [view.supervisor.terminal, ...mine.map((w) => w.terminal)].filter((t): t is string => typeof t === 'string' && t !== '')
+      deps.onLimits?.({ repo: repoKey, terminals, live, startsToday, day: dayOf(now), freeBytes: free, listedAt: workersAt, limits })
     }
     // Orca waits on the hook only for Claude Code: a supervisor on another agent can go over.
     const over =
@@ -427,7 +433,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       board.attention.push({
         key: `limits:${repoKey}`,
         repo: repoKey,
-        message: `${repoKey}: ${over}. Matriarch can refuse a worker start only from a Claude Code supervisor: ask the supervisor to wait for its workers to finish, or raise the limit in Settings.`,
+        message: `${repoKey}: ${over}. Matriarch can refuse a start only from a Claude Code supervisor or worker in a terminal: ask the supervisor to wait for its workers to finish, or raise the limit in Settings.`,
         terminal: view.supervisor.terminal ?? undefined
       })
     }
@@ -919,6 +925,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     }
   }
 
+  deps.onProjects?.(board.repos.map((r) => r.repo))
   if (deps.crew) await deps.crew.sweep().catch((error: Error) => deps.log(`review sweep: ${error.message}`))
   // Hourly at most: drop records of PRs closed a week ago and worktrees gone a week.
   if (deps.store.keys && deps.store.delete) {
