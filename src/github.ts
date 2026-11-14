@@ -6,7 +6,7 @@
 // It is one of Matriarch's two forges (forge.ts): it also merges, updates branches, posts reviews
 // and reads failed job logs, all with `gh`.
 import type { Exec } from './exec.ts'
-import { repoKey, tailLog, type Forge, type ForgeKind, type ForgeReader, type Outcome, type RepoRef } from './forge.ts'
+import { repoKey, tailLog, type Forge, type ForgeKind, type ForgeReader, type IssueInfo, type Outcome, type RepoRef } from './forge.ts'
 
 export { repoKey, type RepoRef }
 
@@ -546,6 +546,17 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
       }
       return logs
     },
+    // Over REST, which has its own budget: GraphQL's is the one the PR reads spend.
+    async labeledIssues(repo, label) {
+      const path = `repos/${repoArg(repo)}/issues?state=open&labels=${encodeURIComponent(label)}&sort=created&direction=asc&per_page=50`
+      const res = await exec(bin, ['api', path], { timeoutMs: 30_000 })
+      if (res.code !== 0) {
+        const text = `${res.stderr}${res.stdout}`.trim()
+        throw new GitHubError(`gh api issues: ${text.slice(0, 300)}`, /rate limit|secondary rate|abuse/i.test(text))
+      }
+      return parseIssues(res.stdout)
+    },
+    commentIssue: (repo, number, body) => run(['api', '-X', 'POST', `repos/${repoArg(repo)}/issues/${number}/comments`, '-f', `body=${body}`]),
     async publishReview(repo, pr, sha, review) {
       const post = (comments: typeof review.comments) =>
         exec(bin, ['api', `repos/${repoArg(repo)}/pulls/${pr.number}/reviews`, '-X', 'POST', '--input', '-'], {
@@ -558,6 +569,24 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
       return res.code === 0 ? { ok: true } : { ok: false, error: `gh api reviews: ${(res.stderr || res.stdout).trim().slice(0, 300)}` }
     }
   }
+}
+
+/** GitHub's REST issue list, without the pull requests it also lists. */
+export function parseIssues(stdout: string): IssueInfo[] {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    throw new GitHubError('gh api issues returned non-JSON output', false)
+  }
+  const issues: IssueInfo[] = []
+  for (const item of Array.isArray(raw) ? raw.map(obj) : []) {
+    const number = num(item.number)
+    const url = str(item.html_url)
+    if (number === null || url === null || item.pull_request !== undefined) continue
+    issues.push({ number, title: str(item.title) ?? '', body: str(item.body) ?? '', url, author: str(obj(item.user).login) })
+  }
+  return issues
 }
 
 /** `https://github.com/acme/app.git`, `git@github.com:acme/app.git` and `ssh://...` forms. */

@@ -307,7 +307,6 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       choice('Findings that block', null, d.review.blockAt, (Object.keys(SEVERITY_LABEL) as Severity[]).map((k): [Severity, string] => [k, SEVERITY_LABEL[k]]), (v) => (d.review.blockAt = v)),
       row('Review rounds per PR', 'Then it escalates instead of asking again.', number(d.review.maxRounds, (n) => (d.review.maxRounds = n), 1, 10)),
       choice('Later rounds', null, d.review.followUp, [['focused', 'check the fixes and what changed (cheaper)'], ['full', 'review the whole PR again']], (v) => (d.review.followUp = v)),
-      row('Reviews at once', 'In this project; more wait their turn.', number(d.limits.maxConcurrentReviews, (n) => (d.limits.maxConcurrentReviews = n), 1, 20)),
       row("Skip the author's agent", 'Reviewers on the same agent that wrote the PR sit it out.', toggle(d.review.differentProviderThanAuthor, (on) => (d.review.differentProviderThanAuthor = on))),
       choice('Where reviews go', null, d.review.publish, [['orca-only', 'stay in Orca'], ['github', 'also posted on the PR (a comment review on GitHub, a note on GitLab)']], (v) => (d.review.publish = v))))
 
@@ -353,6 +352,28 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
     row('Remove merged worktrees', 'Only when nothing runs there and nothing is uncommitted.', toggle(d.merge.removeWorktree, (on) => (d.merge.removeWorktree = on))),
     row('Remove finished worktrees', "A worktree the supervisor's workers finished in that never became a PR, such as a review gate, an hour later. Only when nothing in it is uncommitted or unpushed.",
       toggle(d.merge.removeFinishedWorktrees, (on) => (d.merge.removeFinishedWorktrees = on))))
+
+  const cap = (n: number, word: string) => (n > 0 ? plural(n, word) : `no ${word} limit`)
+  const limits = group('limits', 'Limits', () =>
+    [
+      d.limits.maxWorkers > 0 ? `${plural(d.limits.maxWorkers, 'worker')} at once` : 'any number of workers',
+      d.limits.maxWorkerStartsPerDay > 0 ? `${d.limits.maxWorkerStartsPerDay} starts a day` : null,
+      d.limits.minFreeDiskGB > 0 ? `${d.limits.minFreeDiskGB} GB disk floor` : 'no disk floor',
+      `${cap(d.limits.maxConcurrentReviews, 'review')} at once`
+    ].filter(Boolean).join(' · '),
+    intro("The supervisor is told these, and Matriarch refuses a worker it starts over one, with what to do instead. It can refuse only a Claude Code supervisor's start: another agent's goes through, and Needs you says it went over. They hold in dry run too."),
+    row('Workers at once', "The supervisor's workers running together. 0 for no limit.", number(d.limits.maxWorkers, (n) => (d.limits.maxWorkers = n), 0, 50)),
+    row('Worker starts a day', 'Counted from midnight. 0 for no limit.', number(d.limits.maxWorkerStartsPerDay, (n) => (d.limits.maxWorkerStartsPerDay = n), 0, 1000)),
+    row('Disk floor', 'Below this much free disk, no new worker starts and Needs you says so. 0 turns it off.', number(d.limits.minFreeDiskGB, (n) => (d.limits.minFreeDiskGB = n), 0, 10_000), { after: [unit('GB')] }),
+    row('Reviews at once', 'In this project; more wait their turn.', number(d.limits.maxConcurrentReviews, (n) => (d.limits.maxConcurrentReviews = n), 1, 20)))
+
+  const issues = group('issues', 'Issues', () =>
+    d.issues.enabled ? `Labeled ${d.issues.label || '…'} goes to the supervisor${d.issues.comment ? ' · comments on it' : ''}` : 'Off: you give the supervisor its objectives',
+    intro("Label an open issue and, with autopilot on, Matriarch hands it to the running supervisor as a new objective, once. The label is the go-ahead, and the issue's text goes to the supervisor as written: only people who can label issues (triage access on GitHub, Reporter and up on GitLab) can hand work over."),
+    row('Hand labeled issues to the supervisor', null, toggle(d.issues.enabled, (on) => (d.issues.enabled = on))),
+    dependent(
+      row('Label', 'The label that hands an issue over.', textInput(d.issues.label, (v) => (d.issues.label = v.trim()), { placeholder: 'matriarch' })),
+      row('Comment on the issue', 'One short comment saying the supervisor took it up.', toggle(d.issues.comment, (on) => (d.issues.comment = on)))))
 
   const project = group('project', 'Project', () =>
     d.forge?.kind === 'gitlab' ? `GitLab${d.forge.host ? ` on ${d.forge.host}` : ", on the origin's host"}` : d.forge?.kind === 'github' ? 'GitHub' : 'GitHub or GitLab, found from its origin',
@@ -418,7 +439,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
     el('h3', { class: 'settings-heading' }, 'Who does the work'),
     el('div', { class: 'roles' }, supervisor, workers, reviewers),
     el('h3', { class: 'settings-heading' }, 'Rules'),
-    el('div', { class: 'groups' }, review, fixes, merging, project),
+    el('div', { class: 'groups' }, review, fixes, merging, limits, issues, project),
     danger,
     el('div', { class: 'settings-foot' }, status, cancel, save)
   )

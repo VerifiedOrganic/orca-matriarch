@@ -71,7 +71,10 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
   "merge": { "mode": "manual", "method": "squash", "requireHuman": [], "updateBranch": "rebase",
              "onBaseRed": "pause", "deleteBranch": true },
   "escalation": { "supervisorFirst": true, "humanAfterMinutes": 30 },
-  "limits": { "maxConcurrentReviews": 2 }
+  // maxWorkers and maxWorkerStartsPerDay: 0 for no cap; minFreeDiskGB: 0 for no floor.
+  "limits": { "maxConcurrentReviews": 2, "maxWorkers": 4, "maxWorkerStartsPerDay": 0, "minFreeDiskGB": 10 },
+  // Labeled issues become the supervisor's objectives (see Supervisor).
+  "issues": { "enabled": false, "label": "matriarch", "comment": false }
 }
 ```
 
@@ -236,6 +239,25 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   - the instruction to leave reviews and merges to Matriarch.
 - **Escalations.** Matriarch finds the Run by its tag (`orchestration run-list`). Escalations then
   go to `run:<id>`, which wakes the supervisor.
+- **Limits** (`src/limits.ts`). The supervisor starts workers itself, so Matriarch holds it to
+  `limits.maxWorkers`, `maxWorkerStartsPerDay` and `minFreeDiskGB` two ways. The brief states
+  them, and saving new ones in Settings tells a running supervisor. The `agent.tool.before` hook
+  refuses a `orca orchestration worker-start` Bash call from one of the project's checkouts over a
+  limit, with what to do instead. The hook gets 2 s and may not await, so each tick hands it the
+  counts (running workers of the supervisor's Run, workers first seen today, free disk) and it adds
+  the starts it let through since. Orca waits on that hook only for Claude Code
+  (`agent-tool-plugin-hooks.ts`: other agents' calls are only reported), so a supervisor on
+  another agent can go over; Needs you says so. A worker counts as started when Matriarch first
+  sees it; the workers already there when it first looks are not counted.
+- **Issues as objectives** (`src/issues.ts`). With `issues.enabled`, Matriarch reads the open
+  issues carrying `issues.label` every 5 minutes, over REST (GitHub's REST budget is separate from
+  the GraphQL one the PR reads spend; GitLab's `projects/:id/issues`). Under autopilot each new one
+  goes to the running supervisor once, as plain mail titled "New objective:", with the link, the
+  title, and the body in a fence and marked as the issue's text; the brief says the label is the
+  user's go-ahead and asks for `Closes #<n>` in the PR. Handed issues are kept in plugin storage,
+  saved before the optional comment, so a failed comment never hands one over twice. With no
+  supervisor running, Needs you says they wait; in dry run the board says it would hand them over.
+  The trust boundary is the label: triage access on GitHub, Reporter and up on GitLab.
 - **Not yet run live.** Its workers push branches and open PRs, so the first run should be on a
   task you choose.
 

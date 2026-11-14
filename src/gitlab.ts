@@ -9,7 +9,7 @@
 // pipeline status moved, or every few minutes (QUIET_REFRESH_MS) for what the list cannot show.
 // Merge requests are read into the same PrSnapshot as GitHub's PRs, so the planner reads both.
 import type { Exec, ExecOptions, ExecResult } from './exec.ts'
-import { projectPath, repoKey, tailLog, type Forge, type ForgeReview, type Outcome, type RepoRef } from './forge.ts'
+import { projectPath, repoKey, tailLog, type Forge, type ForgeReview, type IssueInfo, type Outcome, type RepoRef } from './forge.ts'
 import {
   ciStateOf,
   OUR_MARKER,
@@ -261,6 +261,24 @@ export function normalizeMr(raw: unknown, repo: string, host: string, viewer: st
   }
 }
 
+/** GitLab's REST issue list: `iid` is the number people see, `description` its text. */
+export function parseIssues(stdout: string): IssueInfo[] {
+  let raw: unknown
+  try {
+    raw = JSON.parse(stdout)
+  } catch {
+    throw new GitLabError('glab api issues returned non-JSON output', false)
+  }
+  const issues: IssueInfo[] = []
+  for (const item of Array.isArray(raw) ? raw.map(obj) : []) {
+    const number = num(item.iid)
+    const url = str(item.web_url)
+    if (number === null || url === null) continue
+    issues.push({ number, title: str(item.title) ?? '', body: str(item.description) ?? '', url, author: str(obj(item.author).username) })
+  }
+  return issues
+}
+
 export class GitLabError extends Error {
   constructor(
     message: string,
@@ -471,6 +489,17 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     },
     publishReview: (repo, pr, _sha, review) =>
       act(repo, 'notes', ['-X', 'POST', rest(projectPath(repo), `merge_requests/${pr.number}/notes`), '-f', `body=${reviewNote(review)}`]),
+    async labeledIssues(repo, label) {
+      const path = rest(projectPath(repo), `issues?state=opened&labels=${encodeURIComponent(label)}&order_by=created_at&sort=asc&per_page=50`)
+      const res = await glab(repo, [path])
+      if (res.code === 127) throw new GitLabError('glab is not installed, or not on the PATH Orca gives plugins', false)
+      if (res.code !== 0) {
+        const text = `${res.stderr}${res.stdout}`.trim()
+        throw new GitLabError(`glab api issues: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
+      }
+      return parseIssues(res.stdout)
+    },
+    commentIssue: (repo, number, body) => act(repo, 'issue notes', ['-X', 'POST', rest(projectPath(repo), `issues/${number}/notes`), '-f', `body=${body}`]),
     async failedLogs(repo, checks) {
       const logs: Record<string, string> = {}
       for (const { name, jobId, url } of checks.slice(0, 5)) {

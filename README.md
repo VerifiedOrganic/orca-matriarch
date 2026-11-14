@@ -87,6 +87,20 @@ Matriarch is not in Orca's plugin directory yet.
 Matriarch finds the forge from the project's origin. For a GitLab behind an ssh alias, or one glab
 is not signed in to yet, pick it under **Forge** in Settings.
 
+### Issues as objectives
+
+Turn on **Hand labeled issues to the supervisor** under **Settings → Issues**. Then label an open
+issue `matriarch` (or the label you pick there). With autopilot on, Matriarch hands it to the
+running supervisor once, as a new objective: the label is the go-ahead, and the PR that does it
+says `Closes #<n>`. Matriarch reads the labeled issues every 5 minutes. With no supervisor
+running, **Needs you** says the issue waits for one; in dry run the board says it would hand it
+over. **Comment on the issue** posts one short comment when the supervisor takes it up.
+
+Only people who can label issues can hand work over this way: on GitHub, people with triage
+access or more; on GitLab, project members from Reporter up. The issue's text goes to the
+supervisor as written, marked as the issue's and not yours, so label only issues you would give
+an agent to do.
+
 Settings are saved in the project's `.orca/matriarch.json`, so you can commit them to share with
 your team. Nobody has to edit that file: every setting Matriarch uses is in **Settings**, and
 [DESIGN.md](DESIGN.md#roles-and-config) describes each field. **Turn Matriarch off here**, at the bottom of Settings, keeps them for later. Matriarch
@@ -104,9 +118,10 @@ manages only PRs you opened from a branch that belongs to an Orca workspace.
 - **Board:** cards by state with the agent and model, CI, comments and rounds used, and in dry
   run what Matriarch would do next. **Run AI review now** on any card runs the crew on that
   commit, in dry run too.
-- **Supervisor:** each project's chat, with the Run it coordinates and how many workers it has.
+- **Supervisor:** each project's chat, with the Run it coordinates, how many of its workers
+  are running against the project's limit, and the labeled issues it took or that wait.
 - **Needs you:** a reviewer waiting on a prompt, an escalation that reached you, a nearly full
-  disk. The status bar shows the same at a glance.
+  disk, a supervisor that went over its worker limits. The status bar shows the same at a glance.
 - **Full tab:** tab bar **+** → **Matriarch board**.
 
 <img src="docs/picker.png" width="400" alt="Settings: picking a worker's model on OpenCode, with the list filtered as you type and grouped by provider.">
@@ -122,6 +137,13 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - later rounds check only what changed (**Later rounds: check the fixes**);
 - reviewers on the same agent as the PR's author are skipped (you can turn that off);
 - **Reviews at once** (default 2) limits how many review crews run together.
+- **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
+  supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
+  The supervisor's brief states them, and a running supervisor is told when you change them.
+  Matriarch refuses a Claude Code supervisor's `worker-start` over a limit, with what to do
+  instead (wait for a worker to finish, for tomorrow, or for space). Orca lets a plugin stop only
+  Claude Code's tool calls, so a supervisor on another agent can go over; **Needs you** then says
+  so. Limits hold in dry run too: they guard your disk and accounts, not the PRs.
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback
 model you choose; otherwise it shows the reviewer as **Needs you**.
@@ -144,7 +166,9 @@ start agents and read their state. It asks Orca for these capabilities:
   storage.
 - **Own settings** (`settings:own`): autopilot on or off, and how often it checks GitHub and GitLab.
 
-It also adds two **hooks** that apply only to agents launched in a review worktree:
+It also adds two **hooks**. They change nothing for agents outside a review worktree, except
+that a Claude Code agent's `orca orchestration worker-start` in one of your projects is refused
+when it would go over that project's worker limits (see [What it costs](#what-it-costs)):
 
 - **Before an agent launches** (`agent.launch.before`), a reviewer's command is rewritten so it
   starts read-only, whatever permission mode you chose in Orca:
@@ -178,12 +202,14 @@ Supervisor and worker launches are not changed.
 | `orca agent launch --surface chat …` | **Open supervisor chat**: the supervisor, on your model, with its brief |
 | `orca terminal create` | once per project: a terminal titled "Matriarch mailbox" (`cat > /dev/null`), which Orca requires as the sender of Matriarch's messages |
 | `orca orchestration worker-list`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
-| `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations to the supervisor |
+| `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations and labeled issues to the supervisor |
 | `git fetch origin …`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | a review round: a throwaway worktree at the PR head, one agent per reviewer, removed afterwards |
 | `orca terminal close` | a reviewer that started without its lockdown is stopped |
 | `gh api repos/<repo>/pulls/<n>/reviews` | autopilot, when **Where reviews go** includes the PR: one comment review per round |
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
 | `gh pr edit <n> --base <branch>` | autopilot: move a stacked PR to where its parent merged, when GitHub left it on the parent's branch |
+| `gh api repos/<repo>/issues?state=open&labels=<label>` | with **Issues** on, every 5 minutes: the open issues with the label |
+| `gh api -X POST repos/<repo>/issues/<n>/comments` | autopilot, with **Comment on the issue**: one comment when the supervisor takes an issue up |
 | `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `glab api --hostname <host> graphql` | GitLab: each check, the open merge requests with their pipeline status and the default branch's; a merge request's jobs, threads, files and approvals when it changed |
 | `glab api --hostname <host> projects/<project>/merge_requests/<n>` | GitLab: only while it has not worked out whether a merge request can merge, which this read asks it to |
@@ -193,6 +219,8 @@ Supervisor and worker launches are not changed.
 | `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n> -f target_branch=<branch>` | GitLab, autopilot: move a stacked merge request to where its parent merged |
+| `glab api --hostname <host> projects/<project>/issues?state=opened&labels=<label>` | GitLab, with **Issues** on, every 5 minutes: the open issues with the label |
+| `glab api --hostname <host> -X POST …/issues/<n>/notes` | GitLab, autopilot, with **Comment on the issue**: one note when the supervisor takes an issue up |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | GitLab, autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `git -C <worktree> status --porcelain`, `orca worktree rm --delete-branch` | autopilot: remove a merged PR's worktree when nothing runs there and nothing is uncommitted |
 | `sqlite3 'file:…?mode=ro'` | read your Orca settings (below), read-only |

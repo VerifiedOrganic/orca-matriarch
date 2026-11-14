@@ -10,7 +10,15 @@ meant to do. Please report anything that lets it do more than that, for example:
 - a merge, branch update or message that happens in dry run, or that the project's settings do
   not allow;
 - a crafted PR, review comment, CI log or agent output that makes Matriarch run a command or
-  send something it should not.
+  send something it should not;
+- an issue that reaches the supervisor without the label, or whose text Matriarch passes on as
+  its own words or the user's.
+
+With **Issues** on, an open issue with the project's label is handed to the supervisor as an
+objective, and its text goes to the supervisor as written (fenced, and marked as the issue's).
+Who can add that label is your forge's access control: on GitHub, people with triage access or
+more; on GitLab, project members from Reporter up. What a labeled issue asks the pod to do is up
+to the people you let label issues, and is not a vulnerability in Matriarch.
 
 ## Reporting a vulnerability
 

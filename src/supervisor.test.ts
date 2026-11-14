@@ -52,7 +52,7 @@ test('once its Run is found, escalations go to the supervisor instead of you', a
   }
   const board = await tick(deps, { autopilot: true })
   assert.equal(store.get('supervisor:acme/app'), 'run:run-7')
-  assert.deepEqual(board.repos[0].supervisor, { agent: 'claude', model: 'claude-opus-5-5', run: 'run:run-7', pending: false, terminal: null, workers: 0 })
+  assert.deepEqual(board.repos[0].supervisor, { agent: 'claude', model: 'claude-opus-5-5', run: 'run:run-7', pending: false, terminal: null, workers: 0, live: 0, maxWorkers: 4, startsToday: 0, maxStarts: 0 })
   // No worker owns the branch, so the CI failure goes to the supervisor's Run, not straight to you.
   const e = executed[0] as Extract<Action, { kind: 'escalate' }>
   assert.equal(e.kind, 'escalate')

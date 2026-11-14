@@ -122,11 +122,32 @@ export interface RepoView {
     terminal: string | null
     /** Supervised workers in its Run. */
     workers: number
+    /** Of those, the ones still running their task. */
+    live?: number
+    /** Workers it may run at once (limits.maxWorkers); 0 for no cap. */
+    maxWorkers?: number
+    /** Workers started today, counted from when Matriarch first saw each. */
+    startsToday?: number
+    /** Workers it may start a day (limits.maxWorkerStartsPerDay); 0 for no cap. */
+    maxStarts?: number
   }
   errors: string[]
   warnings: string[]
   /** Its forge has no commits for it yet: nothing to branch from or open PRs against. */
   empty?: boolean
+  /** Its labeled issues, when issues are handed to the supervisor as objectives. */
+  issues?: IssuesView
+}
+
+/** A project's open issues with the label that hands them to the supervisor. */
+export interface IssuesView {
+  label: string
+  /** Handed to the supervisor. */
+  taken: number[]
+  /** Not handed over yet. */
+  waiting: number[]
+  /** In dry run, what Matriarch would do with them. */
+  next: string[]
 }
 
 /** An agent the settings form offers for a role. */
