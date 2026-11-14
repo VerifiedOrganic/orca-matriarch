@@ -126,11 +126,14 @@ evaluates in this order:
 3. stacked on a PR that merged, still pointing at its branch → `retarget` to where it merged
 4. worker active → `working` (never interrupt a turn)
 5. worker waiting for input → `needs-you`, escalated to the supervisor first
-6. stacked on a PR that merged, the branch not pushed since → its owner is asked once to rebase
-   off the parent's commits (`git rebase --onto origin/<base> <parent head>`) → `fixing-conflict`
-7. CI failing (after every check finished) → a check whose log, annotations or GitLab failure
-   reason look like the infrastructure failing (`src/flaky.ts`) is re-run once on that commit,
-   when `fix.ci.rerunFlaky` is on (`awaiting-ci`); the rest, and a check failing again, → `fixing-ci`
+6. stacked on a PR that merged, the branch not pushed since, and the base without the commit it
+   was built on → its owner is asked once to rebase off the parent's commits
+   (`git rebase --onto origin/<base> <fork point>`) → `fixing-conflict`; escalated if the branch
+   has not moved an hour later
+7. CI failing (after every check finished) → a GitHub Actions or GitLab job whose failure looks
+   like the infrastructure failing (`src/flaky.ts`) is re-run once on that commit, when
+   `fix.ci.rerunFlaky` is on (`awaiting-ci`); the rest, a check failing again, and a re-run the
+   forge refused, → `fixing-ci`
 8. merge conflict → `fixing-conflict`
 9. unresolved human or bot review threads, or a human "changes requested" → `fixing-review`
 10. CI pending or cancelled → `awaiting-ci`
@@ -139,10 +142,37 @@ evaluates in this order:
     whose base is another open PR's head branch waits there (`ready`, "stacked on #n") until that
     one merges; one whose parent closed without merging needs you.
 
-A PR is stacked when its base is the head branch of another PR Matriarch sees (open, or closed
-within the last six hours); a PR into a release branch is not. The ledger keeps the parent, so
-the PR stays stacked after the parent leaves the board, and a parent Matriarch never followed is
-read once when it leaves the open list.
+A PR is stacked when its base is the head branch of another open PR that Matriarch follows (from
+an Orca worktree, opened by you) and that can be a parent: a PR from a short-lived branch of this
+repository into another branch. These are never parents, so PRs into their branch merge there as
+they ask:
+
+- a PR from the default branch (git flow's develop → main release PR);
+- a PR from a branch named like a long-lived one: main, master, trunk, develop, dev, staging,
+  production, prod, stable, next, release, `release/*`, `release-*`, `releases/*`, or a version
+  (`v2`, `1.x`, `2.3.4`);
+- a fork's PR (GitHub's `isCrossRepository`, or a GitLab source project other than the target);
+- a PR into its own head branch;
+- a PR Matriarch does not follow: someone else's, or one with no worktree here.
+
+The ledger keeps the parent, so the PR stays stacked after the parent leaves the board, and a
+parent that left the open list is read once to learn whether it merged. It also keeps the fork
+point: the parent's head when the PR was first seen on it, which stays put as the parent moves
+on (rebased off its own parent, amended). The rebase after the parent merges starts there, so a
+three-deep stack, A ← B ← C, rebases C off the B it was built on. When the parent merged, the
+forge is asked once whether its base has the fork point (GitHub's compare, GitLab's merge base):
+after a merge commit or a fast-forward it does, and the PR goes on without a rebase.
+
+When the forge lists more open PRs than Matriarch reads (four pages), a PR into a branch with an
+Orca worktree here may be stacked on one left out: it waits for you instead of merging.
+
+A re-run is recorded with the failed attempt's job id. Until the forge shows a new attempt (a
+new job id) or for ten minutes, the old failure is the job starting again, not failing again. A
+re-run the forge refuses is recorded too, so the failure goes to the worker on the next tick.
+Several flaky jobs of one GitHub workflow run re-run together (`rerun-failed-jobs`), since GitHub
+refuses a second job's re-run while the run is going again; that re-runs the run's other failed
+jobs as well. Only a GitHub Actions job (its check suite's app is github-actions) can be read or
+re-run; a check another app posts is not GitHub's to re-run.
 
 ### Fix rounds and escalation
 
@@ -306,7 +336,8 @@ and does the signing in. Matriarch never reads, prints or passes a token.
   simplest sound approach is one GraphQL query per project per tick. It reads:
   - `currentUser`;
   - the open merge requests (50 a page, up to 4 pages, newest update first), each with its
-    branches, `diffHeadSha`, `updatedAt`, author and `headPipeline { status }`;
+    branches, `sourceProjectId` and `targetProjectId` (a fork's merge request is never a stack
+    parent), `diffHeadSha`, `updatedAt`, author and `headPipeline { status }`;
   - the default branch's name, its head (`repository.tree(ref:).lastCommit.sha`), and its latest
     pipeline (`project.pipelines(ref:, first: 1)`).
 
@@ -380,6 +411,9 @@ and does the signing in. Matriarch never reads, prints or passes a token.
   **Not verified:**
   - job traces (gitlab.com answers 401 without signing in) and `currentUser`;
   - merge, rebase, notes, approvals and the REST mergeability recheck;
+  - for stacked and flaky work: `sourceProjectId`/`targetProjectId` (from GitLab's GraphQL
+    reference, not run against gitlab.com), the target-branch update, job retry, `GET jobs/:id`'s
+    `failure_reason` and `repository/merge_base`;
   - `--hostname` with a port;
   - anything on a self-hosted GitLab. An older one lacks some of these GraphQL fields
     (`detailedMergeStatus`, `reviewState` among them), and the board then shows GitLab's error.

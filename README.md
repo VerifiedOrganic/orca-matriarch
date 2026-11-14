@@ -20,7 +20,8 @@ It starts in **dry run**: it watches and shows what it would do until you turn o
 2. **Build.** Workers push branches and open PRs.
 3. **CI, comments, conflicts.** A failing check, an unresolved review comment or a conflict goes
    back to the worker that owns the branch, with the details. A check that failed on the
-   infrastructure (a lost runner, the network, a rate limit) is re-run once first. A branch that
+   infrastructure (its runner went away, a registry or git remote was out of reach) is re-run
+   once first. A branch that
    falls behind its base is updated.
 4. **AI review.** When CI passes, a review crew reads the PR in a throwaway worktree: several
    reviewers, each on its own agent and model, each with its own focus. Their verdicts are combined
@@ -29,10 +30,12 @@ It starts in **dry run**: it watches and shows what it would do until you turn o
 5. **Merge.** Matriarch marks the PR ready for you to merge, or merges the reviewed commit itself
    if the project allows it.
 
-A PR **stacked** on another, whose base is that PR's branch, goes through CI and review as usual
-but waits to merge until its parent has. Then it is moved to where its parent merged (when the
-forge left it on the parent's branch) and its worker is asked to rebase it off the parent's
-commits; it merges once that is pushed. If the parent closes without merging, it needs you.
+A PR **stacked** on another of yours, whose base is that PR's feature branch, goes through CI and
+review as usual but waits to merge until its parent has. Then it is moved to where its parent
+merged (when the forge left it on the parent's branch) and, unless the base kept the parent's
+commits as they were, its worker is asked to rebase it off them; it merges once that is pushed. If
+the parent closes without merging, it needs you. A PR into the default branch, a long-lived branch
+(develop, `release/*`, …) or a fork's branch is never held this way.
 
 Anything that needs a decision goes to the supervisor first, then to you after a while. The
 supervisor is told to keep the run moving without you, and Matriarch never answers an agent's
@@ -174,7 +177,7 @@ Supervisor and worker launches are not changed.
 | `gh api graphql` | read open PRs, CI checks and review threads, when something changed |
 | `gh api repos/<repo>/actions/jobs/<id>/logs` | autopilot: the tail of a failed job's log, for the worker |
 | `gh api repos/<repo>/check-runs/<id>/annotations`, `…/actions/jobs/<id>/logs` | once per failed check and commit: whether it failed on the infrastructure rather than the code |
-| `gh api -X POST repos/<repo>/actions/jobs/<id>/rerun` | autopilot: re-run, once, a job that failed on the infrastructure |
+| `gh api -X POST repos/<repo>/actions/jobs/<id>/rerun`, `…/actions/runs/<id>/rerun-failed-jobs` | autopilot: re-run, once, a job that failed on the infrastructure (several of one workflow run together) |
 | `orca agent launch --surface chat …` | **Open supervisor chat**: the supervisor, on your model, with its brief |
 | `orca terminal create` | once per project: a terminal titled "Matriarch mailbox" (`cat > /dev/null`), which Orca requires as the sender of Matriarch's messages |
 | `orca orchestration worker-list`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
@@ -184,6 +187,7 @@ Supervisor and worker launches are not changed.
 | `gh api repos/<repo>/pulls/<n>/reviews` | autopilot, when **Where reviews go** includes the PR: one comment review per round |
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
 | `gh pr edit <n> --base <branch>` | autopilot: move a stacked PR to where its parent merged, when GitHub left it on the parent's branch |
+| `gh api repos/<repo>/compare/<sha>...<branch>` | once when a stacked PR's parent merged: whether the base kept the commit the PR was built on |
 | `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `glab api --hostname <host> graphql` | GitLab: each check, the open merge requests with their pipeline status and the default branch's; a merge request's jobs, threads, files and approvals when it changed |
 | `glab api --hostname <host> projects/<project>/merge_requests/<n>` | GitLab: only while it has not worked out whether a merge request can merge, which this read asks it to |
@@ -193,6 +197,7 @@ Supervisor and worker launches are not changed.
 | `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n> -f target_branch=<branch>` | GitLab, autopilot: move a stacked merge request to where its parent merged |
+| `glab api --hostname <host> …/repository/merge_base?refs[]=<sha>&refs[]=<branch>` | GitLab, once when a stacked merge request's parent merged: whether the base kept the commit it was built on |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | GitLab, autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `git -C <worktree> status --porcelain`, `orca worktree rm --delete-branch` | autopilot: remove a merged PR's worktree when nothing runs there and nothing is uncommitted |
 | `sqlite3 'file:…?mode=ro'` | read your Orca settings (below), read-only |

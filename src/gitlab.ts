@@ -31,7 +31,7 @@ export const LIST_QUERY = `query($path: ID!, $ref: String!, $after: String) {
     pipelines(ref: $ref, first: 1) { nodes { status sha } }
     mergeRequests(state: opened, first: 50, after: $after, sort: UPDATED_DESC) {
       pageInfo { hasNextPage endCursor }
-      nodes { iid sourceBranch targetBranch diffHeadSha updatedAt author { username } headPipeline { status } }
+      nodes { iid sourceBranch targetBranch sourceProjectId targetProjectId diffHeadSha updatedAt author { username } headPipeline { status } }
     }
   }
 }`
@@ -40,7 +40,7 @@ export const DETAIL_QUERY = `query($path: ID!, $iid: String!) {
   currentUser { username }
   project(fullPath: $path) {
     mergeRequest(iid: $iid) {
-      iid webUrl title description state draft sourceBranch targetBranch diffHeadSha updatedAt
+      iid webUrl title description state draft sourceBranch targetBranch sourceProjectId targetProjectId diffHeadSha updatedAt
       detailedMergeStatus conflicts approved
       author { username }
       approvedBy { nodes { username } }
@@ -144,6 +144,9 @@ export function jobProject(url: string | null): string | null {
   }
 }
 
+/** A merge request from a fork: its source project is not the project it merges into. */
+const fromFork = (mr: Obj): boolean => num(mr.sourceProjectId) !== null && num(mr.targetProjectId) !== null && mr.sourceProjectId !== mr.targetProjectId
+
 const OPEN_STATES: Record<string, PrSnapshot['state']> = { opened: 'OPEN', locked: 'OPEN', merged: 'MERGED', closed: 'CLOSED' }
 
 /**
@@ -244,6 +247,7 @@ export function normalizeMr(raw: unknown, repo: string, host: string, viewer: st
     headRef: str(mr.sourceBranch) ?? '',
     headSha,
     baseRef: str(mr.targetBranch) ?? '',
+    ...(fromFork(mr) ? { crossRepo: true } : {}),
     draft: mr.draft === true,
     state: OPEN_STATES[lower(mr.state)] ?? 'OPEN',
     mergeable,
@@ -347,7 +351,7 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
   }
 
   /** The open merge requests and the default branch, read with `ref` as the default branch's name. */
-  async function readOpen(repo: RepoRef, ref: string): Promise<{ list: { viewer: string; prs: PrSummary[]; rate: RateInfo | null; base: BaseBranch | null }; rootRef: string | null }> {
+  async function readOpen(repo: RepoRef, ref: string): Promise<{ list: { viewer: string; prs: PrSummary[]; rate: RateInfo | null; base: BaseBranch | null; truncated?: boolean }; rootRef: string | null }> {
     const path = projectPath(repo)
     const prs: PrSummary[] = []
     let viewer = ''
@@ -355,6 +359,7 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     let base: BaseBranch | null = null
     let rootRef: string | null = null
     let after: string | undefined
+    let truncated = false
     for (let page = 0; page < 4; page++) {
       const { data, rate: r } = await graphql(repo, LIST_QUERY, { path, ref, after })
       rate = r ?? rate
@@ -382,14 +387,16 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
           baseRef: str(n.targetBranch) ?? undefined,
           author: str(obj(n.author).username),
           updatedAt: str(n.updatedAt) ?? '',
-          rollup: pipelineRollup(obj(n.headPipeline).status)
+          rollup: pipelineRollup(obj(n.headPipeline).status),
+          ...(fromFork(n) ? { crossRepo: true } : {})
         })
       }
       const info = obj(conn.pageInfo)
+      truncated = info.hasNextPage === true
       if (info.hasNextPage !== true || typeof info.endCursor !== 'string') break
       after = info.endCursor
     }
-    return { list: { viewer, prs, rate, base }, rootRef }
+    return { list: { viewer, prs, rate, base, ...(truncated ? { truncated } : {}) }, rootRef }
   }
 
   async function act(repo: RepoRef, what: string, args: string[]): Promise<Outcome> {
@@ -447,11 +454,26 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     // Asynchronous, like gh pr update-branch: GitLab answers at once and rebases in the background.
     updateBranch: (repo, pr) => act(repo, 'rebase', ['-X', 'PUT', rest(projectPath(repo), `merge_requests/${pr.number}/rebase`)]),
     retarget: (repo, pr, base) => act(repo, 'update', ['-X', 'PUT', rest(projectPath(repo), `merge_requests/${pr.number}`), '-f', `target_branch=${base}`]),
-    // In the project the job ran in: a fork's pipeline runs in the fork.
-    rerun: (repo, check) =>
-      check.jobId === null
-        ? Promise.resolve({ ok: false, error: `${check.name} is not a job GitLab can retry` })
-        : act(repo, 'retry', ['-X', 'POST', rest(jobProject(check.url) ?? projectPath(repo), `jobs/${check.jobId}/retry`)]),
+    // Each job on its own, in the project it ran in: a fork's pipeline runs in the fork.
+    async rerun(repo, checks) {
+      for (const check of checks) {
+        if (check.jobId === null) return { ok: false, error: `${check.name} is not a job GitLab can retry` }
+        const done = await act(repo, 'retry', ['-X', 'POST', rest(jobProject(check.url) ?? projectPath(repo), `jobs/${check.jobId}/retry`)])
+        if (!done.ok) return done
+      }
+      return { ok: true }
+    },
+    async isAncestor(repo, sha, ref) {
+      // The merge base of a commit and a branch is that commit exactly when the branch has it.
+      const res = await glab(repo, [rest(projectPath(repo), `repository/merge_base?refs[]=${encodeURIComponent(sha)}&refs[]=${encodeURIComponent(ref)}`)])
+      if (res.code !== 0) return null
+      try {
+        const id = str(obj(JSON.parse(res.stdout)).id)
+        return id === null ? null : id === sha
+      } catch {
+        return null
+      }
+    },
     async failureDetails(repo, checks) {
       const details: Record<string, string> = {}
       for (const { name, jobId, url } of checks.slice(0, 5)) {

@@ -34,11 +34,21 @@ export interface StackParent {
   headRef: string
   /** The parent's head commit: its last one, once it merged. */
   headSha: string
+  /**
+   * The parent's head when this PR was first seen on it: the commit it was built on, and so where
+   * its own commits start. Kept as the parent moves on (a restack of its own, an amended commit).
+   */
+  forkSha?: string
   /** Where the parent merges, and so where this PR goes once the parent merged. */
   baseRef: string
   state: 'OPEN' | 'MERGED' | 'CLOSED'
   /** This PR's head when Matriarch first saw the parent merged: until it moves, the branch still carries the parent's commits. */
   headAtMerge?: string
+  /**
+   * Once the parent merged: its base has `forkSha` itself (a merge commit or a fast-forward kept
+   * the parent's commits), so this branch only needs to catch up, not to be rebased off them.
+   */
+  forkInBase?: boolean
 }
 
 export interface PrLedger {
@@ -68,8 +78,18 @@ export interface PrLedger {
   restacks?: Record<string, { at: number; sha: string }>
   /** Failed checks read for a flaky cause, by `<sha>:<check>`: why it looks flaky, or null when it looks real. */
   flaky?: Record<string, string | null>
-  /** Checks re-run once because they looked flaky, by `<sha>:<check>`. */
-  reruns?: Record<string, { at: number; why: string }>
+  /**
+   * Checks re-run once because they looked flaky, by `<sha>:<check>`: the job id of the attempt
+   * that failed (the forge gives the new one another), and the forge's words when it refused.
+   */
+  reruns?: Record<string, Rerun>
+}
+
+export interface Rerun {
+  at: number
+  why: string
+  jobId: number | null
+  error?: string
 }
 
 /** How a check on a commit is named in the ledger's flaky and reruns records. */
@@ -120,8 +140,28 @@ function stackOf(raw: unknown): StackParent | null {
     headSha: s.headSha,
     baseRef: typeof s.baseRef === 'string' ? s.baseRef : '',
     state,
-    ...(typeof s.headAtMerge === 'string' ? { headAtMerge: s.headAtMerge } : {})
+    ...(typeof s.forkSha === 'string' ? { forkSha: s.forkSha } : {}),
+    ...(typeof s.headAtMerge === 'string' ? { headAtMerge: s.headAtMerge } : {}),
+    ...(s.forkInBase === true ? { forkInBase: true } : {})
   }
+}
+
+/**
+ * Per-check records (flaky verdicts, re-runs) with one more set: every one of `sha`'s kept, so a
+ * commit with many failing checks never re-reads them; of older commits, only the newest 40.
+ */
+export function keepChecks<T>(records: Readonly<Record<string, T>>, sha: string, added: readonly (readonly [string, T])[]): Record<string, T> {
+  const all = [...Object.entries(records).filter(([k]) => !added.some(([a]) => a === k)), ...added]
+  const current = all.filter(([k]) => k.startsWith(`${sha}:`))
+  const older = all.filter(([k]) => !k.startsWith(`${sha}:`)).slice(-40)
+  return Object.fromEntries([...older, ...current])
+}
+
+/** The ledger after the forge refused a re-run: it is not tried again, and the failure goes to the worker. */
+export function recordRefusedRerun(ledger: PrLedger, action: Extract<Action, { kind: 'rerun-check' }>, now: number, error: string): PrLedger {
+  const next = loadLedger(structuredClone(ledger))
+  next.reruns = keepChecks<Rerun>(next.reruns ?? {}, action.sha, action.checks.map((c): [string, Rerun] => [checkKey(action.sha, c.name), { at: now, why: action.why, jobId: c.jobId, error }]))
+  return next
 }
 
 /** Fix rounds used: each head commit that got a message counts once. */
@@ -174,8 +214,7 @@ export function record(ledger: PrLedger, action: Action, now: number): PrLedger 
       next.restacks = { ...next.restacks, [action.parent]: { at: now, sha: action.sha } }
       break
     case 'rerun-check':
-      // Only the last few commits' re-runs matter: the oldest go first.
-      next.reruns = Object.fromEntries([...Object.entries(next.reruns ?? {}), [checkKey(action.sha, action.check.name), { at: now, why: action.why }]].slice(-40))
+      next.reruns = keepChecks<Rerun>(next.reruns ?? {}, action.sha, action.checks.map((c): [string, Rerun] => [checkKey(action.sha, c.name), { at: now, why: action.why, jobId: c.jobId }]))
       break
   }
   return next

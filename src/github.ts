@@ -20,8 +20,13 @@ export interface CheckInfo {
   name: string
   state: CheckState
   url: string | null
-  /** A GitHub Actions check run id, which is also its job id (for logs); on GitLab, the job's id. */
+  /**
+   * A GitHub Actions job's id (its check run's id, for logs and re-runs); null for a check another
+   * app or CI posted. On GitLab, the job's id. A re-run gives a new id.
+   */
   jobId: number | null
+  /** The GitHub Actions workflow run the job is part of. */
+  runId?: number | null
 }
 
 export interface ThreadInfo {
@@ -49,6 +54,8 @@ export interface PrSummary {
   updatedAt: string
   /** Its CI rollup in GitHub's words (SUCCESS, FAILURE, ERROR, PENDING, EXPECTED), or null with no CI. */
   rollup: string | null
+  /** From a fork (another repository or project): its branch is not one of this repository's. */
+  crossRepo?: boolean
   /**
    * A stamp of its head's checks as GitHub last answered (their ETags), when Matriarch watches
    * them. It changes with any check, even when the overall rollup stays the same.
@@ -68,6 +75,8 @@ export interface PrSnapshot {
   headRef: string
   headSha: string
   baseRef: string
+  /** From a fork (another repository or project): its branch is not one of this repository's. */
+  crossRepo?: boolean
   draft: boolean
   state: 'OPEN' | 'MERGED' | 'CLOSED'
   mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN'
@@ -97,7 +106,7 @@ export const LIST_QUERY = `query($owner: String!, $name: String!, $after: String
     defaultBranchRef { name target { ... on Commit { oid statusCheckRollup { state } } } }
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number headRefName headRefOid baseRefName updatedAt author { login }
+      nodes { number headRefName headRefOid baseRefName isCrossRepository updatedAt author { login }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }
     }
   }
@@ -107,14 +116,14 @@ export const DETAIL_QUERY = `query($owner: String!, $name: String!, $number: Int
   rateLimit { cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      number url title body state isDraft headRefName headRefOid baseRefName
+      number url title body state isDraft headRefName headRefOid baseRefName isCrossRepository
       mergeable mergeStateStatus reviewDecision updatedAt author { login }
       files(first: 100) { pageInfo { hasNextPage } nodes { path } }
       latestReviews(first: 20) { nodes { id state body url author { login __typename } } }
       commits(last: 1) { nodes { commit { oid statusCheckRollup { state
         contexts(first: 100) { pageInfo { hasNextPage } nodes {
           __typename
-          ... on CheckRun { name status conclusion detailsUrl databaseId }
+          ... on CheckRun { name status conclusion detailsUrl databaseId checkSuite { app { slug } workflowRun { databaseId } } }
           ... on StatusContext { context state targetUrl } } } } } } }
       reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { id isResolved isOutdated path line
         comments(first: 5) { nodes { url body author { login __typename } } } } }
@@ -169,6 +178,20 @@ export function ciStateOf(checks: readonly CheckInfo[]): CiState {
   return 'passing'
 }
 
+/**
+ * A check run that is a GitHub Actions job: its job and workflow run ids. Another app's check run
+ * (a code scanner, an external CI) has no job behind it: its logs and re-runs are not GitHub's.
+ */
+export function actionsJob(node: Obj): { jobId: number; runId: number | null } | null {
+  if (node.__typename !== 'CheckRun') return null
+  const suite = obj(node.checkSuite)
+  const page = (str(node.detailsUrl) ?? '').match(/\/actions\/runs\/(\d+)\/job\/(\d+)/)
+  const slug = str(obj(suite.app).slug)
+  if (slug !== 'github-actions' && !(slug === null && page)) return null
+  const jobId = num(node.databaseId) ?? (page ? Number(page[2]) : null)
+  return jobId === null ? null : { jobId, runId: num(obj(suite.workflowRun).databaseId) ?? (page ? Number(page[1]) : null) }
+}
+
 const isBot = (author: Obj): boolean => author.__typename === 'Bot' || (str(author.login) ?? '').endsWith('[bot]')
 
 export function normalizePr(raw: unknown, repo: string, fetchedAt: number): PrSnapshot | null {
@@ -179,12 +202,11 @@ export function normalizePr(raw: unknown, repo: string, fetchedAt: number): PrSn
 
   const commit = obj(nodes(pr.commits)[0]?.commit)
   const rollup = obj(commit.statusCheckRollup)
-  const checks: CheckInfo[] = nodes(rollup.contexts).map((c) => ({
-    name: str(c.name) ?? str(c.context) ?? 'check',
-    state: checkState(c),
-    url: str(c.detailsUrl) ?? str(c.targetUrl),
-    jobId: c.__typename === 'CheckRun' ? num(c.databaseId) : null
-  }))
+  const checks: CheckInfo[] = nodes(rollup.contexts).map((c) => {
+    const url = str(c.detailsUrl) ?? str(c.targetUrl)
+    const job = actionsJob(c)
+    return { name: str(c.name) ?? str(c.context) ?? 'check', state: checkState(c), url, jobId: job?.jobId ?? null, runId: job?.runId ?? null }
+  })
 
   const threads: ThreadInfo[] = nodes(pr.reviewThreads).map((t) => {
     const comments = nodes(t.comments)
@@ -243,6 +265,7 @@ export function normalizePr(raw: unknown, repo: string, fetchedAt: number): PrSn
     headRef: str(pr.headRefName) ?? '',
     headSha,
     baseRef: str(pr.baseRefName) ?? '',
+    ...(pr.isCrossRepository === true ? { crossRepo: true } : {}),
     draft: pr.isDraft === true,
     state,
     mergeable,
@@ -299,6 +322,8 @@ export interface OpenList {
   base?: BaseBranch | null
   /** True when GitHub said nothing changed since the last read, so this is that read again. */
   unchanged?: boolean
+  /** More open PRs than Matriarch reads (four pages): some are not in `prs`. */
+  truncated?: boolean
   /**
    * How long a PR's detail may be reused while its summary looks the same, when the forge cannot
    * tell every change from the list (GitLab). The engine's own limit applies when it is shorter.
@@ -433,6 +458,7 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
       let rate: RateInfo | null = null
       let base: BaseBranch | null = null
       let after: string | undefined
+      let truncated = false
       for (let page = 0; page < 4; page++) {
         const data = await graphql(LIST_QUERY, { owner: repo.owner, name: repo.name, after })
         viewer = str(obj(data.viewer).login) ?? viewer
@@ -454,14 +480,16 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
             baseRef: str(n.baseRefName) ?? undefined,
             author: str(obj(n.author).login),
             updatedAt: str(n.updatedAt) ?? '',
-            rollup: str(obj(obj(nodes(n.commits)[0]?.commit).statusCheckRollup).state)
+            rollup: str(obj(obj(nodes(n.commits)[0]?.commit).statusCheckRollup).state),
+            ...(n.isCrossRepository === true ? { crossRepo: true } : {})
           })
         }
         const info = obj(conn.pageInfo)
+        truncated = info.hasNextPage === true
         if (info.hasNextPage !== true || typeof info.endCursor !== 'string') break
         after = info.endCursor
       }
-      return { viewer, prs, rate, base }
+      return { viewer, prs, rate, base, ...(truncated ? { truncated } : {}) }
   }
 
   const repoArg = (r: RepoRef) => `${r.owner}/${r.name}`
@@ -511,9 +539,21 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
         ...(deleteBranch ? ['--delete-branch'] : [])
       ]),
     retarget: (repo, pr, base) => run(['pr', 'edit', String(pr.number), '--repo', repoArg(repo), '--base', base]),
-    // An Actions check run's id is its job's id: the job alone runs again, not its whole workflow.
-    rerun: (repo, check) =>
-      check.jobId === null ? Promise.resolve({ ok: false, error: `${check.name} is not a GitHub Actions job, so Matriarch cannot re-run it` }) : run(['api', '-X', 'POST', `repos/${repoArg(repo)}/actions/jobs/${check.jobId}/rerun`]),
+    // One job runs again alone. GitHub refuses a second job of a run while the first runs again,
+    // so several jobs of one workflow run go together: that run's failed jobs run again.
+    rerun: (repo, checks) => {
+      const job = checks[0]
+      if (!job || job.jobId === null) return Promise.resolve({ ok: false, error: `${job?.name ?? 'the check'} is not a GitHub Actions job, so Matriarch cannot re-run it` })
+      if (checks.length > 1 && job.runId) return run(['api', '-X', 'POST', `repos/${repoArg(repo)}/actions/runs/${job.runId}/rerun-failed-jobs`])
+      return run(['api', '-X', 'POST', `repos/${repoArg(repo)}/actions/jobs/${job.jobId}/rerun`])
+    },
+    async isAncestor(repo, sha, ref) {
+      // `ahead`: the branch has every commit of `sha` and more; `identical`: it is `sha`.
+      const res = await exec(bin, ['api', `repos/${repoArg(repo)}/compare/${sha}...${ref}?per_page=1`, '--jq', '.status'], { timeoutMs: 30_000 })
+      if (res.code !== 0) return null
+      const status = res.stdout.trim()
+      return status === 'ahead' || status === 'identical' ? true : status === 'behind' || status === 'diverged' ? false : null
+    },
     async failureDetails(repo, checks) {
       const details: Record<string, string> = {}
       for (const { name, jobId } of checks.slice(0, 5)) {
@@ -527,7 +567,8 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
         if (notes.code === 0) {
           try {
             const list: unknown = JSON.parse(notes.stdout)
-            for (const a of Array.isArray(list) ? list : []) if (typeof obj(a).message === 'string') lines.push(obj(a).message as string)
+            // Only what failed the job: a warning (a cache miss, a deprecation) says nothing about why.
+            for (const a of Array.isArray(list) ? list : []) if (obj(a).annotation_level === 'failure' && typeof obj(a).message === 'string') lines.push(obj(a).message as string)
           } catch {
             // No annotations to read.
           }

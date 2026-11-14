@@ -11,7 +11,7 @@ import { flakyReason } from './flaky.ts'
 import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
-import { checkKey, ledgerKey, loadLedger, record, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
+import { checkKey, keepChecks, ledgerKey, loadLedger, record, recordRefusedRerun, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
 import { MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
@@ -171,7 +171,7 @@ export function describe(action: Action, forge: ForgeKind = 'github'): string {
     case 'send-restack':
       return `ask the worker to rebase onto ${action.base}, off the commits of #${action.parent}, which merged`
     case 'rerun-check':
-      return `re-run ${action.check.name} once: ${action.why}`
+      return `re-run ${action.checks.map((c) => c.name).join(', ')} once: ${action.why}`
   }
 }
 
@@ -202,7 +202,7 @@ function markFor(action: Action, at: number, forge: ForgeKind = 'github'): Mark 
     case 'send-restack':
       return { at, kind: 'rebase-sent', label: `rebase off #${action.parent} requested` }
     case 'rerun-check':
-      return { at, kind: 'ci-rerun', label: `${action.check.name} re-run: ${action.why}` }
+      return { at, kind: 'ci-rerun', label: `${action.checks.map((c) => c.name).join(', ')} re-run: ${action.why}` }
   }
 }
 
@@ -267,6 +267,25 @@ interface StackCandidate {
 }
 
 /**
+ * Branches that live on after their PRs merge (a release or integration branch), by name. A PR
+ * from one is a release or a back-merge, never a parent that PRs into that branch wait for.
+ */
+export const LONG_LIVED_BRANCH = /^(?:main|master|trunk|develop|development|dev|staging|stage|production|prod|stable|next|releases?(?:[/-].+)?|v?\d+(?:\.(?:\d+|x))*)$/i
+
+/** A branch a PR can be stacked on: a short-lived one, not the default branch or a long-lived one. */
+export function stackableBranch(branch: string, defaultBranch: string | null): boolean {
+  return branch !== '' && branch !== defaultBranch && !LONG_LIVED_BRANCH.test(branch)
+}
+
+/**
+ * Whether PRs into this PR's head branch are stacked on it: a PR Matriarch follows, from a
+ * short-lived branch of this repository (not a fork's), into a branch other than its own head.
+ */
+export function canBeParent(p: { headRef: string; baseRef: string; crossRepo?: boolean }, defaultBranch: string | null): boolean {
+  return !p.crossRepo && p.headRef !== p.baseRef && stackableBranch(p.headRef, defaultBranch)
+}
+
+/**
  * The PR a PR is stacked on, as its ledger should now remember it: one whose head branch is this
  * PR's base. A parent that left the open list is looked up once, from the state Matriarch read
  * when it closed, or from the forge; a PR moved off a parent that is still open is not stacked.
@@ -276,24 +295,33 @@ async function followStack(
   repo: RepoInfo,
   snap: PrSnapshot,
   ledger: PrLedger,
-  open: { byHead: Map<string, StackCandidate>; byNumber: Map<number, StackCandidate> },
+  open: { parents: Map<string, StackCandidate>; all: Map<number, StackCandidate> },
   closed: Map<number, PrSnapshot>,
   defaultBase: string | null
 ): Promise<StackParent | undefined> {
   const st = ledger.stack
-  const parent = open.byHead.get(snap.baseRef)
+  const parent = open.parents.get(snap.baseRef)
   if (parent && parent.number !== snap.number) {
-    return { number: parent.number, headRef: parent.headRef, headSha: parent.headSha, baseRef: parent.baseRef || st?.baseRef || defaultBase || '', state: 'OPEN' }
+    // The parent's head when this PR was first seen on it stays its fork point, however the
+    // parent moves on afterwards (rebased off its own parent, amended).
+    const forkSha = st?.number === parent.number ? (st.forkSha ?? st.headSha) : parent.headSha
+    return { number: parent.number, headRef: parent.headRef, headSha: parent.headSha, baseRef: parent.baseRef || st?.baseRef || defaultBase || '', state: 'OPEN', forkSha }
   }
-  if (!st) return undefined
-  // Still open, and this PR no longer points at its branch: someone moved it.
-  if (open.byNumber.has(st.number)) return undefined
+  if (!st || !canBeParent(st, defaultBase)) return undefined
+  // Still open: stacked while this PR points at its branch; moved off it, not stacked any more.
+  const still = open.all.get(st.number)
+  if (still) return still.headRef === snap.baseRef ? { ...st, headSha: still.headSha } : undefined
   if (st.state !== 'OPEN') return st
   const kept = closed.get(st.number) ?? ((await deps.store.get(`snap:${repo.key}#${st.number}`)) as { snap?: PrSnapshot } | null)?.snap
   const reader = readerFor(deps, repo.ref)
   const final = kept && kept.state !== 'OPEN' ? kept : reader ? (await reader.detail(repo.ref, st.number).catch(() => ({ pr: null }))).pr : null
   if (!final || final.state === 'OPEN') return st
-  return { ...st, headSha: final.headSha || st.headSha, baseRef: final.baseRef || st.baseRef, state: final.state, ...(final.state === 'MERGED' ? { headAtMerge: snap.headSha } : {}) }
+  const next: StackParent = { ...st, headSha: final.headSha || st.headSha, baseRef: final.baseRef || st.baseRef, state: final.state }
+  if (final.state !== 'MERGED') return next
+  // A merge commit or a fast-forward keeps the commits this PR was built on: then it only needs
+  // to catch up with the base, not to be rebased off them. Asked once, as the merge is first seen.
+  const kept2 = reader?.isAncestor ? await reader.isAncestor(repo.ref, st.forkSha ?? st.headSha, next.baseRef).catch(() => null) : null
+  return { ...next, headAtMerge: snap.headSha, ...(kept2 === true ? { forkInBase: true } : {}) }
 }
 
 /**
@@ -307,11 +335,11 @@ async function judgeFailures(deps: EngineDeps, repo: RepoInfo, snap: PrSnapshot,
   const todo = snap.checks.filter((c) => c.state === 'failure' && c.jobId !== null && ledger.flaky?.[checkKey(sha, c.name)] === undefined && !ledger.reruns?.[checkKey(sha, c.name)])
   const reader = readerFor(deps, repo.ref)
   if (todo.length === 0 || !reader?.failureDetails) return ledger
-  const details = await reader.failureDetails(repo.ref, todo).catch(() => null)
-  if (!details) return ledger
-  // A check the forge said nothing about (past the first few, or no log) counts as a real failure.
-  const judged = todo.map((c) => [checkKey(sha, c.name), flakyReason(details[c.name] ?? '')] as const)
-  return { ...ledger, flaky: Object.fromEntries([...Object.entries(ledger.flaky ?? {}), ...judged].slice(-40)) }
+  // A check the forge said nothing about (past the first few, no log, or the read failed) counts
+  // as a real failure: each gets a verdict, so none is read again on every tick.
+  const details = await reader.failureDetails(repo.ref, todo).catch(() => ({}) as Record<string, string>)
+  const judged = todo.map((c): [string, string | null] => [checkKey(sha, c.name), flakyReason(details[c.name] ?? '')])
+  return { ...ledger, flaky: keepChecks(ledger.flaky ?? {}, sha, judged) }
 }
 
 function toNumbers(v: unknown): number[] {
@@ -474,6 +502,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     let viewer = ''
     let listed = false
     let base: { name: string; sha: string | null; rollup: string | null } | null = null
+    // The forge had more open PRs than it lists: a PR's parent may be among those left out.
+    let truncatedList = false
     // How long a PR's detail may be reused: shorter where the forge's list cannot show every change.
     let detailAge = maxAge
     // Only PRs whose branch lives in an Orca workspace and that the signed-in user opened.
@@ -485,6 +515,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       viewer = list.viewer
       base = list.base ?? null
       detailAge = Math.min(maxAge, list.detailMaxAgeMs ?? maxAge)
+      truncatedList = list.truncated === true
       // GitHub's budget is the scarce one: GitLab's shows only when no GitHub project reports one.
       if (list.rate && (kind === 'github' || !board.rate)) board.rate = kind === 'github' ? list.rate : { ...list.rate, forge: terms.name }
       // The real client says null when the forge has no default branch; a reader that omits it says nothing.
@@ -683,13 +714,16 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
 
     const seenWorkspaces = new Set<string>()
 
-    // Stacked PRs: one whose base is another open PR's head branch merges only after it, and is
-    // moved and rebased once that one merged. Open PRs by head branch, from their detail where
-    // Matriarch follows them, else from the list; closed ones from what was read as they closed.
-    const byHead = new Map<string, StackCandidate>()
-    for (const { snap: s } of items) if (s.state === 'OPEN') byHead.set(s.headRef, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef })
-    for (const s of summaries) if (!byHead.has(s.headRef)) byHead.set(s.headRef, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef ?? '' })
-    const openStack = { byHead, byNumber: new Map([...byHead.values()].map((c) => [c.number, c])) }
+    // Stacked PRs: one whose base is the head branch of another PR Matriarch follows merges only
+    // after it, and is moved and rebased once that one merged. Only a PR from a short-lived branch
+    // of this repository can be a parent (canBeParent): a release PR from a long-lived branch, or
+    // a fork's PR from its own main, never holds the PRs into that branch.
+    const parents = new Map<string, StackCandidate>()
+    for (const { snap: s } of items) {
+      if (s.state === 'OPEN' && canBeParent(s, base?.name ?? null)) parents.set(s.headRef, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef })
+    }
+    const all = new Map(summaries.map((s) => [s.number, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef ?? '' }]))
+    const openStack = { parents, all }
     const closedSnaps = new Map(items.filter((i) => i.snap.state !== 'OPEN').map((i) => [i.snap.number, i.snap]))
 
     for (const item of items) {
@@ -739,6 +773,9 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         baseHasChecks: base && base.name === snap.baseRef ? base.rollup !== null : undefined,
         ownersKnown,
         stack: item.ledger.stack ?? null,
+        // A cut-short list may leave out the PR whose branch this one merges into.
+        unlistedBase:
+          truncatedList && snap.state === 'OPEN' && !item.ledger.stack && byBranch.has(snap.baseRef) && stackableBranch(snap.baseRef, base?.name ?? null),
         now
       })
 
@@ -788,6 +825,11 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         }
         if (outcome.skipped) continue
         view.errors.push(`#${snap.number} ${action.kind}: ${outcome.error ?? 'failed'}`)
+        // A re-run the forge refused is not asked for again: the failure goes to the worker next.
+        if (action.kind === 'rerun-check') {
+          ledger = recordRefusedRerun(ledger, action, now, outcome.error ?? 'refused')
+          await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
+        }
         if (action.kind === 'merge') ledger = { ...ledger, merge: { sha: action.sha, at: now, status: 'failed', error: outcome.error } }
         // A supervisor that cannot be reached: tell the person now, and forget a Run Orca lost.
         if (action.kind === 'escalate' && action.to === 'supervisor') {

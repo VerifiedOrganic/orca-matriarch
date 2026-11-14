@@ -324,7 +324,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
   },
     intro('Fixes go to the worker that owns the branch, or to the supervisor once that worker has finished. After the last round, it escalates.'),
     fixRow('ci'),
-    row('Re-run flaky checks once', 'A check that failed on a lost runner, the network or a rate limit runs again before it goes to the worker.', toggle(d.fix.ci.rerunFlaky, (on) => (d.fix.ci.rerunFlaky = on))),
+    row('Re-run flaky checks once', 'A check that failed because its runner went away, or a registry or git remote was out of reach, runs again before it goes to the worker.', toggle(d.fix.ci.rerunFlaky, (on) => (d.fix.ci.rerunFlaky = on))),
     fixRow('comments'), fixRow('conflicts'),
     el('div', { class: 'group-sub' }, 'Escalation'),
     row('Supervisor first', 'Send problems to the supervisor before you.', toggle(d.escalation.supervisorFirst, (on) => (d.escalation.supervisorFirst = on))),

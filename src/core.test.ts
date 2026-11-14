@@ -90,7 +90,7 @@ describe('github', () => {
               contexts: {
                 pageInfo: { hasNextPage: false },
                 nodes: [
-                  { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'u', databaseId: 99 },
+                  { __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'u', databaseId: 99, checkSuite: { app: { slug: 'github-actions' }, workflowRun: { databaseId: 5 } } },
                   { __typename: 'CheckRun', name: 'build', status: 'IN_PROGRESS', conclusion: null },
                   { __typename: 'StatusContext', context: 'ci/legacy', state: 'SUCCESS', targetUrl: 't' }
                 ]

@@ -55,8 +55,11 @@ export type Action =
   | { kind: 'retarget'; sha: string; parent: number; from: string; base: string }
   /** Asks the branch's owner to rebase it off a merged parent's commits. */
   | { kind: 'send-restack'; to: string; sha: string; parent: number; parentSha: string; base: string }
-  /** Runs a failed check's job once more: it looked like the infrastructure failing (flaky.ts). */
-  | { kind: 'rerun-check'; sha: string; check: CheckInfo; why: string }
+  /**
+   * Runs failed checks' jobs once more: they looked like the infrastructure failing (flaky.ts).
+   * Several only when they are jobs of one GitHub workflow run, which re-runs them together.
+   */
+  | { kind: 'rerun-check'; sha: string; checks: CheckInfo[]; why: string }
 
 export interface PlanInput {
   pr: PrSnapshot
@@ -77,6 +80,11 @@ export interface PlanInput {
   baseHasChecks?: boolean
   /** The PR this one is stacked on (its base is, or was, that PR's head branch), from the ledger. */
   stack?: StackParent | null
+  /**
+   * This PR's base is a branch with a worktree here, so it may be another open PR's head, and the
+   * forge's list of open PRs was cut short: Matriarch cannot rule out that it is stacked.
+   */
+  unlistedBase?: boolean
   now: number
 }
 
@@ -92,6 +100,13 @@ const short = (sha: string): string => sha.slice(0, 7)
 export const CI_GRACE_MS = 3 * 60_000
 /** A merge the forge has not completed by now has stalled (a merge queue dropped it, say). */
 export const MERGE_TIMEOUT_MS = 30 * 60_000
+/**
+ * After a re-run is requested, the failed attempt can still be what the forge shows for a moment.
+ * Until the forge shows a new attempt (a new job id), or for this long, the check is starting again.
+ */
+export const RERUN_START_MS = 10 * 60_000
+/** A branch asked to rebase off its merged parent that has not moved in this long is escalated. */
+export const RESTACK_STALL_MS = 60 * 60_000
 
 export function ciSignature(checks: readonly CheckInfo[]): string {
   return checks
@@ -254,7 +269,7 @@ export function plan(input: PlanInput): Plan {
   // A PR stacked on one that merged, still pointing at that PR's branch (the forge moves it only
   // when the branch goes): it is moved to where its parent went. A forge action, not the worker's.
   const st = input.stack
-  if (st?.state === 'MERGED' && pr.baseRef === st.headRef) {
+  if (st?.state === 'MERGED' && pr.baseRef === st.headRef && st.baseRef !== st.headRef) {
     if (!st.baseRef) {
       const why = `#${st.number}, which this PR is stacked on, merged, and Matriarch cannot tell where it merged to: point this PR at that branch`
       return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `stack-base:${st.number}`, `${pr.repo} #${pr.number} needs you`, why) }
@@ -273,8 +288,9 @@ export function plan(input: PlanInput): Plan {
     return { lane: 'needs-you', reason: `the worker is ${owner.activity} on input`, actions: e.actions }
   }
 
-  // 0. Its parent merged: the branch still carries the parent's commits until it is rebased off them.
-  if (st?.state === 'MERGED' && st.headAtMerge === sha) {
+  // 0. Its parent merged: the branch still carries the parent's commits until it is rebased off
+  // them. Not when the base kept those commits as they are (a merge commit, a fast-forward).
+  if (st?.state === 'MERGED' && st.headAtMerge === sha && st.forkInBase !== true) {
     const step = restackStep(input, st)
     if (step) return step
   }
@@ -283,19 +299,29 @@ export function plan(input: PlanInput): Plan {
   const pending = pr.checks.filter((c) => c.state === 'pending').length
   const rerunning = rerunNote(input)
   if (pr.ci === 'failing') {
-    const failing = pr.checks.filter((c) => c.state === 'failure')
+    // A check re-run a moment ago still shows the attempt that failed: it is starting again.
+    const failing = pr.checks.filter((c) => c.state === 'failure' && !restarting(input, c))
     const names = failing.map((c) => c.name).join(', ')
-    if (pending > 0) return { lane: 'awaiting-ci', reason: `failing: ${names}; ${rerunning ?? `${pending} check(s) still running`}`, actions: [] }
-    // A check that failed on the infrastructure (a lost runner, the network, a rate limit) runs
-    // once more before a worker spends a round on it; whatever still fails then goes to the worker.
+    if (failing.length === 0) return { lane: 'awaiting-ci', reason: rerunning ?? `${pending} check(s) running on ${short(sha)}`, actions: [] }
+    if (pending > 0 || rerunning) return { lane: 'awaiting-ci', reason: `failing: ${names}; ${rerunning ?? `${pending} check(s) still running`}`, actions: [] }
+    // A check that failed on the infrastructure (a lost runner, a registry out of reach) runs once
+    // more before a worker spends a round on it; whatever still fails then goes to the worker.
     if (config.fix.ci.rerunFlaky && !ledger.ci[sha]) {
-      const again: Action[] = failing.flatMap((c) => {
-        const key = checkKey(sha, c.name)
-        const why = ledger.flaky?.[key]
-        return why && c.jobId !== null && !ledger.reruns?.[key] ? [{ kind: 'rerun-check' as const, sha, check: c, why }] : []
-      })
+      const flaky = failing.filter((c) => c.jobId !== null && ledger.flaky?.[checkKey(sha, c.name)] && !ledger.reruns?.[checkKey(sha, c.name)])
+      // GitHub re-runs one job of a workflow run at a time: jobs of one run go together.
+      const runs = new Map<string, CheckInfo[]>()
+      for (const c of flaky) {
+        const key = c.runId ? `run:${c.runId}` : `job:${c.jobId}`
+        runs.set(key, [...(runs.get(key) ?? []), c])
+      }
+      const again: Action[] = [...runs.values()].map((checks) => ({
+        kind: 'rerun-check',
+        sha,
+        checks,
+        why: [...new Set(checks.map((c) => ledger.flaky![checkKey(sha, c.name)]!))].join('; ')
+      }))
       if (again.length > 0) {
-        const what = again.map((a) => (a.kind === 'rerun-check' ? `${a.check.name} (${a.why})` : '')).join(', ')
+        const what = flaky.map((c) => `${c.name} (${ledger.flaky![checkKey(sha, c.name)]})`).join(', ')
         return { lane: 'awaiting-ci', reason: `re-running ${what} once: it looks like the infrastructure failed, not the code`, actions: again }
       }
     }
@@ -357,10 +383,19 @@ export function plan(input: PlanInput): Plan {
   return review.pre.length > 0 ? { ...gate, actions: [...review.pre, ...gate.actions] } : gate
 }
 
+/**
+ * A failed check re-run moments ago, whose failed attempt the forge still shows: the same job id
+ * as the attempt that failed (a new attempt gets a new one), not refused, and not long ago.
+ */
+function restarting(input: PlanInput, c: CheckInfo): boolean {
+  const r = input.ledger.reruns?.[checkKey(input.pr.headSha, c.name)]
+  return Boolean(r && !r.error && r.jobId !== null && c.jobId === r.jobId && input.now - r.at < RERUN_START_MS)
+}
+
 /** Checks running again because they looked flaky on this commit, as the board says it; null when none. */
 function rerunNote(input: PlanInput): string | null {
   const { pr, ledger } = input
-  const again = pr.checks.filter((c) => c.state === 'pending' && ledger.reruns?.[checkKey(pr.headSha, c.name)])
+  const again = pr.checks.filter((c) => (c.state === 'pending' && ledger.reruns?.[checkKey(pr.headSha, c.name)] && !ledger.reruns[checkKey(pr.headSha, c.name)].error) || (c.state === 'failure' && restarting(input, c)))
   return again.length ? `re-running ${again.map((c) => `${c.name} (${ledger.reruns![checkKey(pr.headSha, c.name)].why})`).join(', ')} once` : null
 }
 
@@ -377,16 +412,25 @@ export function restackCommand(base: string, parentSha: string): string {
 function restackStep(input: PlanInput, st: StackParent): Plan | null {
   const { pr, owner, ledger } = input
   const what = `#${st.number}, which this PR was stacked on, merged into ${pr.baseRef}`
-  if (ledger.restacks?.[st.number]) return { lane: 'fixing-conflict', reason: `${what}; waiting for the branch to be rebased off its commits`, actions: [] }
+  // Where this branch's own commits start: the parent's head it was built on.
+  const fork = st.forkSha ?? st.headSha
+  const sent = ledger.restacks?.[st.number]
+  if (sent) {
+    const waited = input.now - sent.at
+    if (waited < RESTACK_STALL_MS) return { lane: 'fixing-conflict', reason: `${what}; waiting for the branch to be rebased off its commits`, actions: [] }
+    // Nothing pushed in all this time: the rebase may have been a no-op, or the worker is stuck.
+    const e = escalate(input, `restack-stalled:${st.number}`, `${what}; branch ${pr.headRef} was asked ${Math.round(waited / 60_000)} min ago to be rebased off its commits and has not moved. Rebase it (${restackCommand(pr.baseRef, fork)}), or, if it has nothing of #${st.number}'s left, push it as it is`)
+    return { lane: e.toHuman ? 'needs-you' : 'fixing-conflict', reason: `${what}; the branch has not moved since it was asked to rebase`, actions: e.actions }
+  }
   if (!owner?.address) {
     if (input.ownersKnown === false) return { lane: 'fixing-conflict', reason: `${what}; waiting to see Orca's workers again`, actions: [] }
-    const e = escalate(input, `restack:${st.number}`, `${what}, and branch ${pr.headRef} still carries its commits, with no supervised worker on it. Rebase it off them in its worktree: ${restackCommand(pr.baseRef, st.headSha)}`)
+    const e = escalate(input, `restack:${st.number}`, `${what}, and branch ${pr.headRef} still carries its commits, with no supervised worker on it. Rebase it off them in its worktree: ${restackCommand(pr.baseRef, fork)}`)
     return { lane: e.toHuman ? 'needs-you' : 'fixing-conflict', reason: `${what}; no worker owns this branch to rebase it`, actions: e.actions }
   }
   return {
     lane: 'fixing-conflict',
     reason: `${what}; asking the worker to rebase off its commits`,
-    actions: [{ kind: 'send-restack', to: owner.address, sha: pr.headSha, parent: st.number, parentSha: st.headSha, base: pr.baseRef }]
+    actions: [{ kind: 'send-restack', to: owner.address, sha: pr.headSha, parent: st.number, parentSha: fork, base: pr.baseRef }]
   }
 }
 
@@ -455,6 +499,9 @@ function mergeGate(input: PlanInput): Plan {
       const why = `stacked on #${st.number}, which closed without merging: retarget it or close it`
       return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `stack-closed:${st.number}`, `${pr.repo} #${pr.number} needs you`, why) }
     }
+  }
+  if (input.unlistedBase) {
+    return { lane: 'ready', reason: `its base ${pr.baseRef} may be another open PR's branch, and ${forgeTerms(pr.forge).name} listed too many open PRs to tell: merge it yourself`, actions: [] }
   }
   if (merge.requireHuman.length > 0) {
     const hits = matchingGlobs(merge.requireHuman, pr.files)

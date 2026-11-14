@@ -2,15 +2,15 @@
 // its parent merged, and is rebased off the parent's commits before it merges itself.
 import { assert, describe, test } from 'orca/testing'
 import { validateConfig } from './config.ts'
-import { tick, type EngineDeps, type Workspace } from './engine.ts'
+import { canBeParent, stackableBranch, tick, type EngineDeps, type Workspace } from './engine.ts'
 import type { Exec, ExecResult } from './exec.ts'
 import { createExecutor, type Executor } from './executor.ts'
-import type { GitHub, PrSnapshot } from './github.ts'
-import { normalizeMr } from './gitlab.ts'
+import { createGitHub, normalizePr, type GitHub, type PrSnapshot } from './github.ts'
+import { createGitLab, normalizeMr } from './gitlab.ts'
 import { emptyLedger, ledgerKey, loadLedger, record, type PrLedger, type StackParent } from './ledger.ts'
 import { restackMessage } from './messages.ts'
 import { createOrcaCli } from './orca-cli.ts'
-import { plan, restackCommand, type Action } from './plan.ts'
+import { plan, RESTACK_STALL_MS, restackCommand, type Action } from './plan.ts'
 import { config, input, owner, pr, SHA } from './testing/fixtures.ts'
 import { detailData, fakeGlab, HOST, KEY, REPO } from './testing/gitlab.ts'
 
@@ -87,6 +87,42 @@ describe('planning a stacked PR', () => {
     assert.deepEqual(plan(input({ pr: child, config: auto, stack: closed }, record(passed(), p.actions[0], 5))).actions, [])
   })
 
+  test('a parent whose base is its own head is no reason to move a PR', () => {
+    // A fork's PR from its own main into main: retargeting "from main to main" would never end.
+    const self = parent({ headRef: 'main', baseRef: 'main', state: 'MERGED', headAtMerge: SHA })
+    const p = plan(input({ pr: pr({ number: 12, baseRef: 'main' }), config: auto, stack: self }, passed()))
+    assert.ok(!p.actions.some((a) => a.kind === 'retarget'))
+  })
+
+  test('no rebase when the base kept the commits the branch was built on; it merges as is', () => {
+    const kept = parent({ state: 'MERGED', headAtMerge: SHA, forkInBase: true })
+    assert.deepEqual(kinds(plan(input({ pr: pr({ number: 12, baseRef: 'main' }), config: auto, stack: kept }, passed())).actions), ['merge'])
+  })
+
+  test('the rebase starts at the parent head the branch was built on, not the one that merged', () => {
+    const amended = parent({ state: 'MERGED', headAtMerge: SHA, headSha: NEW_SHA, forkSha: PARENT_SHA })
+    const p = plan(input({ pr: pr({ number: 12, baseRef: 'main' }), config: auto, stack: amended }, passed()))
+    assert.deepEqual(p.actions, [{ kind: 'send-restack', to: 'dispatch:d1', sha: SHA, parent: 11, parentSha: PARENT_SHA, base: 'main' }])
+  })
+
+  test('a branch that never moves after the rebase request is escalated', () => {
+    const merged = parent({ state: 'MERGED', headAtMerge: SHA })
+    const moved = pr({ number: 12, baseRef: 'main' })
+    const asked = record(passed(), { kind: 'send-restack', to: 'dispatch:d1', sha: SHA, parent: 11, parentSha: PARENT_SHA, base: 'main' }, 0)
+    assert.deepEqual(plan(input({ pr: moved, config: auto, stack: merged, supervisor: 'run:r1', now: RESTACK_STALL_MS - 1 }, asked)).actions, [])
+    const late = plan(input({ pr: moved, config: auto, stack: merged, supervisor: 'run:r1', now: RESTACK_STALL_MS }, asked))
+    assert.deepEqual(late.actions.map((a) => (a.kind === 'escalate' ? a.to : a.kind)), ['supervisor'])
+    assert.ok(late.actions[0].kind === 'escalate' && late.actions[0].reason.includes('has not moved'))
+  })
+
+  test('a PR whose base may be an unlisted PR waits to merge, in both modes', () => {
+    for (const cfg of [auto, config()]) {
+      const p = plan(input({ pr: child, config: cfg, unlistedBase: true }, passed()))
+      assert.equal(p.lane, 'ready')
+      assert.deepEqual(p.actions, [])
+    }
+  })
+
   test('the rebase message names only the branch commits, onto the new base', () => {
     const m = restackMessage(pr({ number: 12, baseRef: 'main' }), 11, PARENT_SHA, 'main')
     assert.match(m.subject, /#11 merged: rebase #12 onto main/)
@@ -102,22 +138,29 @@ describe('planning a stacked PR', () => {
 
 describe('an engine tick over stacked PRs', () => {
   const T0 = 1_800_000_000_000
-  const workspaces: Workspace[] = [
-    { id: 'ws-auth', kind: 'worktree', name: 'auth', path: '/r/wt/auth', branch: 'feature/auth', hostId: null },
-    { id: 'ws-login', kind: 'worktree', name: 'login', path: '/r/wt/login', branch: 'feature/login', hostId: null }
-  ]
-  function harness(prs: PrSnapshot[]) {
+  const ws = (name: string, branch: string): Workspace => ({ id: `ws-${name}`, kind: 'worktree', name, path: `/r/wt/${name}`, branch, hostId: null })
+  const WORKSPACES = [ws('auth', 'feature/auth'), ws('login', 'feature/login'), ws('profile', 'feature/profile')]
+  function harness(prs: PrSnapshot[], opts: { workspaces?: Workspace[]; defaultBranch?: string; truncated?: boolean; inBase?: (sha: string, ref: string) => boolean | null } = {}) {
     const store = new Map<string, unknown>()
     const executed: Action[] = []
+    const asked: [string, string][] = []
     let now = T0
+    const workspaces = opts.workspaces ?? WORKSPACES
     const github: GitHub = {
       async listOpen() {
-        return { viewer: 'me', rate: null, prs: prs.filter((p) => p.state === 'OPEN').map((p) => ({ number: p.number, headRef: p.headRef, headSha: p.headSha, baseRef: p.baseRef, author: p.author, updatedAt: p.updatedAt, rollup: p.ci })) }
+        return {
+          viewer: 'me',
+          rate: null,
+          base: { name: opts.defaultBranch ?? 'main', sha: 'basesha', rollup: 'SUCCESS' },
+          ...(opts.truncated ? { truncated: true } : {}),
+          prs: prs.filter((p) => p.state === 'OPEN').map((p) => ({ number: p.number, headRef: p.headRef, headSha: p.headSha, baseRef: p.baseRef, author: p.author, updatedAt: p.updatedAt, rollup: 'SUCCESS', ...(p.crossRepo ? { crossRepo: true } : {}) }))
+        }
       },
       async detail(_repo, number) {
         const p = prs.find((x) => x.number === number)
         return { pr: p ? { ...p, fetchedAt: now } : null, rate: null }
-      }
+      },
+      ...(opts.inBase ? { isAncestor: async (_repo: unknown, sha: string, ref: string) => (asked.push([sha, ref]), opts.inBase!(sha, ref)) } : {})
     }
     const executor: Executor = { execute: async (a) => (executed.push(a), { ok: true }) }
     const deps: EngineDeps = {
@@ -127,17 +170,16 @@ describe('an engine tick over stacked PRs', () => {
       repoOf: async () => ({ ref: { owner: 'acme', name: 'app' }, key: 'acme/app', root: '/r' }),
       readConfig: async () => validateConfig({ review: { enabled: false }, merge: { mode: 'auto' } }),
       github,
-      workers: async () => [
-        { dispatchId: 'd-auth', worktreeId: 'ws-auth', taskId: 't1', runId: 'r1', agent: 'codex', model: null, state: 'idle' },
-        { dispatchId: 'd-login', worktreeId: 'ws-login', taskId: 't2', runId: 'r1', agent: 'codex', model: null, state: 'idle' }
-      ],
+      workers: async () => workspaces.map((w, i) => ({ dispatchId: `d-${w.name}`, worktreeId: w.id, taskId: `t${i}`, runId: 'r1', agent: 'codex', model: null, state: 'idle' })),
       activity: () => null,
       supervisor: async () => 'run:r1',
       store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v), keys: async () => [...store.keys()] },
       executor
     }
-    return { deps, store, executed, advance: (ms: number) => (now += ms) }
+    return { deps, store, executed, asked, advance: (ms: number) => (now += ms) }
   }
+  const ledgerOf = (h: ReturnType<typeof harness>, n: number) => h.store.get(ledgerKey('acme/app', n)) as PrLedger
+  const merges = (h: ReturnType<typeof harness>) => h.executed.filter((a) => a.kind === 'merge').map((a) => (a.kind === 'merge' ? a.sha : ''))
 
   test('the parent merges first; the child is moved, asked to rebase, and merges after its push', async () => {
     const auth = pr({ number: 11, headRef: 'feature/auth', headSha: PARENT_SHA, title: 'Auth' })
@@ -145,11 +187,11 @@ describe('an engine tick over stacked PRs', () => {
     const prs = [auth, login]
     const h = harness(prs)
     const first = await tick(h.deps, { autopilot: true })
-    assert.deepEqual(h.executed.map((a) => [a.kind, a.kind === 'merge' ? a.sha : null]), [['merge', PARENT_SHA]], 'only the parent merges')
+    assert.deepEqual(merges(h), [PARENT_SHA], 'only the parent merges')
     const card = first.tracks.find((t) => t.pr?.number === 12)!
     assert.equal(card.lane, 'ready')
     assert.equal(card.pr?.stackedOn, 11)
-    assert.equal((h.store.get(ledgerKey('acme/app', 12)) as PrLedger).stack?.number, 11)
+    assert.equal(ledgerOf(h, 12).stack?.forkSha, PARENT_SHA)
 
     // The parent merged, its branch kept: the child still points at it, and is moved.
     prs[0] = { ...auth, state: 'MERGED' }
@@ -157,9 +199,8 @@ describe('an engine tick over stacked PRs', () => {
     h.advance(60_000)
     await tick(h.deps, { autopilot: true })
     assert.deepEqual(h.executed, [{ kind: 'retarget', sha: SHA, parent: 11, from: 'feature/auth', base: 'main' }])
-    const st = (h.store.get(ledgerKey('acme/app', 12)) as PrLedger).stack
-    assert.equal(st?.state, 'MERGED')
-    assert.equal(st?.headAtMerge, SHA)
+    assert.equal(ledgerOf(h, 12).stack?.state, 'MERGED')
+    assert.equal(ledgerOf(h, 12).stack?.headAtMerge, SHA)
 
     // The forge shows the new base: its worker is asked to rebase off the parent's commits.
     prs[1] = { ...login, baseRef: 'main', updatedAt: '2026-11-10T11:00:00Z' }
@@ -177,25 +218,90 @@ describe('an engine tick over stacked PRs', () => {
     prs[1] = { ...prs[1], headSha: NEW_SHA, updatedAt: '2026-11-10T12:00:00Z' }
     h.advance(5 * 60_000)
     await tick(h.deps, { autopilot: true })
-    assert.deepEqual(h.executed.map((a) => [a.kind, a.kind === 'merge' ? a.sha : null]), [['merge', NEW_SHA]])
+    assert.deepEqual(merges(h), [NEW_SHA])
   })
 
-  test('a parent Matriarch never followed is looked up once it leaves the open list', async () => {
-    // Someone else's PR #11 (not from an Orca worktree, so not followed), with #12 on top of it.
-    const auth = pr({ number: 11, headRef: 'feature/auth', headSha: PARENT_SHA, author: 'alice' })
+  test('a parent merged with its commits kept (a merge commit, a fast-forward): no rebase, the child merges', async () => {
+    const auth = pr({ number: 11, headRef: 'feature/auth', headSha: PARENT_SHA })
     const login = pr({ number: 12, headRef: 'feature/login', baseRef: 'feature/auth' })
     const prs = [auth, login]
-    const h = harness(prs)
-    await tick(h.deps, { autopilot: false })
-    assert.equal((h.store.get(ledgerKey('acme/app', 12)) as PrLedger).stack?.number, 11)
-    // It merged and GitHub moved #12 to main as the branch went: #12 still carries its commits.
+    const h = harness(prs, { inBase: () => true })
+    await tick(h.deps, { autopilot: true })
     prs[0] = { ...auth, state: 'MERGED' }
     prs[1] = { ...login, baseRef: 'main', updatedAt: '2026-11-10T11:00:00Z' }
+    h.executed.length = 0
     h.advance(60_000)
-    const board = await tick(h.deps, { autopilot: false })
-    const card = board.tracks.find((t) => t.pr?.number === 12)!
-    assert.equal(card.lane, 'fixing-conflict')
-    assert.match(card.next[0], /rebase onto main, off the commits of #11/)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(h.asked, [[PARENT_SHA, 'main']], 'asked once, whether main has the commit the child was built on')
+    assert.equal(ledgerOf(h, 12).stack?.forkInBase, true)
+    assert.deepEqual(merges(h), [SHA])
+  })
+
+  test('three deep: each PR is rebased off the parent head it was built on, not the one that merged', async () => {
+    const A_SHA = 'a'.repeat(40)
+    const B1 = 'b1'.repeat(20)
+    const B2 = 'b2'.repeat(20)
+    const C1 = 'c1'.repeat(20)
+    const a = pr({ number: 10, headRef: 'feature/auth', headSha: A_SHA })
+    const b = pr({ number: 11, headRef: 'feature/login', baseRef: 'feature/auth', headSha: B1 })
+    const c = pr({ number: 12, headRef: 'feature/profile', baseRef: 'feature/login', headSha: C1 })
+    const prs = [a, b, c]
+    const h = harness(prs)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(merges(h), [A_SHA])
+    assert.deepEqual([ledgerOf(h, 11).stack?.forkSha, ledgerOf(h, 12).stack?.forkSha], [A_SHA, B1])
+    // A merges (squashed); GitHub moves B to main; B's worker rebases it off A: B is now B2.
+    prs[0] = { ...a, state: 'MERGED' }
+    prs[1] = { ...b, baseRef: 'main', updatedAt: '2026-11-10T11:00:00Z' }
+    h.executed.length = 0
+    h.advance(60_000)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(h.executed.map((x) => (x.kind === 'send-restack' ? `${x.to} ${x.parentSha}` : x.kind)), [`dispatch:d-login ${A_SHA}`])
+    prs[1] = { ...prs[1], headSha: B2, updatedAt: '2026-11-10T12:00:00Z' }
+    h.executed.length = 0
+    h.advance(5 * 60_000)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(merges(h), [B2], 'B merges; C still waits for it')
+    assert.equal(ledgerOf(h, 12).stack?.headSha, B2)
+    assert.equal(ledgerOf(h, 12).stack?.forkSha, B1, 'C was built on B1, and its own commits start there')
+    // B merges: C is moved, and rebased off B1, the commit it was built on.
+    prs[1] = { ...prs[1], state: 'MERGED' }
+    prs[2] = { ...c, baseRef: 'main', updatedAt: '2026-11-10T13:00:00Z' }
+    h.executed.length = 0
+    h.advance(60_000)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(h.executed, [{ kind: 'send-restack', to: 'dispatch:d-profile', sha: C1, parent: 11, parentSha: B1, base: 'main' }])
+  })
+
+  test('a release PR from the default branch or a long-lived one is no parent: PRs into that branch merge there', async () => {
+    // git flow: develop is the default branch, and its release PR into main is open.
+    const release = pr({ number: 5, headRef: 'develop', baseRef: 'main', headSha: 'd'.repeat(40) })
+    const login = pr({ number: 12, headRef: 'feature/login', baseRef: 'develop' })
+    const flow = harness([release, login], { workspaces: [ws('develop', 'develop'), ws('login', 'feature/login')], defaultBranch: 'develop' })
+    await tick(flow.deps, { autopilot: true })
+    assert.equal(ledgerOf(flow, 12).stack, undefined)
+    assert.ok(merges(flow).includes(SHA), 'into develop, as it asks')
+    // A release branch with its back-merge PR open, and a fix into that release branch.
+    const back = pr({ number: 6, headRef: 'release/2.0', baseRef: 'main', headSha: 'e'.repeat(40) })
+    const fix = pr({ number: 13, headRef: 'feature/login', baseRef: 'release/2.0' })
+    const rel = harness([back, fix], { workspaces: [ws('release', 'release/2.0'), ws('login', 'feature/login')] })
+    await tick(rel.deps, { autopilot: true })
+    assert.equal(ledgerOf(rel, 13).stack, undefined)
+    assert.ok(merges(rel).includes(SHA))
+  })
+
+  test("a fork's PR, or one Matriarch does not follow, is no parent", async () => {
+    // A contributor's PR from their fork's main, and someone else's PR: PRs into those branches are not held.
+    const fork = pr({ number: 7, headRef: 'feature/auth', baseRef: 'main', author: 'me', crossRepo: true, headSha: 'f'.repeat(40) })
+    const login = pr({ number: 12, headRef: 'feature/login', baseRef: 'feature/auth' })
+    const h = harness([fork, login])
+    await tick(h.deps, { autopilot: true })
+    assert.equal(ledgerOf(h, 12).stack, undefined)
+    const alice = pr({ number: 8, headRef: 'feature/auth', baseRef: 'main', author: 'alice', headSha: 'f'.repeat(40) })
+    const h2 = harness([alice, login])
+    await tick(h2.deps, { autopilot: true })
+    assert.equal(ledgerOf(h2, 12).stack, undefined)
+    assert.deepEqual(merges(h2), [SHA])
   })
 
   test('a PR moved off a parent that is still open is not stacked any more', async () => {
@@ -207,7 +313,34 @@ describe('an engine tick over stacked PRs', () => {
     prs[1] = { ...login, baseRef: 'main', updatedAt: '2026-11-10T11:00:00Z' }
     h.advance(60_000)
     await tick(h.deps, { autopilot: false })
-    assert.equal((h.store.get(ledgerKey('acme/app', 12)) as PrLedger).stack, undefined)
+    assert.equal(ledgerOf(h, 12).stack, undefined)
+  })
+
+  test('with a cut-short PR list, a PR into a branch with a worktree here waits rather than merging blind', async () => {
+    const login = pr({ number: 12, headRef: 'feature/login', baseRef: 'feature/auth' })
+    const h = harness([login], { truncated: true })
+    const board = await tick(h.deps, { autopilot: true })
+    assert.deepEqual(merges(h), [])
+    assert.match(board.tracks.find((t) => t.pr?.number === 12)!.reason, /may be another open PR's branch/)
+    // Into main, or with the whole list read, it merges as usual.
+    const full = harness([login])
+    await tick(full.deps, { autopilot: true })
+    assert.deepEqual(merges(full), [SHA])
+    const intoMain = harness([pr({ number: 12, headRef: 'feature/login' })], { truncated: true })
+    await tick(intoMain.deps, { autopilot: true })
+    assert.deepEqual(merges(intoMain), [SHA])
+  })
+})
+
+describe('which PRs can be parents', () => {
+  test('only a short-lived branch of this repository, into another branch', () => {
+    const p = (headRef: string, baseRef = 'main', crossRepo = false) => canBeParent({ headRef, baseRef, crossRepo }, 'main')
+    assert.equal(p('feature/auth'), true)
+    assert.equal(p('main', 'release'), false, 'the default branch')
+    for (const b of ['master', 'develop', 'dev', 'trunk', 'staging', 'production', 'release', 'release/2.0', 'release-2.0', 'releases/1', 'v2', '1.x', '2.3.4']) assert.equal(p(b), false, b)
+    assert.equal(p('feature/auth', 'main', true), false, "a fork's branch")
+    assert.equal(p('feature/auth', 'feature/auth'), false, 'into its own head')
+    assert.equal(stackableBranch('develop-login', 'main'), true, 'a feature branch named after one')
   })
 })
 
@@ -229,5 +362,32 @@ describe('moving a PR to another base', () => {
     const snap = normalizeMr(detailData().project.mergeRequest, KEY, HOST, 'me', 0)!
     assert.deepEqual(await ex.execute({ kind: 'retarget', sha: SHA, parent: 11, from: 'feature/auth', base: 'main' }, { ...ctx, repo: REPO, pr: snap }), { ok: true })
     assert.deepEqual(g.calls[0].args, ['api', '--hostname', HOST, '-X', 'PUT', 'projects/group%2Fsub%2Fapp/merge_requests/12', '-f', 'target_branch=main'])
+  })
+})
+
+describe('reading what stacking needs from each forge', () => {
+  test('GitHub: whether a branch has a commit, from compare; a fork PR is cross-repository', async () => {
+    const answers: Record<string, string> = { ahead: 'true', identical: 'true', behind: 'false', diverged: 'false' }
+    for (const [status, want] of Object.entries(answers)) {
+      const calls: (readonly string[])[] = []
+      const exec: Exec = async (_file, args): Promise<ExecResult> => (calls.push(args), { code: 0, stdout: `${status}\n`, stderr: '' })
+      assert.equal(String(await createGitHub(exec).isAncestor!({ owner: 'acme', name: 'app' }, PARENT_SHA, 'main')), want, status)
+      assert.deepEqual(calls[0], ['api', `repos/acme/app/compare/${PARENT_SHA}...main?per_page=1`, '--jq', '.status'])
+    }
+    const failed: Exec = async () => ({ code: 1, stdout: '', stderr: 'HTTP 404' })
+    assert.equal(await createGitHub(failed).isAncestor!({ owner: 'acme', name: 'app' }, PARENT_SHA, 'main'), null)
+    assert.equal(normalizePr({ number: 7, headRefOid: SHA, isCrossRepository: true }, 'acme/app', 0)?.crossRepo, true)
+    assert.equal(normalizePr({ number: 7, headRefOid: SHA, isCrossRepository: false }, 'acme/app', 0)?.crossRepo, undefined)
+  })
+
+  test("GitLab: the merge base answers whether a branch has a commit; another project's merge request is a fork's", async () => {
+    const g = fakeGlab(() => ({ stdout: JSON.stringify({ id: PARENT_SHA }) }))
+    assert.equal(await createGitLab(g.exec).isAncestor!(REPO, PARENT_SHA, 'main'), true)
+    assert.deepEqual(g.calls[0].args, ['api', '--hostname', HOST, `projects/group%2Fsub%2Fapp/repository/merge_base?refs[]=${PARENT_SHA}&refs[]=main`])
+    const other = fakeGlab(() => ({ stdout: JSON.stringify({ id: 'c0ffee'.padEnd(40, '0') }) }))
+    assert.equal(await createGitLab(other.exec).isAncestor!(REPO, PARENT_SHA, 'main'), false)
+    const mr = (source: number, target: number) => normalizeMr({ ...detailData().project.mergeRequest, sourceProjectId: source, targetProjectId: target }, KEY, HOST, 'me', 0)!
+    assert.equal(mr(2, 1).crossRepo, true)
+    assert.equal(mr(1, 1).crossRepo, undefined)
   })
 })
