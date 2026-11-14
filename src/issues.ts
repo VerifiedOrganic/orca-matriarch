@@ -133,8 +133,13 @@ export interface IssuesInput {
   supervisor: string | null
   /** A supervisor chat is open and has not created its Run yet. */
   pending: boolean
-  /** Autopilot is on and the settings have no errors. */
+  /** Autopilot is on, Matriarch can act, and the settings have no errors. */
   acting: boolean
+  /**
+   * Why nothing should be handed over now although Matriarch acts: the disk is below the floor or
+   * the project is at its worker limit, so the supervisor could start no worker for it. Null when not.
+   */
+  held?: string | null
   now: number
   store: { get(key: string): Promise<unknown>; set(key: string, value: JsonValue): Promise<void> }
   /** Sends the supervisor a message from Matriarch's mailbox. */
@@ -146,7 +151,8 @@ export interface IssuesInput {
 
 export interface IssuesResult {
   view: IssuesView
-  attention: Attention | null
+  /** What needs the person: issues waiting for a supervisor, a handoff that may not have arrived. */
+  attention: Attention[]
   warnings: string[]
   errors: string[]
 }
@@ -162,7 +168,7 @@ export async function followIssues(input: IssuesInput): Promise<IssuesResult> {
     return await follow(input)
   } catch (error) {
     const label = input.config.issues.label
-    return { view: { label, taken: [], waiting: [], refused: [], unsure: [], next: [], truncated: false }, attention: null, warnings: [`Issues labeled ${label}: ${message(error)}`], errors: [] }
+    return { view: { label, taken: [], waiting: [], refused: [], unsure: [], next: [] }, attention: [], warnings: [`Issues labeled ${label}: ${message(error)}`], errors: [] }
   }
 }
 
@@ -199,7 +205,7 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
     return h !== undefined && (!c?.labelAt || c.labelAt === h.labelAt)
   }
   const passing = (n: number) => !taken(n) && rec.checks[n]?.ok === true
-  const canHand = input.acting && input.supervisor !== null && input.tellSupervisor !== undefined
+  const canHand = input.acting && !input.held && input.supervisor !== null && input.tellSupervisor !== undefined
   const due = now - rec.at >= ISSUES_EVERY_MS || (canHand && rec.open.some(passing) && now - rec.at >= EAGER_MS)
 
   // Read this tick, with the text the handoff needs: nothing of it is stored.
@@ -289,20 +295,28 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
 
   const takenNow = rec.open.filter(taken)
   const unsure = takenNow.filter((n) => !rec.handed[n].sure)
-  for (const n of unsure) {
-    warnings.push(`#${n} may not have reached the supervisor: Matriarch was cut off while handing it over. Check the supervisor's chat; to hand it over again, remove ${label} from the issue and add it back.`)
-  }
   const refused = rec.open.filter((n) => !taken(n) && rec.checks[n]?.ok === false).map((n) => ({ number: n, why: rec.checks[n].why ?? 'it did not pass the check' }))
   const waiting = rec.open.filter((n) => !taken(n) && rec.checks[n]?.ok !== false)
   const ready = waiting.filter((n) => rec.checks[n]?.ok === true)
-  const next = input.supervisor && !canHand ? ready.map((n) => `hand #${n} to the supervisor`) : []
-  const attention: Attention | null =
-    ready.length > 0 && !input.supervisor && !input.pending
-      ? {
-          key,
-          repo,
-          message: `${repo}: ${ready.length === 1 ? 'an issue' : `${ready.length} issues`} labeled ${label} ${ready.length === 1 ? 'waits' : 'wait'} for a supervisor (${ready.map((n) => `#${n}`).join(', ')}). Open the supervisor chat and Matriarch hands ${ready.length === 1 ? 'it' : 'them'} over.`
-        }
-      : null
-  return { view: { label, taken: takenNow, waiting, refused, unsure, next, truncated: rec.truncated }, attention, warnings, errors }
+  // In dry run (or held), the ones Matriarch would hand over to the running supervisor.
+  const next = input.supervisor && !canHand ? ready : []
+  const list = (ns: readonly number[]) => ns.map((n) => `#${n}`).join(', ')
+  const attention: Attention[] = []
+  if (ready.length > 0 && !input.supervisor && !input.pending) {
+    attention.push({
+      key,
+      repo,
+      alert: true,
+      message: `${repo}: ${ready.length === 1 ? 'an issue' : `${ready.length} issues`} labeled ${label} ${ready.length === 1 ? 'waits' : 'wait'} for a supervisor (${list(ready)}). Open the supervisor chat and Matriarch hands ${ready.length === 1 ? 'it' : 'them'} over.`
+    })
+  }
+  if (unsure.length > 0) {
+    attention.push({
+      key: `${key}:unsure`,
+      repo,
+      alert: true,
+      message: `${repo}: ${list(unsure)} may not have reached the supervisor: Matriarch was cut off while handing ${unsure.length === 1 ? 'it' : 'them'} over. Check the supervisor's chat; to hand one over again, remove ${label} from the issue and add it back.`
+    })
+  }
+  return { view: { label, taken: takenNow, waiting, refused, unsure, next, ...(input.held && ready.length > 0 ? { held: input.held } : {}) }, attention, warnings, errors }
 }

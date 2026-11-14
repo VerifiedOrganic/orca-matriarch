@@ -491,6 +491,10 @@ export function createWorker(options: WorkerOptions = {}) {
       crew,
       advisor,
       alert: (a) => alerter.send(a),
+      notifyPerson: async (a) => {
+        await orca.host.call('notifications.show', { title: a.title, body: a.body })
+        alerter.send(a)
+      },
       supervisorSenders: (repo, run) => supervisorSenders(cli, orca.storage, repo, run),
       freeSpace: async (path) => {
         const s = await statfs(path)

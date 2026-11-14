@@ -1,6 +1,6 @@
 import { assert, describe, test } from 'orca/testing'
 import { validateConfig } from './config.ts'
-import { FINISHED_GRACE_MS, SHOW_CLOSED_MS, tick, type EngineDeps, type Workspace } from './engine.ts'
+import { ATTENTION_CLEAR_MS, FINISHED_GRACE_MS, SHOW_CLOSED_MS, tick, type EngineDeps, type Workspace } from './engine.ts'
 import type { Executor } from './executor.ts'
 import type { GitHub, PrSnapshot } from './github.ts'
 import { ledgerKey } from './ledger.ts'
@@ -339,6 +339,8 @@ describe("a finished worktree that never became a PR", () => {
     h.advance(FINISHED_GRACE_MS)
     await tick(h.deps, { autopilot: true })
     assert.deepEqual(removed, [{ path: '/r/wt/gate', keepBranch: true }], "only the supervisor's own worktree")
+    const log = (h.store.get('track:ws-gate') as { log: { kind: string; text: string }[] }).log
+    assert.match(log.at(-1)?.text ?? '', /^Removed the worktree P1 gate review: its worker finished, it never became a PR/)
   })
 
   test('stays in dry run, while a worker is live there, and when the setting is off', async () => {
@@ -382,5 +384,65 @@ describe('a merged PR', () => {
     h.advance(SHOW_CLOSED_MS)
     const gone = await tick(h.deps, { autopilot: false })
     assert.ok(!gone.tracks.some((t) => t.pr?.number === 12), 'gone once the window passed')
+  })
+})
+
+describe('Needs you that nothing else tells you about', () => {
+  // A nearly full disk: on the board, and with no escalation or notice of its own.
+  const setup = () => {
+    const h = harness([])
+    let free = 2 * 1024 ** 3
+    const told: string[] = []
+    h.deps.freeSpace = async () => free
+    h.deps.notifyPerson = async (a) => void told.push(`${a.kind}: ${a.body}`)
+    return { h, told, setFree: (gb: number) => (free = gb * 1024 ** 3) }
+  }
+
+  test('reaches you once while it stands, and again only after it cleared for a while', async () => {
+    const { h, told, setFree } = setup()
+    const board = await tick(h.deps, { autopilot: true })
+    assert.equal(board.attention.find((a) => a.key === 'disk')?.alert, true)
+    assert.equal(told.length, 1)
+    assert.match(told[0], /^needs-you: Only 2\.0 GB free on the disk with acme\/app/)
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told.length, 1, 'once while it stands')
+    // Gone for a tick (a read that failed, say), then back: not again.
+    setFree(50)
+    await tick(h.deps, { autopilot: true })
+    setFree(2)
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told.length, 1, 'a short gap does not ring twice')
+    // Gone for long enough, then back: again.
+    setFree(50)
+    await tick(h.deps, { autopilot: true })
+    h.advance(ATTENTION_CLEAR_MS)
+    await tick(h.deps, { autopilot: true })
+    setFree(2)
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told.length, 2)
+  })
+
+  test('only while Matriarch acts: one first seen in dry run reaches you once autopilot is on', async () => {
+    const { h, told } = setup()
+    await tick(h.deps, { autopilot: false })
+    assert.deepEqual(told, [])
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told.length, 1)
+  })
+
+  test('an item another path already tells you about (the advisor stuck on a prompt) is not alerted twice', async () => {
+    const { h, told, setFree } = setup()
+    setFree(50)
+    h.deps.advisor = {
+      step: async () => ({
+        agent: 'claude', model: null, effort: null, usable: true, queued: 0, waiting: null, last: null,
+        answering: { question: 'q', since: 1, blocked: 'a permission prompt', terminal: 'term_adv', workspaceId: null, lock: null }
+      })
+    }
+    const board = await tick(h.deps, { autopilot: true })
+    const stuck = board.attention.find((a) => a.key === 'acme/app:advisor')
+    assert.ok(stuck, 'it is under Needs you')
+    assert.notEqual(stuck.alert, true, 'the advisor alerts when it starts waiting')
+    assert.deepEqual(told, [])
   })
 })

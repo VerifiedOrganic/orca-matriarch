@@ -115,11 +115,13 @@ describe('planning a stacked PR', () => {
     assert.ok(late.actions[0].kind === 'escalate' && late.actions[0].reason.includes('has not moved'))
   })
 
-  test('a PR whose base may be an unlisted PR waits to merge, in both modes', () => {
+  test('a PR whose base may be an unlisted PR waits for you to merge it, in both modes, and says so once', () => {
     for (const cfg of [auto, config()]) {
       const p = plan(input({ pr: child, config: cfg, unlistedBase: true }, passed()))
-      assert.equal(p.lane, 'ready')
-      assert.deepEqual(p.actions, [])
+      assert.equal(p.lane, 'needs-you')
+      assert.deepEqual(p.actions.map((a) => a.kind), ['notify'], 'no merge, and you hear of it')
+      const told = plan(input({ pr: child, config: cfg, unlistedBase: true }, { ...passed(), notified: { [`unlisted-base:${child.headSha}`]: 1 } }))
+      assert.deepEqual(told.actions, [], 'once')
     }
   })
 

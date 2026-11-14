@@ -430,8 +430,10 @@ looks like any other.
   cut to 6000 characters as they are read). A storage failure only leaves an issue waiting, and
   never stops the tick.
 - With no supervisor running, Needs you says the issues wait; in dry run the board says it would
-  hand them over. A label with a comma, over 100 characters, or named `any`, `none` or `no label`
-  (filters on GitLab) is refused.
+  hand them over. While the disk is below `limits.minFreeDiskGB` or the project is at a worker
+  limit, none is handed over (the supervisor could start no worker for it: it would only be
+  refused or stopped), and the board says why. A label with a comma, over 100 characters, or
+  named `any`, `none` or `no label` (filters on GitLab) is refused.
 
 ### Advisor
 
@@ -730,9 +732,13 @@ taught this: the only place to answer it was a terminal in a worktree you never 
 notifications also goes to Slack, Discord, ntfy or any JSON webhook, by kind: needs you (an
 escalation to the person, a reviewer or advisor stuck on a prompt, a PR that needs a human merge
 or is blocked), ready to merge, and (off by default) merged, which is webhook-only since Orca
-shows no notification for a merge. Board-only notices (a nearly full disk, a supervisor over its
-limits) send nothing. The engine's alerts go only while it acts (autopilot on); in dry run only a
-reviewer stuck on a prompt in a review the person started is sent, as Orca notifies them of it.
+shows no notification for a merge. A board item no escalation or notice carries (a nearly full
+disk, a supervisor over its limits, labeled issues waiting for a supervisor, a handoff that may
+not have arrived) is marked `alert`, and the tick tells the person of it once while it stands,
+in Orca and by webhook (`attention:alerted` records each, and an item may alert again only after
+it was gone for 15 minutes, so one failed read does not ring twice). The engine's alerts go only
+while it acts (autopilot on); in dry run only a reviewer stuck on a prompt in a review the person
+started is sent, as Orca notifies them of it.
 The settings are per machine: the URL in Orca's secrets, the rest in plugin storage, none of it in
 a project's config.
 

@@ -266,7 +266,7 @@ describe('handing labeled issues to the supervisor', () => {
     assert.deepEqual(s.told, [])
     assert.deepEqual(res.view.refused, [{ number: 4, why: 'it was edited after maya added matriarch' }, { number: 7, why: 'matriarch was added by lena, who has read access, not triage' }])
     assert.deepEqual(res.view.waiting, [])
-    assert.equal(res.attention, null)
+    assert.deepEqual(res.attention, [])
   })
 
   test('changing the label reads the new one at once', async () => {
@@ -288,10 +288,11 @@ describe('handing labeled issues to the supervisor', () => {
     const none = setup({ supervisor: null })
     const res = await followIssues(none.input(T0))
     assert.deepEqual(none.told, [])
-    assert.match(res.attention?.message ?? '', /acme\/app: 2 issues labeled matriarch wait for a supervisor \(#4, #7\)/)
+    assert.match(res.attention[0]?.message ?? '', /acme\/app: 2 issues labeled matriarch wait for a supervisor \(#4, #7\)/)
+    assert.equal(res.attention[0]?.alert, true, 'nothing else tells the person: Matriarch notifies them')
     assert.deepEqual(res.view.waiting, [4, 7])
     const opening = setup({ supervisor: null, pending: true })
-    assert.equal((await followIssues(opening.input(T0))).attention, null)
+    assert.deepEqual((await followIssues(opening.input(T0))).attention, [])
     await followIssues(none.input(T0 + 61_000, { supervisor: 'run:r2' }))
     assert.equal(none.told.length, 2, 'read again within a minute, not five, to hand them over')
   })
@@ -300,8 +301,17 @@ describe('handing labeled issues to the supervisor', () => {
     const s = setup({ acting: false })
     const res = await followIssues(s.input(T0))
     assert.deepEqual(s.told, [])
-    assert.deepEqual(res.view.next, ['hand #4 to the supervisor', 'hand #7 to the supervisor'])
-    assert.equal(res.attention, null)
+    assert.deepEqual(res.view.next, [4, 7])
+    assert.deepEqual(res.attention, [])
+  })
+
+  test('none is handed over while the supervisor could start no worker for it, and the board says why', async () => {
+    const s = setup({ held: '4 of 4 workers are running, the most at once' })
+    const res = await followIssues(s.input(T0))
+    assert.deepEqual(s.told, [], 'it would only be refused or stopped')
+    assert.deepEqual([res.view.next, res.view.held], [[4, 7], '4 of 4 workers are running, the most at once'])
+    await followIssues(s.input(T0 + ISSUES_EVERY_MS, { held: null }))
+    assert.equal(s.told.length, 2, 'they go once there is room')
   })
 
   test('a handoff that fails is tried again; the pause switch stops at once', async () => {
@@ -331,7 +341,6 @@ describe('handing labeled issues to the supervisor', () => {
     const many: ForgeReader = { listOpen: async () => ({ viewer: '', prs: [], rate: null }), detail: async () => ({ pr: null, rate: null }), labeledIssues: async () => ({ issues: [issue(1)], truncated: true }), labelCheck: async () => ({ ok: true, by: 'maya', at: 'x' }) }
     const res = await followIssues(s.input(T0, { forge: many }))
     assert.match(res.warnings.join(' '), /More open issues carry matriarch than Matriarch reads/)
-    assert.equal(res.view.truncated, true)
   })
 })
 
@@ -422,7 +431,10 @@ describe('each go-ahead goes over once', () => {
     assert.deepEqual(later.view.unsure, [4])
     assert.ok(!s.told.some((t) => t.subject.includes('#4')), '#4 is not sent again')
     assert.ok(s.told.some((t) => t.subject.includes('#7')), 'the others still go')
-    assert.match(later.warnings.join(' '), /#4 may not have reached the supervisor.*remove matriarch from the issue and add it back/)
+    // Under Needs you, which notifies the person: it waits on them to check the chat.
+    const unsure = later.attention.find((a) => a.key.endsWith(':unsure'))
+    assert.match(unsure?.message ?? '', /#4 may not have reached the supervisor.*remove matriarch from the issue and add it back/)
+    assert.equal(unsure?.alert, true)
     assert.ok(writes > 0)
   })
 })

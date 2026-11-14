@@ -535,7 +535,8 @@ function mergeGate(input: PlanInput): Plan {
     }
   }
   if (input.unlistedBase) {
-    return { lane: 'ready', reason: `its base ${pr.baseRef} may be another open PR's branch, and ${forgeTerms(pr.forge).name} listed too many open PRs to tell: merge it yourself`, actions: [] }
+    const why = `its base ${pr.baseRef} may be another open PR's branch, and ${forgeTerms(pr.forge).name} listed too many open PRs to tell: merge it yourself`
+    return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `unlisted-base:${sha}`, `${pr.repo} #${pr.number} needs a human merge`, why) }
   }
   if (merge.requireHuman.length > 0) {
     const hits = matchingGlobs(merge.requireHuman, pr.files, { ignoreCase: true })

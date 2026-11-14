@@ -87,6 +87,11 @@ export interface Attention {
   terminal?: string
   /** Workspace to show when there is no terminal. */
   workspaceId?: string
+  /**
+   * Nothing else tells the person about this one (no escalation or notice carries it): Matriarch
+   * notifies them once while it stands, under autopilot, in Orca and by webhook.
+   */
+  alert?: boolean
 }
 
 /** A review finding as the board shows it (merged across reviewers, most severe first). */
@@ -208,10 +213,10 @@ export interface IssuesView {
   waiting: number[]
   /** Not handed over until someone with access adds the label again, and why. */
   refused?: { number: number; why: string }[]
-  /** In dry run, what Matriarch would do with them. */
-  next: string[]
-  /** More issues carry the label than Matriarch reads. */
-  truncated?: boolean
+  /** The issues Matriarch would hand to the running supervisor now, were it acting (dry run) or not held. */
+  next: number[]
+  /** Why ready issues wait although Matriarch acts: the disk below the floor, or the worker limit reached. */
+  held?: string
 }
 
 /** An agent the settings form offers for a role. */

@@ -122,9 +122,10 @@ Matriarch manages only PRs you opened from a branch that belongs to an Orca work
   running against the project's limit, the labeled issues it took or that wait, and its advisor:
   the question it is answering, or the last one it answered.
 - **Needs you:** a reviewer or advisor waiting on a prompt, an escalation that reached you, a PR
-  that needs your merge, a nearly full disk, a supervisor over its worker limits. The status bar
-  shows the same at a glance, and [away alerts](#away-alerts) can carry the first three to you
-  away from Orca.
+  that needs your merge, a nearly full disk, a supervisor over its worker limits, labeled issues
+  waiting for a supervisor, an issue handoff that may not have arrived. The status bar shows the
+  same at a glance. Each also reaches you as an Orca notification, and by
+  [away alert](#away-alerts) when you set one: once while it stands, under autopilot.
 - **Full tab:** tab bar **+** → **Matriarch board**.
 
 ## Options
@@ -174,7 +175,9 @@ running supervisor as a new objective, and the PR that does it says `Closes #<n>
 - **Timing:** the labeled issues are read every 5 minutes, so a newly labeled issue goes over
   within about that; at most 5 are handed over per poll, and Matriarch reads up to 500, oldest
   first (the board says when there are more). With no supervisor running, **Needs you** says the
-  issue waits for one; in dry run the board says it would hand it over. If Matriarch is cut off
+  issue waits for one; in dry run the board says it would hand it over. While the disk is below
+  the floor or the project is at a worker limit, none goes (the supervisor could start no worker
+  for it) and the board says why. If Matriarch is cut off
   while handing an issue over, the board says it may not have arrived, and it is not sent again
   by itself.
 - **Comment on the issue** (off by default) posts one short comment, as you, right after
@@ -246,11 +249,13 @@ and **Send a test**. It applies to every project, on this machine; **Remove** tu
   that wants a password can take it in the URL (`https://user:pass@ntfy.example.com/topic`): it is
   sent as a Basic `Authorization` header and never shown. `http://` is accepted for a server on
   your network.
-- **What:** **Needs you** (an escalation that reached you, a reviewer or advisor stuck on a
-  prompt, a PR that needs your merge or is blocked) and **Ready to merge** are on by default, and
-  go alongside Orca's own notification. **Merged** (a PR Matriarch follows merged, by it or by
-  anyone) is off by default and goes to the webhook only: Orca has no notification for it. A
-  nearly full disk and a supervisor over its limits stay on the board.
+- **What:** **Needs you** (everything under **Needs you** on the board: an escalation that
+  reached you, a reviewer or advisor stuck on a prompt, a PR that needs your merge or is blocked,
+  a nearly full disk, a supervisor over its limits, labeled issues waiting for a supervisor, a
+  handoff that may not have arrived) and **Ready to merge** are on by default, and go alongside
+  Orca's own notification. A board item goes once while it stands, and again only after it was
+  gone for 15 minutes. **Merged** (a PR Matriarch follows merged, by it or by anyone) is off by
+  default and goes to the webhook only: Orca has no notification for it.
 - **When:** while autopilot is on, like everything else Matriarch sends. In dry run only a
   reviewer stuck on a prompt (in a review you started) is sent, as Orca notifies you of it too.
 - **How:** each alert is posted once, with a 10-second limit, and never retried or redirected.

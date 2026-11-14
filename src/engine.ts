@@ -107,6 +107,8 @@ export interface EngineDeps {
   commentIssue?: (ref: RepoRef, number: number, body: string) => Promise<Outcome>
   /** Posts an away alert when the person set a webhook; returns at once and never throws. */
   alert?: (alert: Alert) => void
+  /** Tells the person about something that needs them, in Orca's notifications and by webhook. */
+  notifyPerson?: (alert: Alert) => Promise<void>
 }
 
 const gb = (bytes: number): string => `${(bytes / 1024 ** 3).toFixed(1)} GB`
@@ -408,6 +410,40 @@ function advisorAttention(repo: string, advisor: AdvisorView): Board['attention'
   }
 }
 
+/** How long an alerted Needs-you item must be gone from the board before it can alert again. */
+export const ATTENTION_CLEAR_MS = 15 * 60_000
+
+/**
+ * Tells the person, in Orca and by webhook, about each board item marked `alert` (one that no
+ * escalation or notice carries: a nearly full disk, workers over a limit, issues waiting for a
+ * supervisor, a handoff that may not have arrived), once while it stands. Only while Matriarch
+ * acts, like every alert; one first seen in dry run alerts once autopilot is on. It may alert
+ * again once it has been gone for ATTENTION_CLEAR_MS, so a read that fails for a tick does not
+ * ring twice. Storage is written only when an item comes or goes.
+ */
+async function alertAttention(deps: EngineDeps, board: Board, now: number, acting: boolean): Promise<void> {
+  if (!deps.notifyPerson) return
+  const key = 'attention:alerted'
+  const before = ((await deps.store.get(key)) as Record<string, { at: number; gone?: number }> | null) ?? {}
+  const after: Record<string, { at: number; gone?: number }> = {}
+  const standing = new Map(board.attention.filter((a) => a.alert).map((a) => [a.key, a]))
+  for (const [k, rec] of Object.entries(before)) {
+    if (standing.has(k)) after[k] = { at: rec.at }
+    else if (rec.gone === undefined) after[k] = { at: rec.at, gone: now }
+    else if (now - rec.gone < ATTENTION_CLEAR_MS) after[k] = rec
+  }
+  for (const [k, a] of standing) {
+    if (after[k] || !acting) continue
+    try {
+      await deps.notifyPerson({ kind: 'needs-you', title: `Matriarch: ${a.repo ?? 'a project'} needs you`, body: a.message, ...(a.repo ? { repo: a.repo } : {}) })
+      after[k] = { at: now }
+    } catch (error) {
+      deps.log(`could not tell you about ${k}: ${(error as Error).message}`)
+    }
+  }
+  if (JSON.stringify(after) !== JSON.stringify(before)) await deps.store.set(key, after as unknown as JsonValue)
+}
+
 /** A failed read of a PR's file moves is tried again after this; an answer is kept for the commit. */
 export const MOVES_RETRY_MS = 10 * 60_000
 
@@ -588,10 +624,12 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     // say so once per board, before it fills. The same floor stops the supervisor starting workers.
     const free = deps.freeSpace ? await deps.freeSpace(info.root).catch(() => null) : null
     const limits = config.limits
-    if (free !== null && limits.minFreeDiskGB > 0 && free < limits.minFreeDiskGB * 1024 ** 3 && !board.attention.some((a) => a.key === 'disk')) {
+    const lowDisk = free !== null && limits.minFreeDiskGB > 0 && free < limits.minFreeDiskGB * 1024 ** 3
+    if (lowDisk && !board.attention.some((a) => a.key === 'disk')) {
       board.attention.push({
         key: 'disk',
         repo: repoKey,
+        alert: true,
         message: `Only ${gb(free)} free on the disk with ${repoKey}. Agents' builds, Orca and Matriarch stop saving once it is full: free some space to keep the pod moving.`
       })
     }
@@ -702,14 +740,21 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       board.attention.push({
         key: `limits:${repoKey}`,
         repo: repoKey,
+        alert: true,
         message: acting
           ? `${repoKey}: ${overNow}. Matriarch stops a worker that starts over a limit, but these were running before it looked or before the limit was lowered: ask the supervisor to let some finish, or raise the limit in Settings.`
           : `${repoKey}: ${overNow}. In dry run Matriarch only tells you; with autopilot on it stops a worker that starts over a limit. Ask the supervisor to let some finish, or raise the limit in Settings.`,
         terminal: view.supervisor.terminal ?? undefined
       })
     }
-    // Labeled issues: the supervisor's next objectives (issues.ts).
+    // Labeled issues: the supervisor's next objectives (issues.ts). None goes while the supervisor
+    // could start no worker for it: it would only be refused or stopped.
     if (config.issues.enabled) {
+      const held =
+        lowDisk ? `only ${gb(free!)} is free on the disk, under the ${limits.minFreeDiskGB} GB floor`
+        : limits.maxWorkers > 0 && live >= limits.maxWorkers ? `${live} of ${limits.maxWorkers} workers are running, the most at once`
+        : limits.maxWorkerStartsPerDay > 0 && startsToday >= limits.maxWorkerStartsPerDay ? `${startsToday} workers started today, the most a day`
+        : null
       const issues = await followIssues({
         repo: repoKey,
         ref: info.ref,
@@ -719,6 +764,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         supervisor,
         pending: view.supervisor.pending,
         acting,
+        held,
         now,
         store: deps.store,
         tellSupervisor: deps.tellSupervisor,
@@ -728,7 +774,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       view.issues = issues.view
       view.warnings.push(...issues.warnings)
       view.errors.push(...issues.errors)
-      if (issues.attention) board.attention.push(issues.attention)
+      board.attention.push(...issues.attention)
     }
 
     const byBranch = new Map<string, Workspace>()
@@ -983,6 +1029,10 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         if (res.removed) {
           deps.log(`${repoKey}: removed ${ws.name}, a finished worktree that never became a PR (${ws.path})`)
           gone.add(ws.path)
+          // In its log too, as for a merged PR's worktree (kept a week, like any worktree's history).
+          const key = historyKey(ws.id)
+          const entry = { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: its worker finished, it never became a PR, and nothing in it was uncommitted or unpushed (its branch is kept)` }
+          await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
         } else still[ws.path] = since
       }
       if (JSON.stringify(still) !== JSON.stringify(seen)) await deps.store.set(finishedKey, still as unknown as JsonValue)
@@ -1316,6 +1366,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       if (needs) board.attention.push(needs)
     }
   }
+  // Needs-you items nothing else tells the person about: once while each stands.
+  await alertAttention(deps, board, now, notActing(opts.autopilot, deps) === null).catch((error: Error) => deps.log(`needs-you alerts: ${error.message}`))
   if (deps.crew) await deps.crew.sweep().catch((error: Error) => deps.log(`review sweep: ${error.message}`))
   // Hourly at most: drop records of PRs closed a week ago and worktrees gone a week.
   if (deps.store.keys && deps.store.delete) {
