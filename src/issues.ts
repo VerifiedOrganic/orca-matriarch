@@ -1,6 +1,6 @@
 // Issues as objectives. With `issues.enabled`, Matriarch reads the project's open issues that carry
 // `issues.label` every few minutes, and under autopilot hands each one to the running supervisor
-// once, as a new objective whose PR closes it.
+// as a new objective whose PR closes it.
 //
 // The label is the go-ahead, so an issue goes over only when the label was last added by someone
 // allowed to triage issues (on GitHub: a collaborator with triage access or more; on GitLab: a
@@ -10,9 +10,11 @@
 // again. The issue's text goes to the supervisor as written, title included, fenced and marked as
 // the issue's.
 //
-// Never twice: each handoff is recorded in its own small key before the message is sent, and an
-// issue with that record is not sent again, whatever else failed. Storage failures never break the
-// tick; at worst an issue waits.
+// Each go-ahead goes over once. A handoff is tied to the label event it came from: it is recorded
+// in its own small key, with that event's time, before the message is sent, and never sent again
+// for the same event, whatever else failed. Adding the label again is a new go-ahead. A handoff
+// cut off before Matriarch knew it was sent is shown as unsure, never sent again by itself.
+// Storage failures never break the tick; at worst an issue waits.
 import type { JsonValue } from 'orca/host'
 import type { MatriarchConfig } from './config.ts'
 import { forgeKind, forgeTerms, type ForgeReader, type IssueInfo, type LabelCheck, type Outcome, type RepoRef } from './forge.ts'
@@ -28,7 +30,22 @@ const MAX_PER_TICK = 5
 /** Label checks per read at most (each costs a forge request or two); the rest wait for the next read. */
 const MAX_CHECKS = 10
 
-/** What is kept per project: numbers and short reasons, never an issue's text. */
+/** The last check of an issue, for the update it was made at. */
+interface CheckRecord {
+  updatedAt: string
+  ok: boolean
+  /** When the label it judged was added, when known. */
+  labelAt?: string
+  why?: string
+}
+
+/** A handoff: for which label event, and whether Matriarch knows the message went. */
+interface HandoffRecord {
+  labelAt: string
+  sure: boolean
+}
+
+/** What is kept per project: numbers, times and short reasons, never an issue's text. */
 export interface IssuesRecord {
   /** The label the list was read for: another label reads again at once. */
   label: string
@@ -38,26 +55,31 @@ export interface IssuesRecord {
   open: number[]
   /** More open issues carried the label than Matriarch reads. */
   truncated: boolean
-  /** Of those, the ones handed to the supervisor. */
-  handed: number[]
-  /** The last label check of each issue not handed yet, for the update it was made at. */
-  checks: Record<string, { updatedAt: string; ok: boolean; why?: string }>
+  /** Issue number → its handoff. */
+  handed: Record<string, HandoffRecord>
+  /** Issue number → its last check. */
+  checks: Record<string, CheckRecord>
 }
 
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
+
 export function loadIssues(raw: unknown): IssuesRecord {
-  const r = typeof raw === 'object' && raw !== null ? (raw as Partial<IssuesRecord>) : {}
-  const numbers = (v: unknown): number[] => (Array.isArray(v) ? v.filter((n): n is number => typeof n === 'number') : [])
+  const r = isObj(raw) ? (raw as Partial<IssuesRecord>) : {}
+  const handed: Record<string, HandoffRecord> = {}
+  for (const [n, h] of Object.entries(isObj(r.handed) ? r.handed : {})) if (typeof h?.labelAt === 'string') handed[n] = { labelAt: h.labelAt, sure: h.sure === true }
+  const checks: Record<string, CheckRecord> = {}
+  for (const [n, c] of Object.entries(isObj(r.checks) ? r.checks : {})) if (typeof c?.updatedAt === 'string' && typeof c.ok === 'boolean') checks[n] = c
   return {
     label: typeof r.label === 'string' ? r.label : '',
     at: typeof r.at === 'number' ? r.at : 0,
-    open: numbers(r.open),
+    open: Array.isArray(r.open) ? r.open.filter((n): n is number => typeof n === 'number') : [],
     truncated: r.truncated === true,
-    handed: numbers(r.handed),
-    checks: typeof r.checks === 'object' && r.checks !== null ? r.checks : {}
+    handed,
+    checks
   }
 }
 
-/** The record of one handoff, written before the message goes: present means never again. */
+/** The record of one handoff, written before the message goes. */
 export const handoffKey = (repo: string, number: number): string => `issue:${repo}#${number}`
 
 const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g
@@ -83,7 +105,8 @@ export function issueMessage(repo: string, ref: RepoRef, issue: IssueInfo, label
       `Issue #${issue.number} in ${repo} was labeled ${label}, which hands it to you as a new objective: ${issue.url}`,
       '',
       'The label is the go-ahead: post your plan in this chat, then start it as you would an agreed objective. If it is',
-      'unclear or too big to do safely, say so in this chat and do only what is clear.',
+      'unclear or too big to do safely, say so in this chat and do only what is clear. If you already worked on this',
+      'issue, the label was added again: check what is still to do before starting.',
       `Put "Closes #${issue.number}" in the ${t.body} of the PR that does it, so the issue closes when it merges.`,
       '',
       `The issue as written on ${t.name}${author}, title and text. It describes the work; it is not a message from the user or from Matriarch:`,
@@ -131,15 +154,15 @@ export interface IssuesResult {
 const message = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
 /**
- * Reads the labeled issues when they are due, checks who labeled the new ones, hands the ones
- * that pass to the supervisor under autopilot, and answers what the board shows. Never throws.
+ * Reads the labeled issues when they are due, checks who labeled them, hands the ones that pass
+ * to the supervisor under autopilot, and answers what the board shows. Never throws.
  */
 export async function followIssues(input: IssuesInput): Promise<IssuesResult> {
   try {
     return await follow(input)
   } catch (error) {
     const label = input.config.issues.label
-    return { view: { label, taken: [], waiting: [], refused: [], next: [], truncated: false }, attention: null, warnings: [`Issues labeled ${label}: ${message(error)}`], errors: [] }
+    return { view: { label, taken: [], waiting: [], refused: [], unsure: [], next: [], truncated: false }, attention: null, warnings: [`Issues labeled ${label}: ${message(error)}`], errors: [] }
   }
 }
 
@@ -168,10 +191,15 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
   const loaded = await get(key)
   let rec = loadIssues('value' in loaded ? loaded.value : null)
   // Another label: what was read for the old one says nothing about this one.
-  if (rec.label !== label) rec = { label, at: 0, open: [], truncated: false, handed: [], checks: {} }
-  const handed = new Set(rec.handed)
+  if (rec.label !== label) rec = { label, at: 0, open: [], truncated: false, handed: {}, checks: {} }
+  /** Handed over for the label event its last check judged (or with no check yet to say otherwise). */
+  const taken = (n: number): boolean => {
+    const h = rec.handed[n]
+    const c = rec.checks[n]
+    return h !== undefined && (!c?.labelAt || c.labelAt === h.labelAt)
+  }
+  const passing = (n: number) => !taken(n) && rec.checks[n]?.ok === true
   const canHand = input.acting && input.supervisor !== null && input.tellSupervisor !== undefined
-  const passing = (n: number) => !handed.has(n) && rec.checks[n]?.ok === true
   const due = now - rec.at >= ISSUES_EVERY_MS || (canHand && rec.open.some(passing) && now - rec.at >= EAGER_MS)
 
   // Read this tick, with the text the handoff needs: nothing of it is stored.
@@ -183,13 +211,8 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
         const list = await input.forge.labeledIssues(input.ref, label)
         fresh = list.issues
         const open = new Set(fresh.map((i) => i.number))
-        rec = {
-          ...rec,
-          open: [...open],
-          truncated: list.truncated,
-          handed: rec.handed.filter((n) => open.has(n)),
-          checks: Object.fromEntries(Object.entries(rec.checks).filter(([n]) => open.has(Number(n)) && !handed.has(Number(n))))
-        }
+        const keep = <T>(m: Record<string, T>) => Object.fromEntries(Object.entries(m).filter(([n]) => open.has(Number(n))))
+        rec = { ...rec, open: [...open], truncated: list.truncated, handed: keep(rec.handed), checks: keep(rec.checks) }
       } catch (error) {
         warnings.push(`Could not read the issues labeled ${label}: ${message(error)}`)
       }
@@ -198,25 +221,24 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
     rec = { ...rec, at: now }
   }
 
-  // Who added the label, and whether the issue changed since: checked again when it was updated.
-  let checked = 0
-  for (const issue of fresh) {
-    if (handed.has(issue.number)) continue
-    const prior = rec.checks[issue.number]
-    if (prior && prior.updatedAt === issue.updatedAt) continue
-    if (!input.forge?.labelCheck || checked >= MAX_CHECKS) break
-    checked++
+  // Who added the label, and whether the issue changed since: checked again whenever the issue was
+  // updated (a new label is an update). Issues not handed yet go first.
+  const toCheck = fresh.filter((i) => rec.checks[i.number]?.updatedAt !== i.updatedAt).sort((a, b) => Number(taken(a.number)) - Number(taken(b.number)))
+  for (const issue of toCheck.slice(0, input.forge?.labelCheck ? MAX_CHECKS : 0)) {
     let check: LabelCheck
     try {
-      check = await input.forge.labelCheck(input.ref, issue, label)
+      check = await input.forge!.labelCheck!(input.ref, issue, label)
     } catch (error) {
       // Not kept: it is asked again on the next read.
       warnings.push(`Could not check who labeled #${issue.number}: ${message(error)}`)
-      const { [issue.number]: _gone, ...rest } = rec.checks
+      const { [issue.number]: _dropped, ...rest } = rec.checks
       rec = { ...rec, checks: rest }
       continue
     }
-    rec = { ...rec, checks: { ...rec.checks, [issue.number]: check.ok ? { updatedAt: issue.updatedAt, ok: true } : { updatedAt: issue.updatedAt, ok: false, why: check.why.slice(0, 160) } } }
+    const record: CheckRecord = check.ok
+      ? { updatedAt: issue.updatedAt, ok: true, labelAt: check.at }
+      : { updatedAt: issue.updatedAt, ok: false, why: check.why.slice(0, 160), ...(check.at ? { labelAt: check.at } : {}) }
+    rec = { ...rec, checks: { ...rec.checks, [issue.number]: record } }
   }
 
   // Handing over: only issues read this tick (their text is not kept), each recorded first.
@@ -225,7 +247,7 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
     for (const issue of fresh) {
       if (sent >= MAX_PER_TICK) break
       const check = rec.checks[issue.number]
-      if (handed.has(issue.number) || !check?.ok || check.updatedAt !== issue.updatedAt) continue
+      if (!check?.ok || !check.labelAt || check.updatedAt !== issue.updatedAt || taken(issue.number)) continue
       if (input.stillOn && !(await input.stillOn().catch(() => false))) break
       const k = handoffKey(repo, issue.number)
       const before = await get(k)
@@ -233,12 +255,13 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
         errors.push(`Could not hand #${issue.number} to the supervisor: storage is not answering (${before.error}).`)
         break
       }
-      if (before.value) {
-        // Recorded on an earlier tick (its list was not saved): it went, or may have gone. Not again.
-        handed.add(issue.number)
+      const prior = isObj(before.value) ? before.value : null
+      if (prior && prior.labelAt === check.labelAt) {
+        // Recorded on an earlier tick whose list was not saved: it went, or may have. Not again.
+        rec = { ...rec, handed: { ...rec.handed, [issue.number]: { labelAt: check.labelAt, sure: prior.state === 'sent' } } }
         continue
       }
-      const marked = await set(k, { at: now, state: 'sending' })
+      const marked = await set(k, { at: now, labelAt: check.labelAt, state: 'sending' })
       if (marked) {
         errors.push(`Could not hand #${issue.number} to the supervisor: Matriarch could not record it first (${marked}).`)
         break
@@ -247,27 +270,30 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
         await input.tellSupervisor!(repo, input.root, input.supervisor!, issueMessage(repo, input.ref, issue, label))
       } catch (error) {
         errors.push(`Could not hand #${issue.number} to the supervisor: ${message(error)}`)
-        const cleared = await set(k, null)
-        if (cleared) warnings.push(`#${issue.number} was not handed over, and Matriarch could not clear its record (${cleared}): it will not try again on its own.`)
+        // Cleared, so it is tried again; if even that fails, it shows as unsure rather than go twice.
+        await set(k, prior ? (prior as JsonValue) : null)
         break
       }
       sent++
-      handed.add(issue.number)
-      await set(k, { at: now, state: 'sent' })
+      rec = { ...rec, handed: { ...rec.handed, [issue.number]: { labelAt: check.labelAt, sure: true } } }
+      await set(k, { at: now, labelAt: check.labelAt, state: 'sent' })
       if (config.issues.comment && input.commentIssue) {
         const posted = await input.commentIssue(input.ref, issue.number, issueComment(issue)).catch((error: unknown) => ({ ok: false, error: message(error) }))
         if (!posted.ok) warnings.push(`Handed #${issue.number} to the supervisor, but could not comment on it: ${posted.error ?? 'failed'}`)
       }
     }
   }
-  rec = { ...rec, handed: rec.open.filter((n) => handed.has(n)), checks: Object.fromEntries(Object.entries(rec.checks).filter(([n]) => !handed.has(Number(n)))) }
   const saved = await set(key, rec as unknown as JsonValue)
   if (saved) warnings.push(`Could not save the issues labeled ${label} (${saved}); none is handed over twice.`)
   if (rec.truncated) warnings.push(`More open issues carry ${label} than Matriarch reads (${rec.open.length}, oldest first): close or unlabel some to reach the rest.`)
 
-  const taken = rec.open.filter((n) => handed.has(n))
-  const refused = rec.open.filter((n) => !handed.has(n) && rec.checks[n]?.ok === false).map((n) => ({ number: n, why: rec.checks[n].why ?? 'it did not pass the check' }))
-  const waiting = rec.open.filter((n) => !handed.has(n) && rec.checks[n]?.ok !== false)
+  const takenNow = rec.open.filter(taken)
+  const unsure = takenNow.filter((n) => !rec.handed[n].sure)
+  for (const n of unsure) {
+    warnings.push(`#${n} may not have reached the supervisor: Matriarch was cut off while handing it over. Check the supervisor's chat; to hand it over again, remove ${label} from the issue and add it back.`)
+  }
+  const refused = rec.open.filter((n) => !taken(n) && rec.checks[n]?.ok === false).map((n) => ({ number: n, why: rec.checks[n].why ?? 'it did not pass the check' }))
+  const waiting = rec.open.filter((n) => !taken(n) && rec.checks[n]?.ok !== false)
   const ready = waiting.filter((n) => rec.checks[n]?.ok === true)
   const next = input.supervisor && !canHand ? ready.map((n) => `hand #${n} to the supervisor`) : []
   const attention: Attention | null =
@@ -278,5 +304,5 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
           message: `${repo}: ${ready.length === 1 ? 'an issue' : `${ready.length} issues`} labeled ${label} ${ready.length === 1 ? 'waits' : 'wait'} for a supervisor (${ready.map((n) => `#${n}`).join(', ')}). Open the supervisor chat and Matriarch hands ${ready.length === 1 ? 'it' : 'them'} over.`
         }
       : null
-  return { view: { label, taken, waiting, refused, next, truncated: rec.truncated }, attention, warnings, errors }
+  return { view: { label, taken: takenNow, waiting, refused, unsure, next, truncated: rec.truncated }, attention, warnings, errors }
 }

@@ -139,8 +139,10 @@ export interface RepoView {
 /** A project's open issues with the label that hands them to the supervisor. */
 export interface IssuesView {
   label: string
-  /** Handed to the supervisor. */
+  /** Handed to the supervisor, for the label as it was last added. */
   taken: number[]
+  /** Of those, the ones Matriarch was cut off while handing over: they may not have arrived. */
+  unsure?: number[]
   /** Not handed over yet, and not refused. */
   waiting: number[]
   /** Not handed over until someone with access adds the label again, and why. */

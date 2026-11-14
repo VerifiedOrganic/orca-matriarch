@@ -539,7 +539,8 @@ export function issuesLine(r: RepoView): string | null {
     i.taken.length ? `${i.taken.length} taken (${list(i.taken)})` : null,
     i.waiting.length ? `${i.waiting.length} waiting (${list(i.waiting)})` : null,
     i.next.length ? `would ${i.next.length === 1 ? i.next[0] : `hand ${i.next.map((n) => n.replace(/^hand | to the supervisor$/g, '')).join(', ')} to the supervisor`}` : null,
-    refused.length ? `${refused.length} need the label added again by someone with access (${refused.map((x) => `#${x.number}: ${x.why}`).join('; ')})` : null
+    refused.length ? `${refused.length} need the label added again by someone with access (${refused.map((x) => `#${x.number}: ${x.why}`).join('; ')})` : null,
+    i.unsure?.length ? `${i.unsure.length} may not have reached the supervisor (${list(i.unsure)}): remove the label and add it back to hand ${i.unsure.length === 1 ? 'it' : 'them'} over again` : null
   ].filter(Boolean).join(' · ')
 }
 

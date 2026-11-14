@@ -85,8 +85,9 @@ is not signed in to yet, pick it under **Forge** in Settings.
 
 Turn on **Hand labeled issues to the supervisor** under **Settings → Issues**. Then label an open
 issue `matriarch` (or the label you pick there). With autopilot on, Matriarch hands it to the
-running supervisor once, as a new objective: the label is the go-ahead, and the PR that does it
-says `Closes #<n>`. Matriarch reads the labeled issues every 5 minutes (500 at most, oldest
+running supervisor as a new objective: the label is the go-ahead, each time it is added goes over
+once, and the PR that does it says `Closes #<n>`. To hand an issue over again, remove the label and
+add it back. Matriarch reads the labeled issues every 5 minutes (500 at most, oldest
 first; the board says when there are more). With no supervisor running, **Needs you** says the
 issue waits for one; in dry run the board says it would hand it over. **Comment on the issue**
 posts one short comment when the supervisor takes it up.
@@ -100,7 +101,9 @@ An issue goes over only when both hold:
   edit after the label was added; on GitLab, no edit of the title or description after it.
 
 So a label an issue template adds counts only if the issue's author has that access, and an
-issue its author edits after you labeled it waits. Such an issue stays on the board with the
+issue its author edits after you labeled it waits (an edit after the handoff changes nothing).
+If Matriarch is cut off while handing an issue over, the board says it may not have arrived, and
+it is not sent again by itself. Such an issue stays on the board with the
 reason, until someone with access adds the label again (remove it, then add it). The issue's
 title and text go to the supervisor as written, inside a fence and marked as the issue's, not
 yours, so label only issues you would give an agent to do. Labels named `any` or `none` are

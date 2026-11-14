@@ -549,15 +549,15 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
       if (!added || !at) return { ok: false, why: `Matriarch cannot tell who added ${label}` }
       const actor = obj(added.actor)
       const by = str(actor.login)
-      if (!by) return { ok: false, why: `${label} was added by an account GitHub no longer names` }
-      if (actor.__typename !== 'User') return { ok: false, why: `${label} was added by ${by}, an app or bot, not a person with triage access` }
+      if (!by) return { ok: false, why: `${label} was added by an account GitHub no longer names`, at }
+      if (actor.__typename !== 'User') return { ok: false, why: `${label} was added by ${by}, an app or bot, not a person with triage access`, at }
       const later = (t: string | null) => t !== null && Date.parse(t) > Date.parse(at)
-      if (items.some((n) => n.__typename === 'RenamedTitleEvent' && later(str(n.createdAt)))) return { ok: false, why: `its title changed after ${by} added ${label}` }
-      if (later(str(obj(node).lastEditedAt))) return { ok: false, why: `it was edited after ${by} added ${label}` }
+      if (items.some((n) => n.__typename === 'RenamedTitleEvent' && later(str(n.createdAt)))) return { ok: false, why: `its title changed after ${by} added ${label}`, at }
+      if (later(str(obj(node).lastEditedAt))) return { ok: false, why: `it was edited after ${by} added ${label}`, at }
       const res = await exec(bin, ['api', `repos/${repoArg(repo)}/collaborators/${encodeURIComponent(by)}/permission`], { timeoutMs: 30_000 })
       if (res.code !== 0) {
         const text = `${res.stderr}${res.stdout}`.trim()
-        if (/\b404\b|Not Found/i.test(text)) return { ok: false, why: `${label} was added by ${by}, who is not a collaborator here` }
+        if (/\b404\b|Not Found/i.test(text)) return { ok: false, why: `${label} was added by ${by}, who is not a collaborator here`, at }
         throw new GitHubError(`gh api permission: ${text.slice(0, 300)}`, /rate limit|secondary rate|abuse/i.test(text))
       }
       let p: Obj = {}
@@ -568,7 +568,7 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
       }
       const role = str(p.role_name)
       if ((role && TRIAGE_ROLES.has(role)) || ['admin', 'write'].includes(str(p.permission) ?? '')) return { ok: true, by, at }
-      return { ok: false, why: `${label} was added by ${by}, who has ${role ?? str(p.permission) ?? 'no'} access, not triage` }
+      return { ok: false, why: `${label} was added by ${by}, who has ${role ?? str(p.permission) ?? 'no'} access, not triage`, at }
     },
     commentIssue: (repo, number, body) => run(['api', '-X', 'POST', `repos/${repoArg(repo)}/issues/${number}/comments`, '-f', `body=${body}`]),
     async publishReview(repo, pr, sha, review) {

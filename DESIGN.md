@@ -276,10 +276,14 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   passing issue goes to the running supervisor once, as plain mail titled "New objective:
   <repo>#<n>" and a cleaned, short title; the title and body go in a fence, marked as the issue's
   text, and the brief says the label is the user's go-ahead and asks for `Closes #<n>`. Only
-  numbers and short reasons are stored, never an issue's text (bodies are cut to 6000 characters
-  as they are read). Each handoff is recorded in its own key (`issue:<repo>#<n>`) before the
-  message is sent, and an issue with that record is never sent again, so a failed save cannot
-  hand one over twice; a storage failure only leaves an issue waiting, and never stops the tick.
+  numbers, times and short reasons are stored, never an issue's text (bodies are cut to 6000
+  characters as they are read). Each go-ahead goes over once: a handoff is tied to the time of the
+  label event that passed the check, and recorded in its own key (`issue:<repo>#<n>`, with that
+  time) before the message is sent. An issue whose record names the same label event is never sent
+  again, so a failed save cannot hand one over twice; adding the label again is a new event and a
+  new handoff. A send that fails clears the record so it is tried again; if even that write fails,
+  the record stays "sending" and the board shows the handoff as unsure, never resending it by
+  itself. A storage failure only leaves an issue waiting, and never stops the tick.
   With no supervisor running, Needs you says they wait; in dry run the board says it would hand
   them over. Labels named `any` or `none` are refused: GitLab reads them as filters.
 - **Not yet run live.** Its workers push branches and open PRs, so the first run should be on a
