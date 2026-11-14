@@ -4,6 +4,7 @@ import { validateConfig } from './config.ts'
 import { tick, type EngineDeps, type Workspace } from './engine.ts'
 import type { Exec, ExecResult } from './exec.ts'
 import { createExecutor, type Executor } from './executor.ts'
+import type { ForgeActions } from './forge.ts'
 import { FLAKY_SIGNS, flakyReason } from './flaky.ts'
 import { createGitHub, normalizePr, type CheckInfo, type GitHub, type PrSnapshot } from './github.ts'
 import { createGitLab, normalizeMr } from './gitlab.ts'
@@ -166,11 +167,17 @@ describe('an engine tick over a flaky check', () => {
       },
       async failureDetails(_repo, checks) {
         read.push(checks.map((c) => c.name))
-        return details(checks)
+        const d = details(checks)
+        return { details: d, logs: Object.fromEntries(Object.entries(d).map(([name, text]) => [name, `log of ${name}: ${text}`])) }
       }
     }
+    const logsSent: Record<string, string>[] = []
     const executor: Executor = {
-      execute: async (a) => (executed.push(a), opts.refuse && a.kind === 'rerun-check' ? { ok: false, error: 'gh api: HTTP 403 Resource not accessible by integration' } : { ok: true })
+      execute: async (a, ctx) => {
+        executed.push(a)
+        if (a.kind === 'send-ci-failure') logsSent.push(ctx.failedLogs ?? {})
+        return opts.refuse && a.kind === 'rerun-check' ? { ok: false, error: 'gh api: HTTP 403 Resource not accessible by integration' } : { ok: true }
+      }
     }
     const deps: EngineDeps = {
       now: () => now,
@@ -185,7 +192,7 @@ describe('an engine tick over a flaky check', () => {
       store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) },
       executor
     }
-    return { deps, store, executed, read, advance: (ms: number) => (now += ms) }
+    return { deps, store, executed, read, logsSent, advance: (ms: number) => (now += ms) }
   }
   const lostRunner = () => ({ test: 'The runner has received a shutdown signal.' })
 
@@ -207,6 +214,8 @@ describe('an engine tick over a flaky check', () => {
     h.advance(60_000)
     await tick(h.deps, { autopilot: true })
     assert.deepEqual(h.executed.map((a) => a.kind), ['rerun-check', 'send-ci-failure'])
+    // Its log is the new attempt's, read when it is sent: the one kept is the first attempt's.
+    assert.deepEqual(h.logsSent, [{}])
   })
 
   test('a re-run the forge refuses is recorded, and the failure goes to the worker on the next tick', async () => {
@@ -221,10 +230,12 @@ describe('an engine tick over a flaky check', () => {
     assert.deepEqual(h.executed.map((a) => a.kind), ['rerun-check', 'send-ci-failure'], 'asked once, then sent once')
   })
 
-  test('a real failure is read once and goes straight to the worker', async () => {
+  test('a real failure is read once and goes straight to the worker, with the log tail already read', async () => {
     const h = harness([pr({ number: 12, ci: 'failing', checks: [check('test', 'failure', 7)] })], () => ({ test: 'AssertionError: 1 !== 2' }))
     await tick(h.deps, { autopilot: true })
     assert.deepEqual(h.executed.map((a) => a.kind), ['send-ci-failure'])
+    assert.deepEqual(h.logsSent, [{ test: 'log of test: AssertionError: 1 !== 2' }], 'not downloaded a second time')
+    assert.deepEqual(h.read, [['test']])
   })
 
   test('a forge read that fails, or says nothing of a check, counts as a real failure and is not read again', async () => {
@@ -309,10 +320,11 @@ describe('the jobs behind GitHub checks', () => {
           }
         : { code: 0, stderr: '', stdout: '2026-11-10T10:00:00.1Z step 1\n' }
     }
-    const details = await createGitHub(exec).failureDetails!({ owner: 'acme', name: 'app' }, [check('test', 'failure', 77)])
+    const { details, logs } = await createGitHub(exec).failureDetails!({ owner: 'acme', name: 'app' }, [check('test', 'failure', 77)])
     assert.deepEqual(calls.map((c) => c[1]), ['repos/acme/app/check-runs/77/annotations', 'repos/acme/app/actions/jobs/77/logs'])
     assert.ok(!details.test.includes('Cache service'), 'a warning is not what failed the job')
     assert.equal(flakyReason(details.test), 'the runner lost its connection')
+    assert.equal(logs.test, 'step 1', 'the plain tail, kept for the worker')
   })
 })
 
@@ -325,8 +337,30 @@ describe('re-running a GitLab job', () => {
     const ctx = { repo: REPO, pr: snap, config: config(), root: '/r' }
     assert.deepEqual(await ex.execute({ kind: 'rerun-check', sha: SHA, checks: [failed[0]], why: 'the GitLab runner failed' }, ctx), { ok: true })
     assert.deepEqual(g.calls[0].args, ['api', '--hostname', HOST, '-X', 'POST', 'projects/forks%2Fme%2Fapp/jobs/16152393446/retry'])
-    const details = await createGitLab(g.exec).failureDetails!(REPO, failed)
+    const { details, logs } = await createGitLab(g.exec).failureDetails!(REPO, failed)
     assert.deepEqual(g.calls.slice(1).map((c) => c.args.at(-1)), ['projects/forks%2Fme%2Fapp/jobs/16152393446', 'projects/forks%2Fme%2Fapp/jobs/16152393446/trace'])
     assert.equal(flakyReason(details[failed[0].name]), 'the GitLab runner failed')
+    assert.match(logs[failed[0].name] ?? '', /Running on runner-1/)
+  })
+})
+
+describe("the worker's CI-failure message", () => {
+  test('carries the log tails already read when the failure was judged; only the rest are downloaded', async () => {
+    const asked: string[][] = []
+    const bodies: string[] = []
+    const forge = {
+      failedLogs: async (_repo: unknown, checks: readonly CheckInfo[]) => (asked.push(checks.map((c) => c.name)), Object.fromEntries(checks.map((c) => [c.name, `fresh log of ${c.name}`])))
+    } as unknown as ForgeActions
+    const cli = { run: async (args: readonly string[]) => (args[1] === 'send' && bodies.push(args[args.indexOf('--body') + 1]), {}) }
+    const ex = createExecutor({ exec: async () => ({ code: 0, stdout: '', stderr: '' }), orca: cli, notify: async () => {}, forges: { github: forge } })
+    const failing = [check('test', 'failure', 7), check('lint', 'failure', 8)]
+    const snap = pr({ number: 12, ci: 'failing', checks: failing })
+    const out = await ex.execute(
+      { kind: 'send-ci-failure', to: 'dispatch:d1', sha: SHA, round: 1, checks: failing, signature: 'lint,test' },
+      { repo: { owner: 'acme', name: 'app' }, pr: snap, config: config(), root: '/r', failedLogs: { test: 'kept log of test' } }
+    )
+    assert.equal(out.ok, true)
+    assert.deepEqual(asked, [['lint']], 'test was read already')
+    assert.ok(bodies[0].includes('kept log of test') && bodies[0].includes('fresh log of lint'))
   })
 })

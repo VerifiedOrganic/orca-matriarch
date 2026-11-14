@@ -577,6 +577,7 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     },
     async failureDetails(repo, checks) {
       const details: Record<string, string> = {}
+      const logs: Record<string, string> = {}
       for (const { name, jobId, url } of checks.slice(0, 5)) {
         if (jobId === null) continue
         const project = jobProject(url) ?? projectPath(repo)
@@ -588,9 +589,10 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
         } catch {
           reason = null
         }
-        details[name] = [reason ? `failure_reason: ${reason}` : '', trace.code === 0 && trace.stdout ? traceTail(trace.stdout) : ''].filter(Boolean).join('\n')
+        if (trace.code === 0 && trace.stdout) logs[name] = traceTail(trace.stdout)
+        details[name] = [reason ? `failure_reason: ${reason}` : '', logs[name] ?? ''].filter(Boolean).join('\n')
       }
-      return details
+      return { details, logs }
     },
     publishReview: (repo, pr, _sha, review) =>
       act(repo, 'notes', ['-X', 'POST', rest(projectPath(repo), `merge_requests/${pr.number}/notes`), '-f', `body=${reviewNote(review)}`]),

@@ -436,10 +436,11 @@ describe('GitLab renames, for a light review', () => {
       const executed: Action[] = []
       let now = T0
       let asked = 0
+      let baseSha = BASE_SHA
       const snap = pr({ forge: 'gitlab', repo: KEY, url: `https://${HOST}/${PATH}/-/merge_requests/12`, files, renamed: null })
       const gitlab: ForgeReader = {
-        listOpen: async () => ({ viewer: 'me', rate: null, base: { name: 'main', sha: BASE_SHA, rollup: 'SUCCESS' }, prs: [{ number: 12, headRef: snap.headRef, headSha: snap.headSha, baseRef: 'main', author: 'me', updatedAt: snap.updatedAt, rollup: 'SUCCESS' }] }),
-        detail: async () => ({ pr: snap, rate: null }),
+        listOpen: async () => ({ viewer: 'me', rate: null, base: { name: 'main', sha: baseSha, rollup: 'SUCCESS' }, prs: [{ number: 12, headRef: snap.headRef, headSha: snap.headSha, baseRef: 'main', author: 'me', updatedAt: snap.updatedAt, rollup: 'SUCCESS' }] }),
+        detail: async () => ({ pr: { ...snap, fetchedAt: now }, rate: null }),
         fileMoves: async () => (asked++, moves())
       }
       const deps: EngineDeps = {
@@ -457,9 +458,22 @@ describe('GitLab renames, for a light review', () => {
         store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) },
         executor: { execute: async (action) => (executed.push(action), { ok: true }) }
       }
-      return { deps, executed, store, asked: () => asked, advance: (ms: number) => (now += ms) }
+      return { deps, executed, store, asked: () => asked, advance: (ms: number) => (now += ms), moveBase: (sha: string) => (baseSha = sha) }
     }
     const reviewed = (executed: Action[]) => executed.some((a) => a.kind === 'start-review')
+
+    test('the kept answer is for the head and the base: a base that moved is read again', async () => {
+      const h = tickHarness(async () => ({ renamed: [], paths: ['docs/guide.md'] }), ['docs/guide.md'])
+      await tick(h.deps, { autopilot: true })
+      assert.equal(h.asked(), 1)
+      // Same head, but the base moved on (or the merge request was moved onto another base): the
+      // diff between them, and so what was renamed, may differ.
+      h.moveBase('c0ffee0000000000000000000000000000000000')
+      await tick(h.deps, { autopilot: true })
+      assert.equal(h.asked(), 2)
+      await tick(h.deps, { autopilot: true })
+      assert.equal(h.asked(), 2, 'kept again for that base')
+    })
 
     test('a docs-only merge request with no renames is a light change, read once per commit', async () => {
       const h = tickHarness(async () => ({ renamed: [], paths: ['docs/guide.md'] }), ['docs/guide.md'])

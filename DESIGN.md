@@ -186,7 +186,9 @@ on (rebased off its own parent, amended).
 When the parent merged:
 
 - a child the forge left on the parent's branch is moved to where the parent merged (`gh pr edit
-  --base`, GitLab's `target_branch`);
+  --base`, GitLab's `target_branch`). A move the forge refuses is recorded with its error and
+  tried again after 5, then 10 minutes; after three refusals it is escalated (the supervisor,
+  then you), since it needs moving by hand;
 - the forge is asked once whether that base has the fork point (GitHub's compare, GitLab's merge
   base). After a merge commit or a fast-forward it does, and the child goes on without a rebase;
 - otherwise its owner (or the supervisor, when the worker finished) is asked once to run
@@ -224,6 +226,10 @@ app under test answered) and a warning about something that recovered never matc
   again first, and the real failure goes to the worker once that re-run finished.
 - A failure the forge said nothing about (no log, the read failed, past the first few) counts as
   real, so nothing is read again on every tick.
+- **Read once.** The log tails read to judge a failure are kept with the job they came from
+  (`ci-logs:`, the head commit's only) and go to the worker with the failure, so a log is not
+  downloaded twice. A check re-run after a flaky failure is another job: its log is read when it
+  is sent.
 
 ### Fix rounds and escalation
 
@@ -303,9 +309,10 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   file list is whole. Then `crew: "one"` runs only the first blocking reviewer left after the
   cross-provider rule, and `"none"` skips the AI review (the merge reason says so).
   - GitLab's diff stats do not mark renames, so for a merge request that would be light the
-    REST diffs are read (`…/diffs`, or `…/changes` before GitLab 15.7), once per head commit,
-    kept as `moves:<repo>#<n>`. A failed or partial read keeps the full crew and is tried again
-    after 10 minutes.
+    REST diffs are read (`…/diffs`, or `…/changes` before GitLab 15.7), once per head commit and
+    base (its target branch and that branch's head, where known: a merge request moved onto
+    another base, or a base that moved on, has another diff), kept as `moves:<repo>#<n>`. A
+    failed or partial read keeps the full crew and is tried again after 10 minutes.
   - A round already on the commit (running, or asking for changes) still decides, and **Run AI
     review now** runs the full crew.
 - **Publishing** (`publish`).
@@ -807,8 +814,13 @@ can be changed and checked without Orca.
   stopped, and its worktree removed. It does not use up a review round.
 - **Failed rounds.** Their worktrees are kept for the 2-hour late-verdict window, then removed.
 - **Pruning.** Storage is pruned at most hourly:
-  - a PR's ledger, snapshot and review rounds go 7 days after Matriarch saw it merged or closed;
-  - a worktree's history goes 7 days after the worktree was last seen.
+  - a PR's ledger, snapshot, review rounds, file moves and kept log tails go 7 days after
+    Matriarch saw it merged or closed, or stopped following it while it was open (its worktree
+    gone, say; `dropped:`), unless it is followed again;
+  - a worktree's history goes 7 days after the worktree was last seen;
+  - a labeled issue's handoff record goes 7 days after the issue left the open list (closed, or
+    unlabeled); a new label event hands it over again anyway;
+  - a review or advice worktree's launch records are deleted when it is removed.
 - **Serial writes.** Polls and panel actions that change storage run one at a time, so
   neither overwrites the other.
 - **Activity across restarts.** What each agent is doing is saved and restored on restart;

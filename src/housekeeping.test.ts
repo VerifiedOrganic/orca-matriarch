@@ -40,6 +40,30 @@ describe('storage pruning', () => {
     s.m.set('track:recent', { seenAt: 0, segments: [] })
     assert.equal(await collectGarbage(s, { now: now + GC_EVERY_MS - 1, openPrs: new Set(), liveWorkspaces: new Set() }), 0, 'throttled')
   })
+
+  test('drops a PR a week after Matriarch stopped following it while open, unless it is followed again', async () => {
+    const s = memoryStore({
+      'dropped:a/b#4': now - RETAIN_MS - 1, 'pr:a/b#4': {}, 'snap:a/b#4': {}, 'moves:a/b#4': {}, 'ci-logs:a/b#4': {},
+      'dropped:a/b#5': now - RETAIN_MS - 1, 'pr:a/b#5': {},
+      'dropped:a/b#6': now - 1000, 'pr:a/b#6': {}
+    })
+    await collectGarbage(s, { now, openPrs: new Set(['a/b#5']), liveWorkspaces: new Set() })
+    assert.deepEqual([...s.m.keys()].sort(), ['dropped:a/b#6', 'gc:last', 'pr:a/b#5', 'pr:a/b#6'])
+  })
+
+  test("drops an issue's handoff record a week after the issue left the open list, not while it is open", async () => {
+    const s = memoryStore({
+      'issues:a/b': { open: [7], left: { 8: now - RETAIN_MS - 1, 9: now - 1000 } },
+      'issue:a/b#7': { at: 0, labelAt: 'x', state: 'sent' },
+      'issue:a/b#8': { at: now - 2000, labelAt: 'x', state: 'sent' },
+      'issue:a/b#9': { at: 0, labelAt: 'x', state: 'sent' },
+      // Issues turned off: no list says when it left, so a week after it was handed over.
+      'issue:c/d#1': { at: now - RETAIN_MS - 1, labelAt: 'x', state: 'sent' },
+      'issue:c/d#2': { at: now - 1000, labelAt: 'x', state: 'sent' }
+    })
+    await collectGarbage(s, { now, openPrs: new Set(), liveWorkspaces: new Set() })
+    assert.deepEqual([...s.m.keys()].filter((k) => k.startsWith('issue:')).sort(), ['issue:a/b#7', 'issue:a/b#9', 'issue:c/d#2'])
+  })
 })
 
 describe('restarts', () => {

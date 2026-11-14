@@ -230,10 +230,10 @@ A PR that changes only docs gets a lighter AI review.
   `copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, `.aider*`, and
   anything in a `.claude`, `.cursor`, `.github`, `.agents`, `.codex`, `.omp`, `.opencode`,
   `.orca`, `.gemini`, `.windsurf`, `.continue`, `.roo`, `.kiro`, `.junie` or `.clinerules`
-  folder; `claude.md` counts as `CLAUDE.md`, as it does on a Mac's disk); a PR that renames or copies a file, or whose old paths
-  are not light; a file list the forge cut short. GitLab's file list does not say what was
-  renamed, so a merge request that looks light is read file by file, once per commit, and gets
-  the full crew when that read fails.
+  folder; `claude.md` counts as `CLAUDE.md`, as it does on a Mac's disk); a PR that renames or
+  copies a file, or whose old paths are not light; a file list the forge cut short. GitLab's file
+  list does not say what was renamed, so a merge request that looks light is read file by file,
+  once per commit and base, and gets the full crew when that read fails.
 - A round already on the commit (running, or asking for changes) still decides, and **Run AI
   review now** always runs the full crew.
 

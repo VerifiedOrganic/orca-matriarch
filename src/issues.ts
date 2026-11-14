@@ -59,6 +59,8 @@ export interface IssuesRecord {
   handed: Record<string, HandoffRecord>
   /** Issue number → its last check. */
   checks: Record<string, CheckRecord>
+  /** Issue number → when a handed-over issue left the open list: its handoff record is pruned a week later (gc.ts). */
+  left: Record<string, number>
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -69,13 +71,16 @@ export function loadIssues(raw: unknown): IssuesRecord {
   for (const [n, h] of Object.entries(isObj(r.handed) ? r.handed : {})) if (typeof h?.labelAt === 'string') handed[n] = { labelAt: h.labelAt, sure: h.sure === true }
   const checks: Record<string, CheckRecord> = {}
   for (const [n, c] of Object.entries(isObj(r.checks) ? r.checks : {})) if (typeof c?.updatedAt === 'string' && typeof c.ok === 'boolean') checks[n] = c
+  const left: Record<string, number> = {}
+  for (const [n, at] of Object.entries(isObj(r.left) ? r.left : {})) if (typeof at === 'number') left[n] = at
   return {
     label: typeof r.label === 'string' ? r.label : '',
     at: typeof r.at === 'number' ? r.at : 0,
     open: Array.isArray(r.open) ? r.open.filter((n): n is number => typeof n === 'number') : [],
     truncated: r.truncated === true,
     handed,
-    checks
+    checks,
+    left
   }
 }
 
@@ -196,8 +201,9 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
 
   const loaded = await get(key)
   let rec = loadIssues('value' in loaded ? loaded.value : null)
-  // Another label: what was read for the old one says nothing about this one.
-  if (rec.label !== label) rec = { label, at: 0, open: [], truncated: false, handed: {}, checks: {} }
+  // Another label: what was read for the old one says nothing about this one. Its handoffs are
+  // done with: they leave the list now, so their records are pruned in a week.
+  if (rec.label !== label) rec = { label, at: 0, open: [], truncated: false, handed: {}, checks: {}, left: { ...rec.left, ...Object.fromEntries(Object.keys(rec.handed).map((n) => [n, now])) } }
   /** Handed over for the label event its last check judged (or with no check yet to say otherwise). */
   const taken = (n: number): boolean => {
     const h = rec.handed[n]
@@ -218,7 +224,11 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
         fresh = list.issues
         const open = new Set(fresh.map((i) => i.number))
         const keep = <T>(m: Record<string, T>) => Object.fromEntries(Object.entries(m).filter(([n]) => open.has(Number(n))))
-        rec = { ...rec, open: [...open], truncated: list.truncated, handed: keep(rec.handed), checks: keep(rec.checks) }
+        // Handed-over issues that left the list are noted, for their records to go a week later;
+        // one back on the list is not.
+        const left: Record<string, number> = Object.fromEntries(Object.entries(rec.left).filter(([n]) => !open.has(Number(n))))
+        for (const n of Object.keys(rec.handed)) if (!open.has(Number(n)) && left[n] === undefined) left[n] = now
+        rec = { ...rec, open: [...open], truncated: list.truncated, handed: keep(rec.handed), checks: keep(rec.checks), left }
       } catch (error) {
         warnings.push(`Could not read the issues labeled ${label}: ${message(error)}`)
       }

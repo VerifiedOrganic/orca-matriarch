@@ -11,11 +11,11 @@ import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
 import type { Executor } from './executor.ts'
 import { flakyReason } from './flaky.ts'
-import { forgeKind, forgeTerms, type FileMoves, type ForgeKind, type ForgeReader, type Outcome } from './forge.ts'
+import { forgeKind, forgeTerms, type FailureDetails, type FileMoves, type ForgeKind, type ForgeReader, type Outcome } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { followIssues } from './issues.ts'
 import { addLog, addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
-import { checkKey, keepChecks, ledgerKey, loadLedger, record, recordRefusedRerun, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
+import { checkKey, keepChecks, ledgerKey, loadLedger, record, recordRefusedRerun, recordRefusedRetarget, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
 import { countStarts, dayOf, isWorking, loadPendingStops, loadStarts, overLimitStarts, STOP_RETRY_MS, stoppedMessage, type LimitState, type PendingStop } from './limits.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
@@ -380,10 +380,20 @@ async function followStack(
   return { ...next, headAtMerge: snap.headSha, ...(kept2 === true ? { forkInBase: true } : {}) }
 }
 
+/** Where a PR's failed-job log tails are kept, read when its failures were judged (one commit's). */
+export const ciLogsKey = (repo: string, number: number): string => `ci-logs:${repo}#${number}`
+
+/** The log tails kept for a PR: its head commit's, by check name, with the job each came from. */
+interface CiLogs {
+  sha: string
+  logs: Record<string, { jobId: number | null; tail: string }>
+}
+
 /**
  * Failed checks on a PR's head, read once per commit and check to tell a flaky failure from a
  * real one (flaky.ts), so the planner can re-run a flaky one before a worker spends a round on it.
- * Only before the failure went to the worker, and once every check finished.
+ * Only before the failure went to the worker, and once every check finished. The log tails read
+ * for it are kept with the job they came from, so the worker's message reuses them.
  */
 async function judgeFailures(deps: EngineDeps, repo: RepoInfo, snap: PrSnapshot, ledger: PrLedger, config: MatriarchConfig): Promise<PrLedger> {
   const sha = snap.headSha
@@ -393,9 +403,29 @@ async function judgeFailures(deps: EngineDeps, repo: RepoInfo, snap: PrSnapshot,
   if (todo.length === 0 || !reader?.failureDetails) return ledger
   // A check the forge said nothing about (past the first few, no log, or the read failed) counts
   // as a real failure: each gets a verdict, so none is read again on every tick.
-  const details = await reader.failureDetails(repo.ref, todo).catch(() => ({}) as Record<string, string>)
-  const judged = todo.map((c): [string, string | null] => [checkKey(sha, c.name), flakyReason(details[c.name] ?? '')])
+  const read: FailureDetails = await reader.failureDetails(repo.ref, todo).catch(() => ({ details: {}, logs: {} }))
+  const judged = todo.map((c): [string, string | null] => [checkKey(sha, c.name), flakyReason(read.details[c.name] ?? '')])
+  const key = ciLogsKey(repo.key, snap.number)
+  const kept = ((await deps.store.get(key)) as CiLogs | null) ?? null
+  const logs: CiLogs = { sha, logs: kept?.sha === sha ? { ...kept.logs } : {} }
+  for (const c of todo) if (read.logs[c.name] !== undefined) logs.logs[c.name] = { jobId: c.jobId, tail: read.logs[c.name] }
+  await deps.store.set(key, logs as unknown as JsonValue)
   return { ...ledger, flaky: keepChecks(ledger.flaky ?? {}, sha, judged) }
+}
+
+/**
+ * The kept log tails that still describe the PR's failed checks: of its head commit, and of the
+ * same job (a check re-run after a flaky failure is another job, whose log was not read).
+ */
+async function keptLogs(deps: EngineDeps, repo: RepoInfo, snap: PrSnapshot): Promise<Record<string, string>> {
+  const kept = (await deps.store.get(ciLogsKey(repo.key, snap.number))) as CiLogs | null
+  if (!kept || kept.sha !== snap.headSha) return {}
+  const out: Record<string, string> = {}
+  for (const c of snap.checks) {
+    const k = kept.logs[c.name]
+    if (c.state === 'failure' && k && k.jobId === c.jobId) out[c.name] = k.tail
+  }
+  return out
 }
 
 /** An advisor waiting on a prompt, under Needs you with the terminal to open. */
@@ -452,17 +482,20 @@ export const MOVES_RETRY_MS = 10 * 60_000
  * light change: its files read one by one, once per commit, so a renamed file and the path it
  * came from are judged as on GitHub. Without an answer it stays as it was, and gets the full crew.
  */
-async function withFileMoves(deps: EngineDeps, repo: RepoInfo, config: ConfigResult['config'], snap: PrSnapshot, now: number): Promise<PrSnapshot> {
+async function withFileMoves(deps: EngineDeps, repo: RepoInfo, config: ConfigResult['config'], snap: PrSnapshot, now: number, baseSha: string | null): Promise<PrSnapshot> {
   const reader = readerFor(deps, repo.ref)
   if (snap.renamed !== null && snap.renamed !== undefined) return snap
   if (!reader?.fileMoves || !config.review.enabled || snap.state !== 'OPEN' || !lightPaths(config, snap)) return snap
   const key = `moves:${repo.key}#${snap.number}`
-  const cached = (await deps.store.get(key)) as { sha?: string; moves?: FileMoves | null; at?: number } | null
+  // A diff is between the head and the base: a stacked PR moved onto another base, or a base that
+  // moved on, has other files moved even with the same head.
+  const cached = (await deps.store.get(key)) as { sha?: string; base?: string; baseSha?: string | null; moves?: FileMoves | null; at?: number } | null
+  const same = cached?.sha === snap.headSha && cached.base === snap.baseRef && (cached.baseSha ?? null) === baseSha
   let moves: FileMoves | null
-  if (cached?.sha === snap.headSha && (cached.moves || now - (cached.at ?? 0) < MOVES_RETRY_MS)) moves = cached.moves ?? null
+  if (same && (cached!.moves || now - (cached!.at ?? 0) < MOVES_RETRY_MS)) moves = cached!.moves ?? null
   else {
     moves = await reader.fileMoves(repo.ref, snap.number).catch(() => null)
-    await deps.store.set(key, { sha: snap.headSha, moves, at: now } as unknown as JsonValue)
+    await deps.store.set(key, { sha: snap.headSha, base: snap.baseRef, baseSha, moves, at: now } as unknown as JsonValue)
   }
   if (!moves) return snap
   return { ...snap, renamed: moves.renamed, files: [...new Set([...snap.files, ...moves.paths])] }
@@ -846,9 +879,10 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     let runningReviews = 0
     for (const s of managed) {
       try {
-        const read = await snapshotFor(deps, info, s, now, detailAge, base && s.baseRef === base.name ? base.sha : null)
+        const baseSha = base && s.baseRef === base.name ? base.sha : null
+        const read = await snapshotFor(deps, info, s, now, detailAge, baseSha)
         if (!read) continue
-        const snap = await withFileMoves(deps, info, config, read, now)
+        const snap = await withFileMoves(deps, info, config, read, now, baseSha)
         let ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, s.number)))
         // When each head was first seen: a new commit's checks get a grace period to register.
         if (!ledger.heads[snap.headSha]) {
@@ -913,7 +947,13 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       for (const number of tracked.filter((n) => !open.has(n))) {
         try {
           const { pr } = await forge.detail(info.ref, number)
-          if (!pr || pr.state === 'OPEN') continue
+          if (!pr) continue
+          if (pr.state === 'OPEN') {
+            // Still open, but no longer followed (its worktree gone, another author): its records
+            // are pruned a week after this unless it is followed again.
+            if (!(await deps.store.get(`dropped:${repoKey}#${number}`))) await deps.store.set(`dropped:${repoKey}#${number}`, now)
+            continue
+          }
           // Its review rounds are moot now.
           if (deps.crew) await deps.crew.supersede(repoKey, number, null).catch(() => [])
           const ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, number)))
@@ -1126,7 +1166,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       // What was carried out (or tried) this tick, for the track's activity log.
       const logged: LogEntry[] = []
       const ownerRow = item.ws ? byWorktree.get(item.ws) : undefined
-      const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null, owner: owner?.address ?? null }
+      const failedLogs = p.actions.some((a) => a.kind === 'send-ci-failure') ? await keptLogs(deps, info, snap) : {}
+      const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null, owner: owner?.address ?? null, failedLogs }
       const run1 = async (a: Action) => {
         try {
           return await deps.executor!.execute(a, ctx)
@@ -1163,6 +1204,11 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         // A re-run the forge refused is not asked for again: the failure goes to the worker next.
         if (action.kind === 'rerun-check') {
           ledger = recordRefusedRerun(ledger, action, now, outcome.error ?? 'refused')
+          await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
+        }
+        // A move of the base the forge refused is tried again later, and escalated after a few tries.
+        if (action.kind === 'retarget') {
+          ledger = recordRefusedRetarget(ledger, action, now, outcome.error ?? 'refused')
           await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
         }
         if (action.kind === 'merge') ledger = { ...ledger, merge: { sha: action.sha, at: now, status: 'failed', error: outcome.error } }

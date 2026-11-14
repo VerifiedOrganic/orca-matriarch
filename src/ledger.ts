@@ -74,6 +74,8 @@ export interface PrLedger {
   stack?: StackParent
   /** Bases moved after the parent merged, by the parent's number. */
   retargets?: Record<string, { at: number; base: string }>
+  /** Moves of the base the forge refused, by the parent's number: how many, the last time, and why. */
+  retargetFailures?: Record<string, RetargetFailure>
   /** Requests to rebase off a merged parent's commits, by the parent's number, with the head they were sent for. */
   restacks?: Record<string, { at: number; sha: string }>
   /** Failed checks read for a flaky cause, by `<sha>:<check>`: why it looks flaky, or null when it looks real. */
@@ -83,6 +85,12 @@ export interface PrLedger {
    * that failed (the forge gives the new one another), and the forge's words when it refused.
    */
   reruns?: Record<string, Rerun>
+}
+
+export interface RetargetFailure {
+  count: number
+  at: number
+  error: string
 }
 
 export interface Rerun {
@@ -124,6 +132,7 @@ export function loadLedger(raw: unknown): PrLedger {
     ...(typeof rec(r.builder).address === 'string' ? { builder: { address: rec(r.builder).address as string, done: rec(r.builder).done === true } } : {}),
     ...(stackOf(r.stack) ? { stack: stackOf(r.stack)! } : {}),
     ...(Object.keys(rec(r.retargets)).length ? { retargets: { ...rec(r.retargets) } } : {}),
+    ...(Object.keys(rec(r.retargetFailures)).length ? { retargetFailures: { ...rec(r.retargetFailures) } } : {}),
     ...(Object.keys(rec(r.restacks)).length ? { restacks: { ...rec(r.restacks) } } : {}),
     ...(Object.keys(rec(r.flaky)).length ? { flaky: { ...rec(r.flaky) } } : {}),
     ...(Object.keys(rec(r.reruns)).length ? { reruns: { ...rec(r.reruns) } } : {})
@@ -161,6 +170,14 @@ export function keepChecks<T>(records: Readonly<Record<string, T>>, sha: string,
 export function recordRefusedRerun(ledger: PrLedger, action: Extract<Action, { kind: 'rerun-check' }>, now: number, error: string): PrLedger {
   const next = loadLedger(structuredClone(ledger))
   next.reruns = keepChecks<Rerun>(next.reruns ?? {}, action.sha, action.checks.map((c): [string, Rerun] => [checkKey(action.sha, c.name), { at: now, why: action.why, jobId: c.jobId, error }]))
+  return next
+}
+
+/** The ledger after the forge refused to move the base: counted, so the next try waits and a few lead to an escalation. */
+export function recordRefusedRetarget(ledger: PrLedger, action: Extract<Action, { kind: 'retarget' }>, now: number, error: string): PrLedger {
+  const next = loadLedger(structuredClone(ledger))
+  const prior = next.retargetFailures?.[action.parent]
+  next.retargetFailures = { ...next.retargetFailures, [action.parent]: { count: (prior?.count ?? 0) + 1, at: now, error: error.slice(0, 300) } }
   return next
 }
 
@@ -207,9 +224,13 @@ export function record(ledger: PrLedger, action: Action, now: number): PrLedger 
     case 'notify':
       next.notified[action.key] = now
       break
-    case 'retarget':
+    case 'retarget': {
       next.retargets = { ...next.retargets, [action.parent]: { at: now, base: action.base } }
+      const { [action.parent]: _done, ...failures } = next.retargetFailures ?? {}
+      if (Object.keys(failures).length) next.retargetFailures = failures
+      else delete next.retargetFailures
       break
+    }
     case 'send-restack':
       next.restacks = { ...next.restacks, [action.parent]: { at: now, sha: action.sha } }
       break

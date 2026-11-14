@@ -263,6 +263,8 @@ export interface Lockdown {
 export interface LockdownStore {
   get(key: string): Promise<unknown>
   set(key: string, value: { mode: LockMode; at: number } | null): Promise<void>
+  /** Removes a record; where a store has none, it is set to null instead. */
+  delete?(key: string): Promise<void>
 }
 
 export function createLockdown(now: () => number = Date.now, store?: LockdownStore): Lockdown {
@@ -293,7 +295,8 @@ export function createLockdown(now: () => number = Date.now, store?: LockdownSto
       for (const k of [...started.keys()]) {
         if (!k.startsWith(`${path}\n`)) continue
         started.delete(k)
-        void store?.set(`lockdown:${k}`, null).catch(() => {})
+        // Deleted, not set to null: a null record still counts among the plugin's keys.
+        void (store?.delete ? store.delete(`lockdown:${k}`) : store?.set(`lockdown:${k}`, null))?.catch(() => {})
       }
     },
     onLaunch(event, guard) {

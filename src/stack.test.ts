@@ -7,10 +7,10 @@ import type { Exec, ExecResult } from './exec.ts'
 import { createExecutor, type Executor } from './executor.ts'
 import { createGitHub, normalizePr, type GitHub, type PrSnapshot } from './github.ts'
 import { createGitLab, normalizeMr } from './gitlab.ts'
-import { emptyLedger, ledgerKey, loadLedger, record, type PrLedger, type StackParent } from './ledger.ts'
+import { emptyLedger, ledgerKey, loadLedger, record, recordRefusedRetarget, type PrLedger, type StackParent } from './ledger.ts'
 import { restackMessage } from './messages.ts'
 import { createOrcaCli } from './orca-cli.ts'
-import { plan, RESTACK_STALL_MS, restackCommand, type Action } from './plan.ts'
+import { plan, RESTACK_STALL_MS, RETARGET_TRIES, restackCommand, retargetBackoff, type Action } from './plan.ts'
 import { config, input, owner, pr, SHA } from './testing/fixtures.ts'
 import { detailData, fakeGlab, HOST, KEY, REPO } from './testing/gitlab.ts'
 
@@ -49,6 +49,22 @@ describe('planning a stacked PR', () => {
     assert.match(after.reason, /base moved to main/)
     // Even while its worker is busy: it is the forge's change, not the worker's.
     assert.deepEqual(kinds(plan(input({ pr: child, owner: owner({ activity: 'working' }), stack: merged }, passed())).actions), ['retarget'])
+  })
+
+  test('a move the forge refuses waits before the next try, and a few refusals go to the supervisor', () => {
+    const merged = parent({ state: 'MERGED', headAtMerge: SHA })
+    const action = { kind: 'retarget' as const, sha: SHA, parent: 11, from: 'feature/auth', base: 'main' }
+    let ledger = recordRefusedRetarget(passed(), action, 1_000, 'HTTP 403: Resource not accessible')
+    const waiting = plan(input({ pr: child, config: auto, stack: merged, now: 1_000 + retargetBackoff(1) - 1 }, ledger))
+    assert.deepEqual(waiting.actions, [], 'not every tick')
+    assert.match(waiting.reason, /failed \(HTTP 403: Resource not accessible\), trying again shortly/)
+    assert.deepEqual(kinds(plan(input({ pr: child, config: auto, stack: merged, now: 1_000 + retargetBackoff(1) }, ledger)).actions), ['retarget'])
+    for (let i = 1; i < RETARGET_TRIES; i++) ledger = recordRefusedRetarget(ledger, action, 2_000, 'HTTP 403')
+    const given = plan(input({ pr: child, config: auto, stack: merged, supervisor: 'run:r1', now: 10_000_000 }, ledger))
+    assert.deepEqual(given.actions.map((a) => (a.kind === 'escalate' ? a.to : a.kind)), ['supervisor'])
+    assert.match(given.reason, /refused to move the base from feature\/auth to main 3 times \(HTTP 403\): move it by hand/)
+    // Once it moved, the refusals are forgotten.
+    assert.equal(record(ledger, action, 3_000).retargetFailures, undefined)
   })
 
   test('then its worker is asked once to rebase off the parent commits, and it merges once that is pushed', () => {
@@ -183,6 +199,24 @@ describe('an engine tick over stacked PRs', () => {
   const ledgerOf = (h: ReturnType<typeof harness>, n: number) => h.store.get(ledgerKey('acme/app', n)) as PrLedger
   const merges = (h: ReturnType<typeof harness>) => h.executed.filter((a) => a.kind === 'merge').map((a) => (a.kind === 'merge' ? a.sha : ''))
 
+  test('a move of the base the forge refuses is recorded, and not tried again on the next tick', async () => {
+    const auth = pr({ number: 11, headRef: 'feature/auth', headSha: PARENT_SHA, title: 'Auth' })
+    const login = pr({ number: 12, headRef: 'feature/login', baseRef: 'feature/auth' })
+    const prs = [auth, login]
+    const h = harness(prs)
+    await tick(h.deps, { autopilot: true })
+    prs[0] = { ...auth, state: 'MERGED' }
+    const tries: string[] = []
+    h.deps.executor = { execute: async (a) => (a.kind === 'retarget' ? (tries.push(a.base), { ok: false, error: 'HTTP 403' }) : { ok: true }) }
+    h.advance(60_000)
+    const refused = await tick(h.deps, { autopilot: true })
+    assert.deepEqual(tries, ['main'])
+    assert.deepEqual(ledgerOf(h, 12).retargetFailures?.['11'], { count: 1, at: refused.at, error: 'HTTP 403' })
+    h.advance(60_000)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(tries, ['main'], 'it waits before the next try, rather than every tick')
+  })
+
   test('the parent merges first; the child is moved, asked to rebase, and merges after its push', async () => {
     const auth = pr({ number: 11, headRef: 'feature/auth', headSha: PARENT_SHA, title: 'Auth' })
     const login = pr({ number: 12, headRef: 'feature/login', baseRef: 'feature/auth' })
@@ -202,6 +236,7 @@ describe('an engine tick over stacked PRs', () => {
     await tick(h.deps, { autopilot: true })
     assert.deepEqual(h.executed, [{ kind: 'retarget', sha: SHA, parent: 11, from: 'feature/auth', base: 'main' }])
     assert.equal(ledgerOf(h, 12).stack?.state, 'MERGED')
+    assert.equal(ledgerOf(h, 12).retargetFailures, undefined)
     assert.equal(ledgerOf(h, 12).stack?.headAtMerge, SHA)
 
     // The forge shows the new base: its worker is asked to rebase off the parent's commits.

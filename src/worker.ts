@@ -312,7 +312,7 @@ export function createWorker(options: WorkerOptions = {}) {
       log: (m) => orca.log(m),
       now
     })
-    const lockdown = createLockdown(now, { get: (k) => orca.storage.get(k), set: (k, v) => orca.storage.set(k, v) })
+    const lockdown = createLockdown(now, { get: (k) => orca.storage.get(k), set: (k, v) => orca.storage.set(k, v), delete: (k) => orca.storage.delete(k) })
     const readIfThere = async (path: string): Promise<string | null> => {
       try {
         return await readFile(path, 'utf8')

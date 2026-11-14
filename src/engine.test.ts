@@ -446,3 +446,19 @@ describe('Needs you that nothing else tells you about', () => {
     assert.deepEqual(told, [])
   })
 })
+
+describe('a PR Matriarch stops following while it is still open', () => {
+  test('is marked, so its records go a week later unless it is followed again', async () => {
+    const open = pr({ number: 12 })
+    const main = { id: 'ws-main', kind: 'worktree' as const, name: 'app', path: '/r', branch: 'main', hostId: null }
+    const login = { id: 'ws-login', kind: 'worktree' as const, name: 'login', path: '/r/wt/login', branch: 'feature/login', hostId: null }
+    const h = harness([open], { workspaces: [main, login] })
+    await tick(h.deps, { autopilot: false })
+    assert.equal(h.store.get('dropped:acme/app#12'), undefined)
+    // Its worktree is gone: the PR is still open, but nothing of it is in Orca any more.
+    h.deps.workspaces = async () => [main]
+    h.advance(60_000)
+    await tick(h.deps, { autopilot: false })
+    assert.equal(typeof h.store.get('dropped:acme/app#12'), 'number')
+  })
+})

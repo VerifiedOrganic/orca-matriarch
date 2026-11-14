@@ -92,6 +92,16 @@ export interface FileMoves {
   paths: string[]
 }
 
+/**
+ * What the forge kept of failed checks, by check name: `details` to judge a flaky failure by (the
+ * log tail with GitHub's failure annotations or GitLab's failure reason), and `logs`, the plain
+ * log tails a worker gets with the failure, so they are not downloaded twice.
+ */
+export interface FailureDetails {
+  details: Record<string, string>
+  logs: Record<string, string>
+}
+
 export interface ForgeReader {
   listOpen(repo: RepoRef, options?: ListOptions): Promise<OpenList>
   detail(repo: RepoRef, number: number): Promise<{ pr: PrSnapshot | null; rate: RateInfo | null }>
@@ -99,7 +109,7 @@ export interface ForgeReader {
    * What the forge kept of each failed check, by check name, to tell a flaky failure from a real
    * one (flaky.ts): its log tail, and GitHub's annotations or GitLab's failure reason.
    */
-  failureDetails?(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
+  failureDetails?(repo: RepoRef, checks: readonly CheckInfo[]): Promise<FailureDetails>
   /** Open issues with this label, oldest first, up to ISSUE_PAGES pages; absent where a forge cannot say. */
   labeledIssues?(repo: RepoRef, label: string): Promise<IssueList>
   /** Who last added the label, whether they may triage issues, and whether it was edited since. Throws when it cannot tell. */

@@ -565,6 +565,7 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
     },
     async failureDetails(repo, checks) {
       const details: Record<string, string> = {}
+      const logs: Record<string, string> = {}
       for (const { name, jobId } of checks.slice(0, 5)) {
         if (jobId === null) continue
         // A runner that went away often leaves no log, only an annotation on the check saying so.
@@ -582,10 +583,13 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
             // No annotations to read.
           }
         }
-        if (log.code === 0 && log.stdout) lines.push(tailLog(log.stdout))
+        if (log.code === 0 && log.stdout) {
+          logs[name] = tailLog(log.stdout)
+          lines.push(logs[name])
+        }
         details[name] = lines.join('\n')
       }
-      return details
+      return { details, logs }
     },
     async failedLogs(repo, checks) {
       const logs: Record<string, string> = {}

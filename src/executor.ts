@@ -26,6 +26,8 @@ export interface ActionContext {
   ownerLive?: boolean | null
   /** Where the worker that owns the branch gets mail (`dispatch:<id>`), when one does. */
   owner?: string | null
+  /** Failed checks' log tails already read this commit (to judge a flaky failure), by check name. */
+  failedLogs?: Record<string, string>
 }
 
 /** Orca's answer when only the Run's coordinator may wake a finished worker. */
@@ -126,7 +128,10 @@ export function createExecutor(deps: ExecutorDeps): Executor {
       const { pr, repo, config } = ctx
       switch (action.kind) {
         case 'send-ci-failure': {
-          const logs = await forgeOf(repo).failedLogs(repo, action.checks)
+          // The tails read to judge the failure are reused; only the rest are downloaded.
+          const kept = ctx.failedLogs ?? {}
+          const missing = action.checks.filter((c) => kept[c.name] === undefined)
+          const logs = { ...kept, ...(missing.length ? await forgeOf(repo).failedLogs(repo, missing) : {}) }
           const m = ciFailureMessage(pr, action.checks, logs, action.round, config.fix.ci.maxRounds)
           return send(ctx, action.to, m.subject, m.body)
         }

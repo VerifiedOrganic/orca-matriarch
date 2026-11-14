@@ -150,6 +150,11 @@ export function lightPaths(config: MatriarchConfig, pr: PrSnapshot): string[] | 
   return matchingGlobs(paths, pr.files)
 }
 
+/** Tries at moving a stacked PR's base before it is escalated. */
+export const RETARGET_TRIES = 3
+/** The wait after a refused move of the base: 5 minutes, then 10. */
+export const retargetBackoff = (failures: number): number => 5 * 60_000 * 2 ** Math.max(0, failures - 1)
+
 /** Worker → supervisor → human. Each step happens once per problem key. */
 function escalate(input: PlanInput, problemKey: string, reason: string): { actions: Action[]; toHuman: boolean } {
   const { ledger, config, supervisor, now } = input
@@ -297,6 +302,16 @@ export function plan(input: PlanInput): Plan {
       return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `stack-base:${st.number}`, `${pr.repo} #${pr.number} needs you`, why) }
     }
     if (ledger.retargets?.[st.number]) return { lane: 'awaiting-ci', reason: `#${st.number} merged; base moved to ${st.baseRef}, waiting for ${forgeTerms(pr.forge).name} to show it`, actions: [] }
+    // The forge refused: tried again after a while, and a few refusals go to the supervisor, then you.
+    const failed = ledger.retargetFailures?.[st.number]
+    if (failed && failed.count >= RETARGET_TRIES) {
+      const why = `${forgeTerms(pr.forge).name} refused to move the base from ${st.headRef} to ${st.baseRef} ${failed.count} times (${failed.error}): move it by hand`
+      const e = escalate(input, `retarget:${st.number}`, why)
+      return { lane: e.toHuman ? 'needs-you' : 'awaiting-ci', reason: why, actions: e.actions }
+    }
+    if (failed && input.now - failed.at < retargetBackoff(failed.count)) {
+      return { lane: 'awaiting-ci', reason: `#${st.number} merged; moving the base to ${st.baseRef} failed (${failed.error}), trying again shortly`, actions: [] }
+    }
     return {
       lane: 'awaiting-ci',
       reason: `#${st.number} merged; moving the base from ${st.headRef} to ${st.baseRef}`,

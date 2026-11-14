@@ -126,6 +126,18 @@ test('a launch record outlives a reload of the plugin', async () => {
   assert.equal(await after.recall('/wt/review-51', 'codex', 5_001), null, 'an older launch does not confirm a newer one')
 })
 
+test("a worktree's launch records are deleted when it is forgotten, not left as null keys", async () => {
+  const saved = new Map<string, unknown>()
+  const store = { get: async (k: string) => saved.get(k) ?? null, set: async (k: string, v: unknown) => void saved.set(k, v), delete: async (k: string) => void saved.delete(k) }
+  const lock = createLockdown(() => 5_000, store)
+  lock.onLaunch({ agent: 'claude', workspaceId: 'repo1::/wt/advice-1', command: `claude --dangerously-skip-permissions 'p'` }, { ids: new Set<string>(), paths: ['/wt/advice-1'] })
+  await new Promise((r) => setTimeout(r, 0))
+  assert.equal([...saved.keys()].length, 1)
+  lock.forget('/wt/advice-1')
+  await new Promise((r) => setTimeout(r, 0))
+  assert.deepEqual([...saved.keys()], [], 'one record per review or advice worktree would otherwise pile up')
+})
+
 describe('GitLab writes are refused like GitHub ones', () => {
   test('glab mr and ci writes, with or without a number, and glab api', async () => {
     for (const rule of [
