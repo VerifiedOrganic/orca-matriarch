@@ -129,8 +129,9 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
   full crew, even when they match: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`,
   `*.prompt.md`, `copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, and anything in a
   `.claude`, `.cursor`, `.github`, `.agents`, `.codex`, `.omp` or `.opencode` folder. So does a PR
-  that renames or copies a file, and on GitLab every merge request, since its file list does not
-  say which files were renamed;
+  that renames or copies a file, or whose old paths are not light. GitLab's file list does not say
+  what was renamed, so a merge request that looks light is read file by file, once per commit;
+  when that read fails, it gets the full crew;
 - **Reviews at once** (default 2) limits how many review crews run together.
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback
@@ -202,6 +203,7 @@ are not changed.
 | `glab api --hostname <host> graphql` | GitLab: each check, the open merge requests with their pipeline status and the default branch's; a merge request's jobs, threads, files and approvals when it changed |
 | `glab api --hostname <host> projects/<project>/merge_requests/<n>` | GitLab: only while it has not worked out whether a merge request can merge, which this read asks it to |
 | `glab api --hostname <host> projects/<project>/jobs/<id>/trace` | GitLab, autopilot: the tail of a failed job's log, for the worker |
+| `glab api --hostname <host> -i …/merge_requests/<n>/diffs?per_page=100&page=<p>` | GitLab: once per commit, only for a merge request whose files all look light: which files it renamed, and their old paths (`…/changes` on a GitLab older than 15.7) |
 | `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | GitLab, autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |

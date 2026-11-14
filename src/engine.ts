@@ -8,13 +8,13 @@ import { defaultConfig, type ConfigResult } from './config.ts'
 import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
 import type { Executor } from './executor.ts'
-import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader } from './forge.ts'
+import { forgeKind, forgeTerms, type FileMoves, type ForgeKind, type ForgeReader } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
 import { ledgerKey, loadLedger, record, roundsUsed, type PrLedger } from './ledger.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
-import { MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
+import { lightPaths, MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
 import { supervisorTagPrefix } from './supervisor.ts'
 import type { Board, Mark, RepoView, TrackView } from './protocol.ts'
 
@@ -248,6 +248,30 @@ async function snapshotFor(
   return pr
 }
 
+/** A failed read of a PR's file moves is tried again after this; an answer is kept for the commit. */
+export const MOVES_RETRY_MS = 10 * 60_000
+
+/**
+ * A PR whose forge cannot say which files were renamed (GitLab), and that would otherwise be a
+ * light change: its files read one by one, once per commit, so a renamed file and the path it
+ * came from are judged as on GitHub. Without an answer it stays as it was, and gets the full crew.
+ */
+async function withFileMoves(deps: EngineDeps, repo: RepoInfo, config: ConfigResult['config'], snap: PrSnapshot, now: number): Promise<PrSnapshot> {
+  const reader = readerFor(deps, repo.ref)
+  if (snap.renamed !== null && snap.renamed !== undefined) return snap
+  if (!reader?.fileMoves || !config.review.enabled || snap.state !== 'OPEN' || !lightPaths(config, snap)) return snap
+  const key = `moves:${repo.key}#${snap.number}`
+  const cached = (await deps.store.get(key)) as { sha?: string; moves?: FileMoves | null; at?: number } | null
+  let moves: FileMoves | null
+  if (cached?.sha === snap.headSha && (cached.moves || now - (cached.at ?? 0) < MOVES_RETRY_MS)) moves = cached.moves ?? null
+  else {
+    moves = await reader.fileMoves(repo.ref, snap.number).catch(() => null)
+    await deps.store.set(key, { sha: snap.headSha, moves, at: now } as unknown as JsonValue)
+  }
+  if (!moves) return snap
+  return { ...snap, renamed: moves.renamed, files: [...new Set([...snap.files, ...moves.paths])] }
+}
+
 function toNumbers(v: unknown): number[] {
   return Array.isArray(v) ? v.filter((n): n is number => typeof n === 'number') : []
 }
@@ -475,8 +499,9 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     let runningReviews = 0
     for (const s of managed) {
       try {
-        const snap = await snapshotFor(deps, info, s, now, detailAge, base && s.baseRef === base.name ? base.sha : null)
-        if (!snap) continue
+        const read = await snapshotFor(deps, info, s, now, detailAge, base && s.baseRef === base.name ? base.sha : null)
+        if (!read) continue
+        const snap = await withFileMoves(deps, info, config, read, now)
         let ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, s.number)))
         // When each head was first seen: a new commit's checks get a grace period to register.
         if (!ledger.heads[snap.headSha]) {

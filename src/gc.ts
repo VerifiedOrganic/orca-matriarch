@@ -45,7 +45,7 @@ export async function collectGarbage(store: GcStore, input: GcInput): Promise<nu
         const run = (await store.get(k)) as { status?: string; worktree?: unknown; cleaned?: boolean } | null
         if (run && (run.status === 'running' || (run.worktree && !run.cleaned))) continue
         doomed.add(k)
-      } else if (k === key || k === `pr:${pr}` || k === `snap:${pr}` || k === `crew:last:${pr}`) {
+      } else if (k === key || k === `pr:${pr}` || k === `snap:${pr}` || k === `moves:${pr}` || k === `crew:last:${pr}`) {
         doomed.add(k)
       }
     }

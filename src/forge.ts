@@ -45,9 +45,23 @@ export interface Outcome {
 }
 
 /** Reads a forge's open PRs cheaply, and one PR in full. */
+/** How a PR's files moved, read file by file: what the forge's own file list cannot say. */
+export interface FileMoves {
+  /** Files renamed by the PR, by their new paths. */
+  renamed: string[]
+  /** Every path the PR touches, old and new: a renamed file counts at both. */
+  paths: string[]
+}
+
 export interface ForgeReader {
   listOpen(repo: RepoRef, options?: ListOptions): Promise<OpenList>
   detail(repo: RepoRef, number: number): Promise<{ pr: PrSnapshot | null; rate: RateInfo | null }>
+  /**
+   * For a forge whose detail cannot say which files were renamed (GitLab): each file's old and
+   * new path, read one by one. Null when it cannot be read whole. Costs a request per page, so it
+   * is asked only when the answer matters, once per commit.
+   */
+  fileMoves?(repo: RepoRef, number: number): Promise<FileMoves | null>
 }
 
 /** One AI review as it goes on the PR: a summary, and the findings anchored to lines. */
