@@ -1,27 +1,31 @@
 # Security policy
 
 Matriarch is a full-access Orca plugin. Its worker runs as you, starts coding agents on your
-accounts, changes how reviewer agents launch, and with autopilot on it messages agents, updates
-branches and can merge pull requests. The [README](README.md#permissions) lists everything it is
-meant to do. Please report anything that lets it do more than that, for example:
+accounts, changes how reviewer and advisor agents launch, and with autopilot on it messages
+agents, updates branches, stops workers and can merge pull requests. The
+[README](README.md#permissions) lists everything it is meant to do, and
+[Dry run and autopilot](README.md#dry-run-and-autopilot) what runs in each. Please report
+anything that lets it do more than that, for example:
 
-- a reviewer that can write outside its review notes, push, or reach the network despite the
-  read-only lockdown;
-- a merge, branch update or message that happens in dry run, or that the project's settings do
-  not allow;
-- a crafted PR, review comment, CI log or agent output that makes Matriarch run a command or
-  send something it should not;
-- an issue that reaches the supervisor when the rule below says it should not, or whose title or
-  text Matriarch passes on as its own words or the user's.
+- a reviewer or the advisor that can write outside its notes, push, or reach the network despite
+  the read-only lockdown;
+- anything that happens in dry run that the dry-run list does not name, or a merge, branch update
+  or message that the project's settings do not allow;
+- a crafted PR, review comment, CI log, issue or agent output that makes Matriarch run a command
+  or send something it should not;
+- an issue that reaches the supervisor when the [label rule](README.md#issues-as-objectives) says
+  it should not, or whose title or text Matriarch passes on as its own words or the user's;
+- a question that reaches the advisor from anyone but the project's supervisor;
+- the [away-alert](README.md#away-alerts) webhook URL kept anywhere but Orca's secrets, or shown
+  or logged beyond its host.
 
-With **Issues** on, an open issue with the project's label is handed to the supervisor as an
-objective only when the label was last added by someone allowed to triage issues (on GitHub, a
-collaborator whose role is triage, write, maintain or admin, and not a bot or app; on GitLab, a
-project member from Reporter up), and its title and text did not change after that (on GitHub, no
-title change and no body edit after the label event; on GitLab, no edit of the title or
-description after it). Its title and text go to the supervisor as written, fenced and marked as
-the issue's. What a labeled issue asks the pod to do is up to the people you let label issues,
-and is not a vulnerability in Matriarch.
+Not vulnerabilities in Matriarch:
+
+- what a labeled issue asks the pod to do, when the label rule held: that is up to the people you
+  let label issues;
+- a supervisor going over its worker limits: they keep cost and disk in hand and are not a
+  security boundary (the refusal before a start works only for Claude Code in a terminal);
+- what the advisor advises: it only reads, and the supervisor weighs its answer.
 
 ## Reporting a vulnerability
 
