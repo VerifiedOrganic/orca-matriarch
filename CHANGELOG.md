@@ -33,3 +33,19 @@ The first release.
 - **Cleanup:** a merged PR's worktree is removed once nothing runs there and nothing is
   uncommitted, and a worktree the supervisor's workers finished in that never became a PR (a
   review gate, say) an hour after, when nothing in it is uncommitted or unpushed.
+- An **advisor** the supervisor can ask for a second opinion, on its own agent, model and
+  thinking level (Claude on Fable 5.2, say). It answers one question at a time, read-only, in a
+  throwaway worktree, and only sees what the supervisor sends it.
+- **Stacked PRs** merge in order: a PR on another PR's branch waits until that one merges, is
+  moved onto its base if the forge did not move it, and is rebased off the merged commits first.
+- A check that failed on the **infrastructure** (a lost runner, the network, a rate limit) is
+  run again once before a worker is asked to fix it.
+- **Lighter review** for a PR that changes only docs: one reviewer, or none if you choose.
+- **What Matriarch did:** each PR's log of the lanes it entered and why, and every message,
+  review, update and merge, from a timeline row or a card.
+- **Away alerts:** what needs you, what is ready and what merged, on Slack, Discord, ntfy or any
+  webhook. The URL is kept in Orca's encrypted secrets.
+- **Limits** on live workers and daily worker starts per project, and a disk floor, held in the
+  supervisor's brief and, for a Claude Code supervisor, by refusing the start.
+- **Issues as objectives,** off by default: label an issue and the supervisor takes it up, with
+  the PR closing it.
