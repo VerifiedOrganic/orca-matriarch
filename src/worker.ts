@@ -6,7 +6,7 @@ import type { JsonValue } from 'orca/host'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { AGENT_CATALOG, agentOptions, MODEL_LISTERS, parseModelList, type LiveModel } from './agents.ts'
 import { readModelCatalog, readOrcaProfile } from './orca-profile.ts'
-import { createAdvisor, type Advisor } from './advisor.ts'
+import { createAdvisor, GONE_TERMINAL, type Advisor } from './advisor.ts'
 import { advisorUsable, CONFIG_OFF_PATH, CONFIG_PATH, defaultConfig, forgeSettingOf, parseConfig, validateConfig, type ForgeSetting, type MatriarchConfig } from './config.ts'
 import { createCrew, launchedTerminal, type Crew } from './crew.ts'
 import { branchName, tick, type ActivityInfo, type EngineDeps, type RepoInfo, type Workspace } from './engine.ts'
@@ -38,6 +38,46 @@ export interface WorkerOptions {
 // The read-only guard lives in guard.ts; re-exported for the tests and callers that used it here.
 export { reviewGuard } from './guard.ts'
 import { reviewGuard, type Guard } from './guard.ts'
+
+/**
+ * Matriarch's mailbox in each project: a terminal of its own in the main checkout, which Orca
+ * accepts as the sender of orchestration mail. It runs `cat > /dev/null`, so anything Orca types
+ * into it (a reply) is swallowed, never run by a shell. Reused while it lives; once Orca says it
+ * is gone (closed, or lost in a restart), `forget` drops it and the next one asked for is new.
+ */
+export function createMailboxes(cli: OrcaCli, store: { get(key: string): Promise<unknown>; set(key: string, value: JsonValue): Promise<void> }) {
+  const mailboxes = new Map<string, Promise<string | null>>()
+  const known = new Map<string, string>()
+  return {
+    get(repo: string, root: string): Promise<string | null> {
+      const cached = mailboxes.get(repo)
+      if (cached) return cached
+      const made = (async () => {
+        const saved = await store.get(`mailbox:${repo}`)
+        if (typeof saved === 'string' && saved && (await cli.run(['terminal', 'show', '--terminal', saved]).then(() => true, () => false))) return saved
+        const handle = createdTerminal(
+          await cli.run(['terminal', 'create', '--worktree', `path:${root}`, '--title', 'Matriarch mailbox', '--command', 'cat > /dev/null']).catch(() => null)
+        )
+        if (handle) await store.set(`mailbox:${repo}`, handle)
+        return handle
+      })()
+      mailboxes.set(repo, made)
+      // A failed mailbox is looked up again next time.
+      void made.then((h) => {
+        if (!h) mailboxes.delete(repo)
+        else known.set(repo, h)
+      })
+      return made
+    },
+    /** Orca says this mailbox is gone. Only the handle still in use is dropped. */
+    forget(repo: string, handle: string): void {
+      if (known.get(repo) !== handle) return
+      mailboxes.delete(repo)
+      known.delete(repo)
+      void store.set(`mailbox:${repo}`, null).catch(() => {})
+    }
+  }
+}
 
 /** Both read-only guards as one: review rounds' worktrees and the advisor's. */
 export function joinGuards(a: Guard, b: Guard): Guard {
@@ -288,6 +328,7 @@ export function createWorker(options: WorkerOptions = {}) {
         readFile: readIfThere,
         workspaceIdFor,
         mailbox: (repo, root) => mailboxFor(repo, root),
+        mailboxGone: (repo, handle) => mailboxes.forget(repo, handle),
         alert: async (repo, message) => {
           await orca.host.call('notifications.show', { title: `Matriarch: ${repo} needs you`, body: message }).catch(() => {})
           void runTick()
@@ -340,29 +381,9 @@ export function createWorker(options: WorkerOptions = {}) {
     orca.events.on('workspace.created', resetRepos)
     orca.events.on('workspace.removed', resetRepos)
 
-    /**
-     * Matriarch's mailbox in a project: a terminal of its own in the main checkout, which Orca
-     * accepts as the sender of orchestration mail. It runs `cat > /dev/null`, so anything Orca
-     * types into it (a reply) is swallowed, never run by a shell. Reused while it lives.
-     */
-    const mailboxes = new Map<string, Promise<string | null>>()
-    const mailboxFor = (repo: string, root: string): Promise<string | null> => {
-      const known = mailboxes.get(repo)
-      if (known) return known
-      const made = (async () => {
-        const saved = await orca.storage.get(`mailbox:${repo}`)
-        if (typeof saved === 'string' && (await cli.run(['terminal', 'show', '--terminal', saved]).then(() => true, () => false))) return saved
-        const handle = createdTerminal(
-          await cli.run(['terminal', 'create', '--worktree', `path:${root}`, '--title', 'Matriarch mailbox', '--command', 'cat > /dev/null']).catch(() => null)
-        )
-        if (handle) await orca.storage.set(`mailbox:${repo}`, handle)
-        return handle
-      })()
-      mailboxes.set(repo, made)
-      // A failed or closed mailbox is looked up again next time.
-      void made.then((h) => { if (!h) mailboxes.delete(repo) })
-      return made
-    }
+    // Matriarch's mailbox in each project (see createMailboxes).
+    const mailboxes = createMailboxes(cli, orca.storage)
+    const mailboxFor = (repo: string, root: string): Promise<string | null> => mailboxes.get(repo, root)
 
     const deps: EngineDeps = {
       now,
@@ -435,6 +456,7 @@ export function createWorker(options: WorkerOptions = {}) {
         crew,
         forges: { github: githubForge, gitlab: gitlabForge },
         mailbox: (ctx) => mailboxFor(ctx.pr.repo, ctx.root),
+        mailboxGone: (ctx, handle) => mailboxes.forget(ctx.pr.repo, handle),
         notify: async (title, body) => {
           await orca.host.call('notifications.show', { title, body })
         }
@@ -773,8 +795,11 @@ export function createWorker(options: WorkerOptions = {}) {
       const run = board.repos.find((r) => r.repo === repo)?.supervisor.run
       if (run && JSON.stringify(before?.config.workers ?? null) !== JSON.stringify(checked.config.workers)) {
         const m = workerSettingsMessage(checked.config)
-        await sendMessage(cli, { to: run, subject: m.subject, body: m.body, from: await mailboxFor(repo, root) })
-          .catch((error: Error) => orca.log(`${repo}: could not tell the supervisor about the new worker settings: ${error.message}`))
+        const from = await mailboxFor(repo, root)
+        await sendMessage(cli, { to: run, subject: m.subject, body: m.body, from }).catch((error: Error) => {
+          if (from && error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)) mailboxes.forget(repo, from)
+          orca.log(`${repo}: could not tell the supervisor about the new worker settings: ${error.message}`)
+        })
       }
       // The forge setting decides which forge the project is read from: look it up again.
       repoOf = createRepoResolver(exec)

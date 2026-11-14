@@ -77,7 +77,7 @@ export interface EngineDeps {
   /** Runs AI review rounds; null where there is no crew (tests of other parts). */
   crew?: Crew | null
   /** Answers the supervisor's questions for a second opinion; absent where there is none. */
-  advisor?: Pick<Advisor, 'step'> | null
+  advisor?: (Pick<Advisor, 'step'> & Partial<Pick<Advisor, 'stop'>>) | null
   /**
    * Removes a merged PR's worktree when it is safe: answers why not (uncommitted changes, Orca
    * refused) otherwise. Absent where nothing is removed (tests of other parts).
@@ -330,7 +330,15 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     } catch (error) {
       cfg = { config: defaultConfig(), errors: [`Could not read config: ${(error as Error).message}`], warnings: [] }
     }
-    if (!cfg) continue
+    if (!cfg) {
+      // Matriarch is off here: an advisor still answering for it stops, and its worktree goes.
+      if (deps.advisor?.stop) {
+        await deps.advisor
+          .stop({ repo: repoKey, root: info.root, supervisor: () => deps.supervisor(repoKey), acting: opts.autopilot && deps.executor !== null })
+          .catch((error: Error) => deps.log(`${repoKey}: could not stop the advisor: ${error.message}`))
+      }
+      continue
+    }
     const config = cfg.config
     const kind = forgeKind(info.ref)
     const terms = forgeTerms(kind)

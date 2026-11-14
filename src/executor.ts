@@ -8,7 +8,7 @@ import { forgeKind, forgeTerms, type ForgeActions, type ForgeKind, type Outcome,
 import { createGitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
 import { ciFailureMessage, commentsMessage, draftMessage, escalationMessage, rebaseMessage, updateMessage } from './messages.ts'
-import { sendMessage, type OrcaCli } from './orca-cli.ts'
+import { OrcaRefusal, sendMessage, type OrcaCli } from './orca-cli.ts'
 import type { Action } from './plan.ts'
 import { findingsMessage, githubReview } from './review.ts'
 
@@ -69,7 +69,12 @@ export interface ExecutorDeps {
    * sender it cannot place in a terminal (no_active_sender_terminal), and a plugin has none.
    */
   mailbox?: (ctx: ActionContext) => Promise<string | null>
+  /** Orca says the mailbox mail went from is gone: the next one asked for is made anew. */
+  mailboxGone?: (ctx: ActionContext, handle: string) => void
 }
+
+/** Orca's answers for a terminal that is gone. */
+const GONE = new Set(['terminal_handle_stale', 'terminal_not_found'])
 
 export function createExecutor(deps: ExecutorDeps): Executor {
   // Each forge acts through its own CLI; the worker passes the same clients it reads with.
@@ -101,6 +106,8 @@ export function createExecutor(deps: ExecutorDeps): Executor {
       return { ok: true }
     } catch (error) {
       const message = (error as Error).message
+      // Mail from a closed mailbox: a new one is made for the next try.
+      if (from && error instanceof OrcaRefusal && GONE.has(error.code)) deps.mailboxGone?.(ctx, from)
       if (to.startsWith('dispatch:') && ctx.supervisor && COORDINATOR_ONLY.test(message)) {
         try {
           return await viaSupervisor()
