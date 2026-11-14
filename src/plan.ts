@@ -3,7 +3,7 @@
 // Every tick re-plans from current facts, so a message held back while a worker was busy goes
 // out once it is free, and nothing is sent twice for the same commit. It reads GitHub and GitLab
 // alike; only the words and commands in its reasons come from the PR's forge.
-import type { MatriarchConfig, ReviewerSpec } from './config.ts'
+import { ALWAYS_FULL_REVIEW, type MatriarchConfig, type ReviewerSpec } from './config.ts'
 import { forgeTerms } from './forge.ts'
 import { actionableThreads, type CheckInfo, type PrSnapshot, type ThreadInfo } from './github.ts'
 import { everyPathMatches, matchingGlobs } from './glob.ts'
@@ -106,12 +106,15 @@ export function selectReviewers(config: MatriarchConfig, authorAgent: string | n
 }
 
 /**
- * Whether the PR is a light change (`review.light`): every changed file matches its paths, and the
- * forge listed them all. Answers the globs that matched, to say why, or null.
+ * Whether the PR is a light change (`review.light`): every changed file matches its paths, none is
+ * an agent's instructions or a tool's config (ALWAYS_FULL_REVIEW), none was renamed or copied
+ * (its old path is not known), and the forge listed them all and said which moved. Answers the
+ * globs that matched, to say why, or null. Anything the forge cannot say counts against it.
  */
 export function lightChange(config: MatriarchConfig, pr: PrSnapshot): string[] | null {
   const { paths } = config.review.light
-  if (pr.filesTruncated || !everyPathMatches(paths, pr.files)) return null
+  if (pr.filesTruncated || !Array.isArray(pr.renamed) || pr.renamed.length > 0) return null
+  if (!everyPathMatches(paths, pr.files) || matchingGlobs(ALWAYS_FULL_REVIEW, pr.files).length > 0) return null
   return matchingGlobs(paths, pr.files)
 }
 
@@ -331,10 +334,14 @@ function reviewStep(input: PlanInput): { plan: Plan | null; pre: Action[]; note?
   const { pr, owner, ledger, config } = input
   const sha = pr.headSha
   if (!config.review.enabled || config.reviewers.length === 0) return { plan: null, pre: [] }
-  // A light change (only docs, say) gets one reviewer, or none: then it passes the review as is.
-  const light = lightChange(config, pr)
-  if (light && config.review.light.crew === 'none') return { plan: null, pre: [], note: `AI review skipped: a light change (only ${light.join(', ')})` }
   const rec = ledger.reviews[sha]
+  // A light change (only docs, say) gets one reviewer, or none: then it passes the review as is,
+  // unless a round already ran on this commit (started by hand, or before the setting) and still
+  // decides: one running, or one that asked for changes.
+  const light = lightChange(config, pr)
+  if (light && config.review.light.crew === 'none' && (!rec || rec.status === 'failed')) {
+    return { plan: null, pre: [], note: `AI review skipped: a light change (only ${light.join(', ')})` }
+  }
   if (!rec) {
     const used = roundsUsed(ledger, 'reviews')
     if (used >= config.review.maxRounds) {
@@ -389,7 +396,7 @@ function mergeGate(input: PlanInput): Plan {
   if (merge.requireHuman.length > 0) {
     const hits = matchingGlobs(merge.requireHuman, pr.files)
     if (hits.length > 0 || pr.filesTruncated) {
-      const why = hits.length > 0 ? `touches protected paths (${hits.join(', ')})` : 'too many files to check protected paths'
+      const why = hits.length > 0 ? `touches protected paths (${hits.join(', ')})` : `${forgeTerms(pr.forge).name} did not list every changed file, so protected paths cannot be checked`
       return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `protected:${sha}`, `${pr.repo} #${pr.number} needs a human merge`, why) }
     }
   }

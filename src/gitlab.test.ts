@@ -125,6 +125,8 @@ describe('reading GitLab merge requests', () => {
     assert.deepEqual([p.mergeable, p.mergeState, p.reviewDecision], ['MERGEABLE', 'BLOCKED', 'CHANGES_REQUESTED'])
     assert.deepEqual(p.files, ['network/gitlab.go', 'go.sum'])
     assert.equal(p.filesTruncated, false)
+    // GitLab's diff stats do not say which files were renamed.
+    assert.equal(p.renamed, null)
     // Resolvable threads only; the viewer's own and Matriarch's are ours; a reviewer's request is feedback.
     assert.equal(p.threads.length, 6)
     const diff = p.threads[0]
@@ -140,6 +142,14 @@ describe('reading GitLab merge requests', () => {
     }).project.mergeRequest
     const p = normalizeMr(raw, KEY, HOST, 'me', 0)!
     assert.deepEqual([p.filesTruncated, p.threadsTruncated, p.checksTruncated, p.ci], [true, true, true, 'failing'])
+  })
+
+  test('no file count means the file list may be cut short', () => {
+    const raw = detailData({ diffStatsSummary: null }).project.mergeRequest
+    const p = normalizeMr(raw, KEY, HOST, 'me', 0)!
+    assert.equal(p.filesTruncated, true)
+    const noSummary = detailData({ diffStatsSummary: { fileCount: null } }).project.mergeRequest
+    assert.equal(normalizeMr(noSummary, KEY, HOST, 'me', 0)!.filesTruncated, true)
   })
 
   test('the list: one GraphQL read on the right host, the default branch read by its name', async () => {

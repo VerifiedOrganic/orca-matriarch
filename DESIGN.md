@@ -70,7 +70,11 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
               "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github", // "github": on the PR, GitLab too
               "followUp": "focused", "fallback": null,
               // A PR changing only these files gets "one" reviewer (the first must-approve one) or "none".
-              "light": { "paths": ["**/*.md", "**/*.mdx", "**/*.txt", "docs/**"], "crew": "one" } },
+              // Never for agents' instructions and tools' config (ALWAYS_FULL_REVIEW in config.ts:
+              // AGENTS.md, CLAUDE.md, SKILL.md, .github/**, .claude/** …), renamed or copied files,
+              // a cut-short file list, or GitLab, whose file list does not say what was renamed. A
+              // round already on the commit (running, or asking for changes) still decides.
+              "light": { "paths": ["**/*.md", "**/*.rst", "**/*.adoc"], "crew": "one" } },
   "fix": { "ci": { "enabled": true, "maxRounds": 3 }, "comments": { "enabled": true, "maxRounds": 3 },
            "conflicts": { "enabled": true, "maxRounds": 2 } },
   "merge": { "mode": "manual", "method": "squash", "requireHuman": [], "updateBranch": "rebase",

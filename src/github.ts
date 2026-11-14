@@ -85,6 +85,11 @@ export interface PrSnapshot {
   threadsTruncated: boolean
   files: string[]
   filesTruncated: boolean
+  /**
+   * Files the PR renames or copies (their new paths). Null when the forge's answer cannot say,
+   * so nothing that depends on it (a light review) is assumed.
+   */
+  renamed?: string[] | null
   updatedAt: string
   /** When this detail was read (ms). */
   fetchedAt: number
@@ -109,7 +114,7 @@ export const DETAIL_QUERY = `query($owner: String!, $name: String!, $number: Int
     pullRequest(number: $number) {
       number url title body state isDraft headRefName headRefOid baseRefName
       mergeable mergeStateStatus reviewDecision updatedAt author { login }
-      files(first: 100) { pageInfo { hasNextPage } nodes { path } }
+      files(first: 100) { pageInfo { hasNextPage } nodes { path changeType } }
       latestReviews(first: 20) { nodes { id state body url author { login __typename } } }
       commits(last: 1) { nodes { commit { oid statusCheckRollup { state
         contexts(first: 100) { pageInfo { hasNextPage } nodes {
@@ -256,6 +261,10 @@ export function normalizePr(raw: unknown, repo: string, fetchedAt: number): PrSn
     threadsTruncated: hasNext(pr.reviewThreads),
     files: nodes(pr.files).map((f) => str(f.path) ?? '').filter(Boolean),
     filesTruncated: hasNext(pr.files),
+    // GitHub says how each file changed, not where a renamed one came from.
+    renamed: nodes(pr.files).every((f) => str(f.changeType) !== null)
+      ? nodes(pr.files).filter((f) => f.changeType === 'RENAMED' || f.changeType === 'COPIED').map((f) => str(f.path) ?? '')
+      : null,
     updatedAt: str(pr.updatedAt) ?? '',
     fetchedAt
   }
