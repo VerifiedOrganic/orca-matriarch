@@ -67,6 +67,8 @@ export interface ForgeReader {
   failureDetails?(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
   /** Open issues with this label, oldest first (up to 50); absent where a forge cannot say. */
   labeledIssues?(repo: RepoRef, label: string): Promise<IssueInfo[]>
+  /** Whether branch `ref` has commit `sha`; null when the forge cannot say. */
+  isAncestor?(repo: RepoRef, sha: string, ref: string): Promise<boolean | null>
 }
 
 /** One AI review as it goes on the PR: a summary, and the findings anchored to lines. */
@@ -89,8 +91,8 @@ export interface ForgeActions {
   failedLogs(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
   /** Points a PR at another base branch: a stacked PR, once the PR it was stacked on merged. */
   retarget(repo: RepoRef, pr: PrSnapshot, base: string): Promise<Outcome>
-  /** Runs one failed check's job again: a check that looked flaky. */
-  rerun(repo: RepoRef, check: CheckInfo): Promise<Outcome>
+  /** Runs failed checks' jobs again (checks that looked flaky); several only when they share a GitHub workflow run. */
+  rerun(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Outcome>
   /** Posts one comment on an issue as the signed-in person. */
   commentIssue?(repo: RepoRef, number: number, body: string): Promise<Outcome>
 }

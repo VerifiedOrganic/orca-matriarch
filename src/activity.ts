@@ -37,7 +37,7 @@ function done(action: Action, who: string, forge: ForgeKind): string {
     case 'send-restack':
       return `Asked ${who} to rebase off #${action.parent}'s commits onto ${action.base}, now that #${action.parent} merged`
     case 'rerun-check':
-      return `Re-ran ${action.check.name} once: ${action.why}`
+      return `Re-ran ${action.checks.map((c) => c.name).join(', ')} once: ${action.why}`
     default:
       // A kind this log has no words for yet still shows up, by its name.
       return (action as { kind: string }).kind

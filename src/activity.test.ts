@@ -68,8 +68,8 @@ describe('log lines', () => {
     assert.equal(logEntry(retarget, { ok: true }, 5, 'gitlab', plannedAs(retarget, 'gitlab')).text, 'Moved the merge request from feat/a onto main: #11, which it was stacked on, merged')
     const restack: Action = { kind: 'send-restack', to: 'dispatch:d1', sha: SHA, parent: 11, parentSha: SHA, base: 'main' }
     assert.match(logEntry(restack, { ok: true, sent: { to: 'worker', subject: '#12: rebase off #11' } }, 5, 'github', plannedAs(restack)).text, /^Asked the worker to rebase off #11's commits onto main, now that #11 merged/)
-    const rerun: Action = { kind: 'rerun-check', sha: SHA, check: check('test', 'failure'), why: 'the runner lost connection' }
-    assert.equal(logEntry(rerun, { ok: true }, 5, 'github', plannedAs(rerun)).text, 'Re-ran test once: the runner lost connection')
+    const rerun: Action = { kind: 'rerun-check', sha: SHA, checks: [check('test', 'failure'), check('lint', 'failure')], why: 'the runner lost connection' }
+    assert.equal(logEntry(rerun, { ok: true }, 5, 'github', plannedAs(rerun)).text, 'Re-ran test, lint once: the runner lost connection')
   })
 
   test('a new commit and a finished review read as what came in', () => {

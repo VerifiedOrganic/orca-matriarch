@@ -146,7 +146,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
         case 'retarget':
           return forgeOf(repo).retarget(repo, pr, action.base)
         case 'rerun-check':
-          return forgeOf(repo).rerun(repo, action.check)
+          return forgeOf(repo).rerun(repo, action.checks)
         case 'send-restack': {
           const m = restackMessage(pr, action.parent, action.parentSha, action.base)
           return send(ctx, action.to, m.subject, m.body)
