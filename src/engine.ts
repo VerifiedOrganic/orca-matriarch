@@ -3,14 +3,15 @@
 // and answer the board. Every dependency is injected, so a tick runs in tests without Orca, git,
 // GitHub or GitLab.
 import type { JsonValue } from 'orca/host'
-import { defaultConfig, type ConfigResult } from './config.ts'
+import { defaultConfig, type ConfigResult, type MatriarchConfig } from './config.ts'
 import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
 import type { Executor } from './executor.ts'
+import { flakyReason } from './flaky.ts'
 import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
-import { ledgerKey, loadLedger, record, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
+import { checkKey, ledgerKey, loadLedger, record, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
 import { MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
@@ -169,6 +170,8 @@ export function describe(action: Action, forge: ForgeKind = 'github'): string {
       return `move the base from ${action.from} to ${action.base}: #${action.parent}, which it was stacked on, merged`
     case 'send-restack':
       return `ask the worker to rebase onto ${action.base}, off the commits of #${action.parent}, which merged`
+    case 'rerun-check':
+      return `re-run ${action.check.name} once: ${action.why}`
   }
 }
 
@@ -198,6 +201,8 @@ function markFor(action: Action, at: number, forge: ForgeKind = 'github'): Mark 
       return { at, kind: 'update-branch', label: `base moved to ${action.base} (#${action.parent} merged)` }
     case 'send-restack':
       return { at, kind: 'rebase-sent', label: `rebase off #${action.parent} requested` }
+    case 'rerun-check':
+      return { at, kind: 'ci-rerun', label: `${action.check.name} re-run: ${action.why}` }
   }
 }
 
@@ -289,6 +294,24 @@ async function followStack(
   const final = kept && kept.state !== 'OPEN' ? kept : reader ? (await reader.detail(repo.ref, st.number).catch(() => ({ pr: null }))).pr : null
   if (!final || final.state === 'OPEN') return st
   return { ...st, headSha: final.headSha || st.headSha, baseRef: final.baseRef || st.baseRef, state: final.state, ...(final.state === 'MERGED' ? { headAtMerge: snap.headSha } : {}) }
+}
+
+/**
+ * Failed checks on a PR's head, read once per commit and check to tell a flaky failure from a
+ * real one (flaky.ts), so the planner can re-run a flaky one before a worker spends a round on it.
+ * Only before the failure went to the worker, and once every check finished.
+ */
+async function judgeFailures(deps: EngineDeps, repo: RepoInfo, snap: PrSnapshot, ledger: PrLedger, config: MatriarchConfig): Promise<PrLedger> {
+  const sha = snap.headSha
+  if (!config.fix.ci.rerunFlaky || snap.ci !== 'failing' || ledger.ci[sha] || snap.checks.some((c) => c.state === 'pending')) return ledger
+  const todo = snap.checks.filter((c) => c.state === 'failure' && c.jobId !== null && ledger.flaky?.[checkKey(sha, c.name)] === undefined && !ledger.reruns?.[checkKey(sha, c.name)])
+  const reader = readerFor(deps, repo.ref)
+  if (todo.length === 0 || !reader?.failureDetails) return ledger
+  const details = await reader.failureDetails(repo.ref, todo).catch(() => null)
+  if (!details) return ledger
+  // A check the forge said nothing about (past the first few, or no log) counts as a real failure.
+  const judged = todo.map((c) => [checkKey(sha, c.name), flakyReason(details[c.name] ?? '')] as const)
+  return { ...ledger, flaky: Object.fromEntries([...Object.entries(ledger.flaky ?? {}), ...judged].slice(-40)) }
 }
 
 function toNumbers(v: unknown): number[] {
@@ -674,6 +697,13 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       const ws = item.ws
       const worker = ws ? byWorktree.get(ws) : undefined
       const owner = ws ? ownerFor(ws, worker, deps.activity(ws.id, ws.path)) : null
+      if (snap.state === 'OPEN') {
+        const judged = await judgeFailures(deps, info, snap, item.ledger, config)
+        if (judged !== item.ledger) {
+          item.ledger = judged
+          await deps.store.set(ledgerKey(repoKey, snap.number), judged as unknown as JsonValue)
+        }
+      }
       if (snap.state === 'OPEN' && listed) {
         const st = await followStack(deps, info, snap, item.ledger, openStack, closedSnaps, base?.name ?? null)
         if (JSON.stringify(st ?? null) !== JSON.stringify(item.ledger.stack ?? null)) {

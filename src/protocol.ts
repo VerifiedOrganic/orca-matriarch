@@ -18,6 +18,7 @@ export interface Segment {
 export type MarkKind =
   | 'push'
   | 'ci-sent'
+  | 'ci-rerun'
   | 'rebase-sent'
   | 'comments-sent'
   | 'review-start'

@@ -318,11 +318,14 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
     return [
       on.length ? `Rounds: ${on.join(', ')}` : 'No automatic fixes',
       on.length && off.length ? `${off.join(' and ')} off` : null,
+      d.fix.ci.rerunFlaky ? null : 'no re-runs',
       d.escalation.supervisorFirst ? `tells you after ${d.escalation.humanAfterMinutes} min` : 'problems go straight to you'
     ].filter(Boolean).join(' · ')
   },
     intro('Fixes go to the worker that owns the branch, or to the supervisor once that worker has finished. After the last round, it escalates.'),
-    fixRow('ci'), fixRow('comments'), fixRow('conflicts'),
+    fixRow('ci'),
+    row('Re-run flaky checks once', 'A check that failed on a lost runner, the network or a rate limit runs again before it goes to the worker.', toggle(d.fix.ci.rerunFlaky, (on) => (d.fix.ci.rerunFlaky = on))),
+    fixRow('comments'), fixRow('conflicts'),
     el('div', { class: 'group-sub' }, 'Escalation'),
     row('Supervisor first', 'Send problems to the supervisor before you.', toggle(d.escalation.supervisorFirst, (on) => (d.escalation.supervisorFirst = on))),
     dependent(

@@ -65,6 +65,14 @@ export interface FixPolicy {
   maxRounds: number
 }
 
+export interface CiFixPolicy extends FixPolicy {
+  /**
+   * A check that failed on the infrastructure (a lost runner, the network, a rate limit; see
+   * flaky.ts) is re-run once on that commit before it goes to the worker.
+   */
+  rerunFlaky: boolean
+}
+
 export interface MatriarchConfig {
   version: 1
   /** Set only to override what the origin says; see ForgeSetting. */
@@ -89,7 +97,7 @@ export interface MatriarchConfig {
     /** When a reviewer's account hits its usage limit, it is started again on this instead. */
     fallback: RoleSpec | null
   }
-  fix: { ci: FixPolicy; comments: FixPolicy; conflicts: FixPolicy }
+  fix: { ci: CiFixPolicy; comments: FixPolicy; conflicts: FixPolicy }
   merge: {
     mode: 'manual' | 'auto'
     method: 'squash' | 'merge' | 'rebase'
@@ -136,7 +144,7 @@ export function defaultConfig(): MatriarchConfig {
       fallback: null
     },
     fix: {
-      ci: { enabled: true, maxRounds: 3 },
+      ci: { enabled: true, maxRounds: 3, rerunFlaky: true },
       comments: { enabled: true, maxRounds: 3 },
       conflicts: { enabled: true, maxRounds: 2 }
     },
@@ -405,13 +413,18 @@ export function validateConfig(raw: unknown): ConfigResult {
   if (fx) r.unknownKeys(fx, ['ci', 'comments', 'conflicts'], 'fix')
   const fixPolicy = (key: 'ci' | 'comments' | 'conflicts'): FixPolicy => {
     const o = fx ? r.section(fx, key, 'fix') : undefined
-    if (o) r.unknownKeys(o, ['enabled', 'maxRounds'], `fix.${key}`)
+    if (o) r.unknownKeys(o, key === 'ci' ? ['enabled', 'maxRounds', 'rerunFlaky'] : ['enabled', 'maxRounds'], `fix.${key}`)
     return {
       enabled: r.bool(o, 'enabled', d.fix[key].enabled, `fix.${key}`),
       maxRounds: r.int(o, 'maxRounds', d.fix[key].maxRounds, `fix.${key}`, 1, 10)
     }
   }
-  const fix = { ci: fixPolicy('ci'), comments: fixPolicy('comments'), conflicts: fixPolicy('conflicts') }
+  const ciSection = fx ? r.section(fx, 'ci', 'fix') : undefined
+  const fix = {
+    ci: { ...fixPolicy('ci'), rerunFlaky: r.bool(ciSection, 'rerunFlaky', d.fix.ci.rerunFlaky, 'fix.ci') },
+    comments: fixPolicy('comments'),
+    conflicts: fixPolicy('conflicts')
+  }
 
   const mg = r.section(raw, 'merge', 'config')
   if (mg) r.unknownKeys(mg, Object.keys(d.merge), 'merge')

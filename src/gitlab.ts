@@ -447,6 +447,28 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     // Asynchronous, like gh pr update-branch: GitLab answers at once and rebases in the background.
     updateBranch: (repo, pr) => act(repo, 'rebase', ['-X', 'PUT', rest(projectPath(repo), `merge_requests/${pr.number}/rebase`)]),
     retarget: (repo, pr, base) => act(repo, 'update', ['-X', 'PUT', rest(projectPath(repo), `merge_requests/${pr.number}`), '-f', `target_branch=${base}`]),
+    // In the project the job ran in: a fork's pipeline runs in the fork.
+    rerun: (repo, check) =>
+      check.jobId === null
+        ? Promise.resolve({ ok: false, error: `${check.name} is not a job GitLab can retry` })
+        : act(repo, 'retry', ['-X', 'POST', rest(jobProject(check.url) ?? projectPath(repo), `jobs/${check.jobId}/retry`)]),
+    async failureDetails(repo, checks) {
+      const details: Record<string, string> = {}
+      for (const { name, jobId, url } of checks.slice(0, 5)) {
+        if (jobId === null) continue
+        const project = jobProject(url) ?? projectPath(repo)
+        // GitLab says itself when a job failed around its script (a runner or the scheduler failing).
+        const [job, trace] = await Promise.all([glab(repo, [rest(project, `jobs/${jobId}`)]), glab(repo, [rest(project, `jobs/${jobId}/trace`)], { timeoutMs: 60_000 })])
+        let reason: string | null = null
+        try {
+          reason = job.code === 0 ? str(obj(JSON.parse(job.stdout)).failure_reason) : null
+        } catch {
+          reason = null
+        }
+        details[name] = [reason ? `failure_reason: ${reason}` : '', trace.code === 0 && trace.stdout ? traceTail(trace.stdout) : ''].filter(Boolean).join('\n')
+      }
+      return details
+    },
     publishReview: (repo, pr, _sha, review) =>
       act(repo, 'notes', ['-X', 'POST', rest(projectPath(repo), `merge_requests/${pr.number}/notes`), '-f', `body=${reviewNote(review)}`]),
     async failedLogs(repo, checks) {

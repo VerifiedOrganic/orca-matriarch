@@ -66,7 +66,14 @@ export interface PrLedger {
   retargets?: Record<string, { at: number; base: string }>
   /** Requests to rebase off a merged parent's commits, by the parent's number, with the head they were sent for. */
   restacks?: Record<string, { at: number; sha: string }>
+  /** Failed checks read for a flaky cause, by `<sha>:<check>`: why it looks flaky, or null when it looks real. */
+  flaky?: Record<string, string | null>
+  /** Checks re-run once because they looked flaky, by `<sha>:<check>`. */
+  reruns?: Record<string, { at: number; why: string }>
 }
+
+/** How a check on a commit is named in the ledger's flaky and reruns records. */
+export const checkKey = (sha: string, check: string): string => `${sha}:${check}`
 
 export const ledgerKey = (repo: string, number: number): string => `pr:${repo}#${number}`
 
@@ -97,7 +104,9 @@ export function loadLedger(raw: unknown): PrLedger {
     ...(typeof rec(r.builder).address === 'string' ? { builder: { address: rec(r.builder).address as string, done: rec(r.builder).done === true } } : {}),
     ...(stackOf(r.stack) ? { stack: stackOf(r.stack)! } : {}),
     ...(Object.keys(rec(r.retargets)).length ? { retargets: { ...rec(r.retargets) } } : {}),
-    ...(Object.keys(rec(r.restacks)).length ? { restacks: { ...rec(r.restacks) } } : {})
+    ...(Object.keys(rec(r.restacks)).length ? { restacks: { ...rec(r.restacks) } } : {}),
+    ...(Object.keys(rec(r.flaky)).length ? { flaky: { ...rec(r.flaky) } } : {}),
+    ...(Object.keys(rec(r.reruns)).length ? { reruns: { ...rec(r.reruns) } } : {})
   }
 }
 
@@ -163,6 +172,10 @@ export function record(ledger: PrLedger, action: Action, now: number): PrLedger 
       break
     case 'send-restack':
       next.restacks = { ...next.restacks, [action.parent]: { at: now, sha: action.sha } }
+      break
+    case 'rerun-check':
+      // Only the last few commits' re-runs matter: the oldest go first.
+      next.reruns = Object.fromEntries([...Object.entries(next.reruns ?? {}), [checkKey(action.sha, action.check.name), { at: now, why: action.why }]].slice(-40))
       break
   }
   return next

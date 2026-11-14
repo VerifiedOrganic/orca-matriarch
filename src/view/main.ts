@@ -23,6 +23,7 @@ const STRIP: Group[] = ['blocked', 'fixing', 'review', 'active', 'waiting', 'rea
 const MARK_COLOR: Record<string, string> = {
   push: 'var(--m-active)',
   'ci-sent': 'var(--m-fixing)',
+  'ci-rerun': 'var(--m-waiting)',
   'rebase-sent': 'var(--m-fixing)',
   'comments-sent': 'var(--m-fixing)',
   'review-start': 'var(--m-review)',

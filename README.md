@@ -19,8 +19,9 @@ It starts in **dry run**: it watches and shows what it would do until you turn o
    plan, and once you agree it creates tasks and starts a worker for each, in its own worktree.
 2. **Build.** Workers push branches and open PRs.
 3. **CI, comments, conflicts.** A failing check, an unresolved review comment or a conflict goes
-   back to the worker that owns the branch, with the details. A branch that falls behind its base
-   is updated.
+   back to the worker that owns the branch, with the details. A check that failed on the
+   infrastructure (a lost runner, the network, a rate limit) is re-run once first. A branch that
+   falls behind its base is updated.
 4. **AI review.** When CI passes, a review crew reads the PR in a throwaway worktree: several
    reviewers, each on its own agent and model, each with its own focus. Their verdicts are combined
    by your rule (every must-approve reviewer approves, a majority, or no blockers). Findings go to
@@ -172,6 +173,8 @@ Supervisor and worker launches are not changed.
 | `gh api -X HEAD -i -H 'If-None-Match: …'` | each check: ask GitHub whether PRs, the default branch or followed checks changed (free when nothing did) |
 | `gh api graphql` | read open PRs, CI checks and review threads, when something changed |
 | `gh api repos/<repo>/actions/jobs/<id>/logs` | autopilot: the tail of a failed job's log, for the worker |
+| `gh api repos/<repo>/check-runs/<id>/annotations`, `…/actions/jobs/<id>/logs` | once per failed check and commit: whether it failed on the infrastructure rather than the code |
+| `gh api -X POST repos/<repo>/actions/jobs/<id>/rerun` | autopilot: re-run, once, a job that failed on the infrastructure |
 | `orca agent launch --surface chat …` | **Open supervisor chat**: the supervisor, on your model, with its brief |
 | `orca terminal create` | once per project: a terminal titled "Matriarch mailbox" (`cat > /dev/null`), which Orca requires as the sender of Matriarch's messages |
 | `orca orchestration worker-list`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
@@ -185,6 +188,8 @@ Supervisor and worker launches are not changed.
 | `glab api --hostname <host> graphql` | GitLab: each check, the open merge requests with their pipeline status and the default branch's; a merge request's jobs, threads, files and approvals when it changed |
 | `glab api --hostname <host> projects/<project>/merge_requests/<n>` | GitLab: only while it has not worked out whether a merge request can merge, which this read asks it to |
 | `glab api --hostname <host> projects/<project>/jobs/<id>/trace` | GitLab, autopilot: the tail of a failed job's log, for the worker |
+| `glab api --hostname <host> projects/<project>/jobs/<id>`, `…/trace` | GitLab, once per failed job and commit: its failure reason and log, whether it failed on the infrastructure |
+| `glab api --hostname <host> -X POST …/jobs/<id>/retry` | GitLab, autopilot: retry, once, a job that failed on the infrastructure |
 | `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n> -f target_branch=<branch>` | GitLab, autopilot: move a stacked merge request to where its parent merged |

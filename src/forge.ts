@@ -48,6 +48,11 @@ export interface Outcome {
 export interface ForgeReader {
   listOpen(repo: RepoRef, options?: ListOptions): Promise<OpenList>
   detail(repo: RepoRef, number: number): Promise<{ pr: PrSnapshot | null; rate: RateInfo | null }>
+  /**
+   * What the forge kept of each failed check, by check name, to tell a flaky failure from a real
+   * one (flaky.ts): its log tail, and GitHub's annotations or GitLab's failure reason.
+   */
+  failureDetails?(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
 }
 
 /** One AI review as it goes on the PR: a summary, and the findings anchored to lines. */
@@ -70,6 +75,8 @@ export interface ForgeActions {
   failedLogs(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
   /** Points a PR at another base branch: a stacked PR, once the PR it was stacked on merged. */
   retarget(repo: RepoRef, pr: PrSnapshot, base: string): Promise<Outcome>
+  /** Runs one failed check's job again: a check that looked flaky. */
+  rerun(repo: RepoRef, check: CheckInfo): Promise<Outcome>
 }
 
 export interface Forge extends ForgeReader, ForgeActions {

@@ -66,7 +66,7 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
   "arbiter": null,
   "review": { "enabled": true, "trigger": "ci-green", "pass": "all-blocking-approve", "blockAt": "major",
               "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github" }, // "github": on the PR, GitLab too
-  "fix": { "ci": { "enabled": true, "maxRounds": 3 }, "comments": { "enabled": true, "maxRounds": 3 },
+  "fix": { "ci": { "enabled": true, "maxRounds": 3, "rerunFlaky": true }, "comments": { "enabled": true, "maxRounds": 3 },
            "conflicts": { "enabled": true, "maxRounds": 2 } },
   "merge": { "mode": "manual", "method": "squash", "requireHuman": [], "updateBranch": "rebase",
              "onBaseRed": "pause", "deleteBranch": true },
@@ -128,7 +128,9 @@ evaluates in this order:
 5. worker waiting for input → `needs-you`, escalated to the supervisor first
 6. stacked on a PR that merged, the branch not pushed since → its owner is asked once to rebase
    off the parent's commits (`git rebase --onto origin/<base> <parent head>`) → `fixing-conflict`
-7. CI failing (after every check finished) → `fixing-ci`
+7. CI failing (after every check finished) → a check whose log, annotations or GitLab failure
+   reason look like the infrastructure failing (`src/flaky.ts`) is re-run once on that commit,
+   when `fix.ci.rerunFlaky` is on (`awaiting-ci`); the rest, and a check failing again, → `fixing-ci`
 8. merge conflict → `fixing-conflict`
 9. unresolved human or bot review threads, or a human "changes requested" → `fixing-review`
 10. CI pending or cancelled → `awaiting-ci`

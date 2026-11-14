@@ -7,7 +7,7 @@ import type { MatriarchConfig, ReviewerSpec } from './config.ts'
 import { forgeTerms } from './forge.ts'
 import { actionableThreads, type CheckInfo, type PrSnapshot, type ThreadInfo } from './github.ts'
 import { matchingGlobs } from './glob.ts'
-import { roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
+import { checkKey, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
 
 export type Lane =
   | 'building' // a worktree whose agent is working, no PR yet
@@ -55,6 +55,8 @@ export type Action =
   | { kind: 'retarget'; sha: string; parent: number; from: string; base: string }
   /** Asks the branch's owner to rebase it off a merged parent's commits. */
   | { kind: 'send-restack'; to: string; sha: string; parent: number; parentSha: string; base: string }
+  /** Runs a failed check's job once more: it looked like the infrastructure failing (flaky.ts). */
+  | { kind: 'rerun-check'; sha: string; check: CheckInfo; why: string }
 
 export interface PlanInput {
   pr: PrSnapshot
@@ -279,10 +281,24 @@ export function plan(input: PlanInput): Plan {
 
   // 1. CI failing, once every check finished, so one message carries every failure.
   const pending = pr.checks.filter((c) => c.state === 'pending').length
+  const rerunning = rerunNote(input)
   if (pr.ci === 'failing') {
     const failing = pr.checks.filter((c) => c.state === 'failure')
     const names = failing.map((c) => c.name).join(', ')
-    if (pending > 0) return { lane: 'awaiting-ci', reason: `failing: ${names}; ${pending} check(s) still running`, actions: [] }
+    if (pending > 0) return { lane: 'awaiting-ci', reason: `failing: ${names}; ${rerunning ?? `${pending} check(s) still running`}`, actions: [] }
+    // A check that failed on the infrastructure (a lost runner, the network, a rate limit) runs
+    // once more before a worker spends a round on it; whatever still fails then goes to the worker.
+    if (config.fix.ci.rerunFlaky && !ledger.ci[sha]) {
+      const again: Action[] = failing.flatMap((c) => {
+        const key = checkKey(sha, c.name)
+        const why = ledger.flaky?.[key]
+        return why && c.jobId !== null && !ledger.reruns?.[key] ? [{ kind: 'rerun-check' as const, sha, check: c, why }] : []
+      })
+      if (again.length > 0) {
+        const what = again.map((a) => (a.kind === 'rerun-check' ? `${a.check.name} (${a.why})` : '')).join(', ')
+        return { lane: 'awaiting-ci', reason: `re-running ${what} once: it looks like the infrastructure failed, not the code`, actions: again }
+      }
+    }
     const signature = ciSignature(pr.checks)
     const sent = ledger.ci[sha]
     return fixStep(
@@ -330,7 +346,7 @@ export function plan(input: PlanInput): Plan {
       if (early.plan) return early.plan
     }
     return pr.ci === 'pending'
-      ? { lane: 'awaiting-ci', reason: `${pending} check(s) running on ${short(sha)}`, actions: [] }
+      ? { lane: 'awaiting-ci', reason: rerunning ?? `${pending} check(s) running on ${short(sha)}`, actions: [] }
       : { lane: 'awaiting-ci', reason: 'a check was cancelled; re-run it', actions: [] }
   }
 
@@ -339,6 +355,13 @@ export function plan(input: PlanInput): Plan {
   if (review.plan) return review.plan
   const gate = mergeGate(input)
   return review.pre.length > 0 ? { ...gate, actions: [...review.pre, ...gate.actions] } : gate
+}
+
+/** Checks running again because they looked flaky on this commit, as the board says it; null when none. */
+function rerunNote(input: PlanInput): string | null {
+  const { pr, ledger } = input
+  const again = pr.checks.filter((c) => c.state === 'pending' && ledger.reruns?.[checkKey(pr.headSha, c.name)])
+  return again.length ? `re-running ${again.map((c) => `${c.name} (${ledger.reruns![checkKey(pr.headSha, c.name)].why})`).join(', ')} once` : null
 }
 
 /** What the owner of a stacked PR runs once its parent merged: its own commits onto the new base. */

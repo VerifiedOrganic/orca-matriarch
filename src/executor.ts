@@ -143,6 +143,8 @@ export function createExecutor(deps: ExecutorDeps): Executor {
           return forgeOf(repo).merge(repo, pr, action.sha, action.method, config.merge.deleteBranch)
         case 'retarget':
           return forgeOf(repo).retarget(repo, pr, action.base)
+        case 'rerun-check':
+          return forgeOf(repo).rerun(repo, action.check)
         case 'send-restack': {
           const m = restackMessage(pr, action.parent, action.parentSha, action.base)
           return send(ctx, action.to, m.subject, m.body)

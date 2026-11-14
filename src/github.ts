@@ -511,6 +511,32 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
         ...(deleteBranch ? ['--delete-branch'] : [])
       ]),
     retarget: (repo, pr, base) => run(['pr', 'edit', String(pr.number), '--repo', repoArg(repo), '--base', base]),
+    // An Actions check run's id is its job's id: the job alone runs again, not its whole workflow.
+    rerun: (repo, check) =>
+      check.jobId === null ? Promise.resolve({ ok: false, error: `${check.name} is not a GitHub Actions job, so Matriarch cannot re-run it` }) : run(['api', '-X', 'POST', `repos/${repoArg(repo)}/actions/jobs/${check.jobId}/rerun`]),
+    async failureDetails(repo, checks) {
+      const details: Record<string, string> = {}
+      for (const { name, jobId } of checks.slice(0, 5)) {
+        if (jobId === null) continue
+        // A runner that went away often leaves no log, only an annotation on the check saying so.
+        const [notes, log] = await Promise.all([
+          exec(bin, ['api', `repos/${repoArg(repo)}/check-runs/${jobId}/annotations`], { timeoutMs: 30_000 }),
+          exec(bin, ['api', `repos/${repoArg(repo)}/actions/jobs/${jobId}/logs`], { timeoutMs: 60_000 })
+        ])
+        const lines: string[] = []
+        if (notes.code === 0) {
+          try {
+            const list: unknown = JSON.parse(notes.stdout)
+            for (const a of Array.isArray(list) ? list : []) if (typeof obj(a).message === 'string') lines.push(obj(a).message as string)
+          } catch {
+            // No annotations to read.
+          }
+        }
+        if (log.code === 0 && log.stdout) lines.push(tailLog(log.stdout))
+        details[name] = lines.join('\n')
+      }
+      return details
+    },
     async failedLogs(repo, checks) {
       const logs: Record<string, string> = {}
       for (const { name, jobId } of checks.slice(0, 5)) {
