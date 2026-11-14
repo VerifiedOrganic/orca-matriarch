@@ -148,3 +148,78 @@ describe('shell: what a reviewer reads with glab is allowed', () => {
     test(cmd, () => assert.equal(bash(cmd), null, `should allow: ${cmd}`))
   }
 })
+
+describe('shell: flags and forms that run a program or write a file are refused', () => {
+  for (const cmd of [
+    // A flag that runs a program, on a tool that only reads otherwise.
+    "rg --pre sh zzz .matriarch/review/x.json",
+    'rg --pre=sh x .',
+    "rg --pre-glob '*.json' --pre sh x",
+    'rg --hostname-bin=./x.json x',
+    "git grep -O'touch PWNED; echo ran' needle",
+    'git grep -iOsh needle',
+    'git grep --open-files-in-pager=sh needle',
+    'git grep --open-f=sh needle',
+    'fd -x sh {}',
+    'fd -HX sh',
+    'fd --exec-batch sh',
+    "bat --pager 'sh -c id' a.rs",
+    'ag --pager=sh x',
+    'ag --pag=sh x',
+    'sort --compress-program=sh a.txt',
+    'sort -o src/a.rs a.txt',
+    'sort -ro src/a.rs a.txt',
+    'tree -o src/a.rs',
+    'file -C -m x.json',
+    'yq -i .a=1 a.yml',
+    'uniq a.txt src/a.rs',
+    'xxd -r a.hex src/a.rs',
+    'less a.rs',
+    "sed -n '1e touch PWNED' a.rs",
+    "sed 's/a/b/e' a.rs",
+    "sed -n 'r /etc/hosts' a.rs",
+    'sed -f .matriarch/review/x.json a.rs',
+    `awk '{ "date" | getline d; print d }' a.rs`,
+    `awk 'BEGIN { while ((getline line < "a") > 0) print line }'`,
+    // git: config that runs a program, and --output by any shortening.
+    'git -c core.fsmonitor=sh status',
+    'git --git-dir=.matriarch/review/x status',
+    'git log --outp=src/a.rs -1',
+    'git log --out=src/a.rs',
+    // Forms that make a word other than it reads.
+    'git log --out\\put=src/a.rs -1',
+    "rg $'--pre' sh x",
+    'rg --p{re,} sh x',
+    'P=--pre; rg $P sh x',
+    'o=--output=src/a.rs; git log "$o" -1',
+    // The environment of a command, and environment variables.
+    "LESSOPEN='|sh -c id %s' cat a",
+    'GIT_EXTERNAL_DIFF=sh git diff',
+    'GIT_CONFIG_COUNT=1; git status',
+    'PATH=.matriarch/review; ls'
+  ]) {
+    test(cmd, () => assert.ok(bash(cmd), `should refuse: ${cmd}`))
+  }
+})
+
+describe('shell: the same tools, only reading, still work', () => {
+  for (const cmd of [
+    'rg -n "fn main" src',
+    'rg --files src',
+    'git grep -n needle -- src',
+    'git log --oneline -5',
+    'git log --format=%h -1',
+    'fd -e rs src',
+    'sort a.txt | uniq -c',
+    'tree -L 2 src',
+    'file src/a.rs',
+    "sed -n '10,40p' src/a.rs",
+    "sed -n '/fn main/,/^}/p' src/a.rs",
+    "sed '1d;$d' a.txt",
+    `awk -F'|' '{print $2}' docs/a.md`,
+    "awk 'NR>=10 && NR<=20' src/a.rs",
+    'f=src/a.rs; head -20 "$f"'
+  ]) {
+    test(cmd, () => assert.equal(bash(cmd), null, `should allow: ${cmd}`))
+  }
+})

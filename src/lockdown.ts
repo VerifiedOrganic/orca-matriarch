@@ -29,13 +29,15 @@ export const LOCK_LABEL: Record<LockMode, string> = {
 
 /** What a Claude reviewer may do without asking; everything else is refused. Path rules are
  *  relative to the worktree, so reading and searching stay inside it; Edit rules cover every
- *  file-writing tool. In dontAsk mode a tool with no allow rule is not offered at all. */
+ *  file-writing tool. In dontAsk mode a tool with no allow rule is not offered at all. A rule is
+ *  a prefix, so a command whose flags can run a program is left out: `rg --pre` runs one on each
+ *  file and `git grep -O` runs one as its pager; Claude's own Grep tool searches instead. */
 export const CLAUDE_ALLOW: readonly string[] = [
   'Read(./**)', 'Grep(./**)', 'Glob(./**)', 'Edit(./.matriarch/review/**)',
   'Bash(git diff *)', 'Bash(git diff)', 'Bash(git log *)', 'Bash(git log)', 'Bash(git show *)', 'Bash(git show)',
-  'Bash(git status *)', 'Bash(git status)', 'Bash(git grep *)', 'Bash(git ls-files *)', 'Bash(git ls-files)',
+  'Bash(git status *)', 'Bash(git status)', 'Bash(git ls-files *)', 'Bash(git ls-files)',
   'Bash(git blame *)', 'Bash(git rev-parse *)', 'Bash(git merge-base *)', 'Bash(git cat-file *)', 'Bash(git ls-tree *)',
-  'Bash(cat *)', 'Bash(head *)', 'Bash(tail *)', 'Bash(wc *)', 'Bash(ls *)', 'Bash(ls)', 'Bash(grep *)', 'Bash(rg *)',
+  'Bash(cat *)', 'Bash(head *)', 'Bash(tail *)', 'Bash(wc *)', 'Bash(ls *)', 'Bash(ls)', 'Bash(grep *)',
   'Bash(pwd)', 'Bash(mkdir -p .matriarch/review/*)',
   'Bash(shasum *)', 'Bash(sha256sum *)', 'Bash(sha512sum *)', 'Bash(md5sum *)', 'Bash(md5 *)', 'Bash(b2sum *)', 'Bash(cksum *)'
 ]
@@ -57,7 +59,9 @@ export const CLAUDE_DENY: readonly string[] = [
   'Bash(gh api *)',
   ...['merge', 'create', 'update', 'note', 'approve', 'revoke', 'close', 'reopen', 'rebase', 'delete'].flatMap((w) => [`Bash(glab mr ${w} *)`, `Bash(glab mr ${w})`]),
   ...['run', 'retry', 'cancel', 'delete', 'trigger'].flatMap((w) => [`Bash(glab ci ${w} *)`, `Bash(glab ci ${w})`]),
-  'Bash(glab api *)', 'Bash(rm *)', 'WebFetch', 'WebSearch'
+  'Bash(glab api *)', 'Bash(rm *)', 'WebFetch', 'WebSearch',
+  // Flags that run a program, for when the person's own settings allow these commands.
+  'Bash(rg *--pre*)', 'Bash(rg *--hostname-bin*)', 'Bash(git grep *-O*)', 'Bash(git grep *--open*)', 'Bash(git -c *)'
 ]
 
 /** Codex config overrides that pin its sandbox shut, whatever ~/.codex/config.toml says. */

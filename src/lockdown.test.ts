@@ -143,3 +143,12 @@ describe('GitLab writes are refused like GitHub ones', () => {
     assert.deepEqual(await shellArgv(out, 'claude'), words.slice(1))
   })
 })
+
+describe('a Claude reviewer gets no command whose flags run a program', () => {
+  test('rg and git grep are left to the Grep tool, and their exec flags are refused anyway', () => {
+    assert.ok(!CLAUDE_ALLOW.some((r) => r.startsWith('Bash(rg') || r.startsWith('Bash(git grep')), 'not allowed outright')
+    for (const rule of ['Bash(rg *--pre*)', 'Bash(rg *--hostname-bin*)', 'Bash(git grep *-O*)', 'Bash(git grep *--open*)', 'Bash(git -c *)']) {
+      assert.ok(CLAUDE_DENY.includes(rule), rule)
+    }
+  })
+})
