@@ -166,7 +166,7 @@ export interface MatriarchConfig {
   issues: {
     enabled: boolean
     label: string
-    /** Posts one short comment on the issue when the supervisor takes it up. */
+    /** Posts one short comment on the issue, as the signed-in person, right after Matriarch hands it to the supervisor. */
     comment: boolean
   }
 }

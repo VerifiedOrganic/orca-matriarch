@@ -827,7 +827,7 @@ export function createWorker(options: WorkerOptions = {}) {
         let problem: string | null = null
         if (!info) problem = (await repoOf.problem(r.path).catch(() => null)) ?? NO_FORGE
         else if ((await exec('git', ['-C', root, 'rev-parse', '--verify', '--quiet', 'HEAD'], { timeoutMs: 10_000 })).code !== 0) {
-          problem = 'It has no commits yet. Commit and push a first version to main before starting a supervisor.'
+          problem = 'It has no commits yet. Commit and push a first version to its default branch before starting a supervisor.'
         }
         projects.push({ root, name: typeof r.displayName === 'string' && r.displayName ? r.displayName : basename(root), repo: info?.key ?? null, enabled: await exists(join(root, CONFIG_PATH)), problem })
       }

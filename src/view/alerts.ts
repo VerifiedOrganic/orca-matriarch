@@ -32,7 +32,7 @@ export interface AlertsActions {
 const LABEL: Record<AlertFormat, string> = { slack: 'Slack', discord: 'Discord', ntfy: 'ntfy', json: 'JSON' }
 
 const EVENTS: { key: AlertEvent; label: string; hint: string }[] = [
-  { key: 'needs-you', label: 'Needs you', hint: 'An escalation that reached you, a reviewer stuck on a prompt, a PR that needs your merge or is blocked.' },
+  { key: 'needs-you', label: 'Needs you', hint: 'An escalation that reached you, a reviewer or the advisor stuck on a prompt, a PR that needs your merge or is blocked.' },
   { key: 'ready', label: 'Ready to merge', hint: 'A PR that passed CI and review, when you merge.' },
   { key: 'merged', label: 'Merged', hint: 'A PR Matriarch follows merged, by it or by anyone.' }
 ]
