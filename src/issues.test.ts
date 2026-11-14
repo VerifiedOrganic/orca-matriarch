@@ -160,6 +160,21 @@ describe('who added the label', () => {
     assert.deepEqual(await check(reply('lachie', { stdout: JSON.stringify({ id: 9, bot: false }) })), { ok: true, by: 'lachie', at: '2026-11-14T08:00:00Z' })
     await assert.rejects(check(reply('lachie', { code: 1, stderr: 'glab: 502 Bad Gateway' })), /glab api users/)
   })
+
+  test('GitLab: an answer that is not JSON is read as nothing, never thrown as a parse error', async () => {
+    const garbled = fakeGlab((args) => {
+      const path = args.find((a) => a.startsWith('projects/') || a.startsWith('users/')) ?? ''
+      if (args.includes('graphql')) return { stdout: included({ project: { issue: { lastEditedAt: null } } }) }
+      if (path.includes('resource_label_events')) return { stdout: JSON.stringify([{ action: 'add', created_at: '2026-11-14T08:00:00Z', user: { id: 9, username: 'lachie' }, label: { name: 'matriarch' } }]) }
+      if (path.includes('members/all/9')) return { stdout: '<html>proxy error</html>' }
+      return { stdout: '{}' }
+    })
+    const res = await createGitLab(garbled.exec).labelCheck!(GITLAB_REPO, issue(3), 'matriarch')
+    assert.match((res as { why: string }).why, /below Reporter/, 'no access level read: not a go-ahead')
+    // Label events that are not a list: the check cannot be made, and is asked again on the next read.
+    const noList = fakeGlab((args) => (args.some((a) => a.includes('resource_label_events')) ? { stdout: 'oops' } : { stdout: '{}' }))
+    await assert.rejects(createGitLab(noList.exec).labelCheck!(GITLAB_REPO, issue(3), 'matriarch'), /GitLab gave no list for #3/)
+  })
 })
 
 describe('the message to the supervisor', () => {

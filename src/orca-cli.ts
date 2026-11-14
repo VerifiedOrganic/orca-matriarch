@@ -124,6 +124,32 @@ export async function listWorkers(cli: OrcaCli): Promise<WorkerRow[]> {
   return rows
 }
 
+/** Orca's answers for a terminal that is gone (closed, or lost in a restart). */
+export const GONE_TERMINAL: ReadonlySet<string> = new Set(['terminal_handle_stale', 'terminal_not_found'])
+
+/** Where Matriarch sends orchestration mail from in a project: its mailbox terminal there. */
+export interface Mailbox {
+  /** The mailbox's terminal handle, made when there is none; null when Orca would not make one. */
+  address(): Promise<string | null>
+  /** Orca said this handle is gone: the next address asked for is a new mailbox. */
+  gone(handle: string): void
+}
+
+/**
+ * Sends a message from a mailbox, the one way Matriarch sends mail: Orca refuses a sender it
+ * cannot place in a terminal, and a plugin has none of its own. A mailbox Orca says is gone is
+ * dropped, so the next send makes a new one; the error still reaches the caller.
+ */
+export async function sendFrom(cli: OrcaCli, mailbox: Mailbox | null, message: { to: string; subject: string; body: string; type?: 'status' | 'escalation' }): Promise<void> {
+  const from = mailbox ? await mailbox.address().catch(() => null) : null
+  try {
+    await sendMessage(cli, { ...message, from })
+  } catch (error) {
+    if (from && error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)) mailbox!.gone(from)
+    throw error
+  }
+}
+
 /** Delivers a message to a worker (`dispatch:<id>`) or a supervisor's Run (`run:<id>`). */
 export async function sendMessage(
   cli: OrcaCli,

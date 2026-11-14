@@ -6,7 +6,7 @@ import type { JsonValue } from 'orca/host'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { AGENT_CATALOG, agentOptions, MODEL_LISTERS, parseModelList, type LiveModel } from './agents.ts'
 import { readModelCatalog, readOrcaProfile } from './orca-profile.ts'
-import { createAdvisor, GONE_TERMINAL, type Advisor } from './advisor.ts'
+import { createAdvisor, type Advisor } from './advisor.ts'
 import { advisorUsable, CONFIG_OFF_PATH, CONFIG_PATH, defaultConfig, forgeSettingOf, parseConfig, validateConfig, type ForgeSetting, type MatriarchConfig } from './config.ts'
 import { createCrew, launchedSession, launchedTerminal, type Crew } from './crew.ts'
 import { branchName, tick, type ActivityInfo, type EngineDeps, type RepoInfo, type Workspace } from './engine.ts'
@@ -16,7 +16,7 @@ import { forgeKind, forgeTerms, gitlabRef, parseRemote, repoKey, type ForgeReade
 import { createGitHub, parseGitHubRemote, type GitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
 import { ledgerKey, loadLedger, record, roundsUsed } from './ledger.ts'
-import { createdTerminal, createOrcaCli, listWorkers, OrcaRefusal, OrcaUnavailable, sendMessage, type OrcaCli } from './orca-cli.ts'
+import { createdTerminal, createOrcaCli, GONE_TERMINAL, listWorkers, OrcaRefusal, OrcaUnavailable, sendFrom, type OrcaCli } from './orca-cli.ts'
 import { selectReviewers, type Activity, type Lane } from './plan.ts'
 import { findTaggedRun, supervisorBrief, supervisorLaunchArgs, supervisorTag, workerSettingsMessage } from './supervisor.ts'
 import { createAlerter, hostOf, type FetchLike } from './alerts.ts'
@@ -437,16 +437,9 @@ export function createWorker(options: WorkerOptions = {}) {
     // Matriarch's mailbox in each project (see createMailboxes).
     const mailboxes = createMailboxes(cli, orca.storage)
     const mailboxFor = (repo: string, root: string): Promise<string | null> => mailboxes.get(repo, root)
-    /** Sends a message from the project's mailbox; one Orca says is gone (its tab was closed) is replaced on the next send. */
-    const sendFromMailbox = async (repo: string, root: string, to: string, m: { subject: string; body: string }): Promise<void> => {
-      const from = await mailboxFor(repo, root)
-      try {
-        await sendMessage(cli, { to, subject: m.subject, body: m.body, from })
-      } catch (error) {
-        if (from && error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)) mailboxes.forget(repo, from)
-        throw error
-      }
-    }
+    /** Sends a message from the project's mailbox (sendFrom); one Orca says is gone (its tab was closed) is replaced on the next send. */
+    const sendFromMailbox = (repo: string, root: string, to: string, m: { subject: string; body: string }): Promise<void> =>
+      sendFrom(cli, { address: () => mailboxFor(repo, root), gone: (handle) => mailboxes.forget(repo, handle) }, { to, subject: m.subject, body: m.body })
 
     const deps: EngineDeps = {
       now,
@@ -484,7 +477,7 @@ export function createWorker(options: WorkerOptions = {}) {
           return false
         } catch (error) {
           // Only Orca saying so counts: an unreachable runtime proves nothing.
-          return error instanceof OrcaRefusal && ['terminal_handle_stale', 'terminal_not_found'].includes(error.code)
+          return error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)
         }
       },
       store: orca.storage,

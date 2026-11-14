@@ -8,7 +8,7 @@ import { forgeKind, forgeTerms, type ForgeActions, type ForgeKind, type Outcome,
 import { createGitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
 import { ciFailureMessage, commentsMessage, draftMessage, escalationMessage, rebaseMessage, restackMessage, updateMessage } from './messages.ts'
-import { OrcaRefusal, sendMessage, type OrcaCli } from './orca-cli.ts'
+import { sendFrom, type Mailbox, type OrcaCli } from './orca-cli.ts'
 import type { Action } from './plan.ts'
 import { findingsMessage, githubReview } from './review.ts'
 
@@ -76,9 +76,6 @@ export interface ExecutorDeps {
   mailboxGone?: (ctx: ActionContext, handle: string) => void
 }
 
-/** Orca's answers for a terminal that is gone. */
-const GONE = new Set(['terminal_handle_stale', 'terminal_not_found'])
-
 export function createExecutor(deps: ExecutorDeps): Executor {
   // Each forge acts through its own CLI; the worker passes the same clients it reads with.
   const forges: Partial<Record<ForgeKind, ForgeActions>> = {
@@ -94,24 +91,23 @@ export function createExecutor(deps: ExecutorDeps): Executor {
   }
 
   async function send(ctx: ActionContext, to: string, subject: string, body: string, type?: 'escalation'): Promise<Outcome> {
-    const from = deps.mailbox ? await deps.mailbox(ctx).catch(() => null) : null
+    // Every message goes from the project's mailbox (sendFrom); a closed one is made anew next time.
+    const mailbox: Mailbox | null = deps.mailbox ? { address: () => deps.mailbox!(ctx), gone: (handle) => deps.mailboxGone?.(ctx, handle) } : null
     // A finished worker can only be woken by the Run's coordinator: the supervisor gets the work.
     const viaSupervisor = async (): Promise<Outcome> => {
       const m = forSupervisor(ctx, to, subject, body)
       // Not --type escalation: Orca takes that only from a worker ("No active Dispatch belongs to this message sender").
-      await sendMessage(deps.orca, { to: ctx.supervisor!, subject: m.subject, body: m.body, from })
+      await sendFrom(deps.orca, mailbox, { to: ctx.supervisor!, subject: m.subject, body: m.body })
       return { ok: true, sent: { to: 'supervisor', subject: m.subject, note: 'its worker had finished, so the supervisor got it' } }
     }
     try {
       if (to.startsWith('dispatch:') && ctx.ownerLive === false && ctx.supervisor) return await viaSupervisor()
       // Matriarch is not a worker, so an escalation goes as plain mail with the word in its subject.
       const sentSubject = type === 'escalation' && !/escalat/i.test(subject) ? `Escalation: ${subject}` : subject
-      await sendMessage(deps.orca, { to, subject: sentSubject, body, from })
+      await sendFrom(deps.orca, mailbox, { to, subject: sentSubject, body })
       return { ok: true, sent: { to: to.startsWith('dispatch:') ? 'worker' : 'supervisor', subject: sentSubject } }
     } catch (error) {
       const message = (error as Error).message
-      // Mail from a closed mailbox: a new one is made for the next try.
-      if (from && error instanceof OrcaRefusal && GONE.has(error.code)) deps.mailboxGone?.(ctx, from)
       if (to.startsWith('dispatch:') && ctx.supervisor && COORDINATOR_ONLY.test(message)) {
         try {
           return await viaSupervisor()

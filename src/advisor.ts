@@ -18,7 +18,7 @@ import {
 import { forgeTerms, type ForgeKind } from './forge.ts'
 import type { Guard } from './guard.ts'
 import { LOCK_LABEL, type LockMode } from './lockdown.ts'
-import { OrcaRefusal, sendMessage } from './orca-cli.ts'
+import { GONE_TERMINAL, OrcaRefusal, sendFrom, type Mailbox } from './orca-cli.ts'
 import type { AdvisorView } from './protocol.ts'
 import { advisorMessage, advisorName } from './supervisor.ts'
 
@@ -38,9 +38,6 @@ export const answerPath = (id: string): string => `${adviceDir(id)}/answer.json`
 const stateKey = (repo: string): string => `advice:${repo}`
 /** Projects with a question being answered, so the read-only guard comes back after a restart. */
 const ACTIVE = 'advice:active'
-
-/** Orca's answer for a terminal that is gone: a mailbox like that is made again. */
-export const GONE_TERMINAL = new Set(['terminal_handle_stale', 'terminal_not_found'])
 
 type Obj = Record<string, unknown>
 const obj = (v: unknown): Obj => (typeof v === 'object' && v !== null ? (v as Obj) : {})
@@ -361,10 +358,15 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     if (next.length !== list.length) await deps.store.set(ACTIVE, next)
   }
 
-  /** A refusal that says Matriarch's mailbox is gone: the next tick makes a new one. */
+  /** A refusal that says Matriarch's mailbox is gone, when reading it: the next tick makes a new one. */
   const noteGone = (repo: string, handle: string | null, error: unknown) => {
     if (handle && error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)) deps.mailboxGone?.(repo, handle)
   }
+  /** The project's mailbox, to send from (sendFrom); `known` pins the address the supervisor is being given. */
+  const mailboxOf = (repo: string, root: string, known?: string): Mailbox => ({
+    address: () => (known ? Promise.resolve(known) : deps.mailbox(repo, root)),
+    gone: (handle) => deps.mailboxGone?.(repo, handle)
+  })
 
   /** Removes a finished question's worktree; only once it is gone does the read-only guard let go. */
   async function removeWorktree(path: string): Promise<boolean> {
@@ -632,14 +634,13 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
   /** Sends what waits in the outbox, in order; what fails stays for the next tick. */
   async function flush(state: AdviceState, repo: string, root: string, supervisor: string): Promise<void> {
     if (state.outbox.length === 0) return
-    const from = await deps.mailbox(repo, root).catch(() => null)
+    const mailbox = mailboxOf(repo, root)
     while (state.outbox.length > 0) {
       const m = state.outbox[0]
       try {
-        await sendMessage(deps.orca, { to: supervisor, subject: m.subject, body: m.body, from })
+        await sendFrom(deps.orca, mailbox, { to: supervisor, subject: m.subject, body: m.body })
         state.outbox.shift()
       } catch (error) {
-        noteGone(repo, from, error)
         deps.log(`${repo}: could not send the advisor's mail to the supervisor: ${(error as Error).message}`)
         break
       }
@@ -724,12 +725,10 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
         await stopAll(state, 'the advisor was turned off')
         if (state.told?.advisor && input.supervisor) {
           const m = advisorMessage(null)
-          const from = await deps.mailbox(input.repo, input.root).catch(() => null)
           try {
-            await sendMessage(deps.orca, { to: input.supervisor!, subject: m.subject, body: m.body, from })
+            await sendFrom(deps.orca, mailboxOf(input.repo, input.root), { to: input.supervisor, subject: m.subject, body: m.body })
             state.told = { run: input.supervisor, address: state.told.address, advisor: null }
           } catch (error) {
-            noteGone(input.repo, from, error)
             deps.log(`${input.repo}: could not tell the supervisor the advisor is off: ${(error as Error).message}`)
           }
         }
@@ -751,10 +750,10 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
             if (!unreachable) {
               const m = advisorMessage({ role, address })
               try {
-                await sendMessage(deps.orca, { to: input.supervisor, subject: m.subject, body: m.body, from: address })
+                // From the very address it is being told to write to.
+                await sendFrom(deps.orca, mailboxOf(input.repo, input.root, address), { to: input.supervisor, subject: m.subject, body: m.body })
                 state.told = { run: input.supervisor, ...want }
               } catch (error) {
-                noteGone(input.repo, address, error)
                 deps.log(`${input.repo}: could not tell the supervisor about the advisor: ${(error as Error).message}`)
               }
             }

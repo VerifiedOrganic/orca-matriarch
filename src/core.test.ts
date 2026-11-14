@@ -6,7 +6,7 @@ import { actionableThreads, ciStateOf, createGitHub, normalizePr, parseGitHubRem
 import { matchingGlobs } from './glob.ts'
 import { emptyHistory, noteLane, prune, windowed } from './history.ts'
 import { loadLedger } from './ledger.ts'
-import { createdTerminal, createOrcaCli, OrcaRefusal, OrcaUnavailable, parseWorkerList, sendMessage } from './orca-cli.ts'
+import { createdTerminal, createOrcaCli, OrcaRefusal, OrcaUnavailable, parseWorkerList, sendFrom, sendMessage } from './orca-cli.ts'
 import { draftMessage } from './messages.ts'
 import { check, config, pr, SHA } from './testing/fixtures.ts'
 
@@ -306,4 +306,29 @@ test('asking the supervisor about a quiet draft is plain mail, not an escalation
   const m = draftMessage(pr({ number: 4, title: 'P2' }), '#4 has been a draft for 15 min with nobody working on it.')
   assert.equal(m.subject, 'acme/app #4 is still a draft')
   assert.ok(!/stuck|decision|escalat/i.test(m.subject + m.body))
+})
+
+describe('sending from the mailbox', () => {
+  test('sends from its address; one Orca says is gone is dropped, and the error still reaches the caller', async () => {
+    const calls: string[][] = []
+    const gone: string[] = []
+    let refuse: string | null = null
+    const cli = {
+      run: async (args: readonly string[]) => {
+        calls.push([...args])
+        if (refuse) throw new OrcaRefusal(refuse, 'no such terminal')
+        return {}
+      }
+    }
+    const mailbox = { address: async () => 'term_mail', gone: (h: string) => void gone.push(h) }
+    await sendFrom(cli, mailbox, { to: 'run:r1', subject: 's', body: 'b' })
+    assert.deepEqual(calls[0].slice(-2), ['--from', 'term_mail'])
+    refuse = 'terminal_not_found'
+    await assert.rejects(sendFrom(cli, mailbox, { to: 'run:r1', subject: 's', body: 'b' }), /no such terminal/)
+    assert.deepEqual(gone, ['term_mail'])
+    // Any other refusal is not the mailbox's: it stays.
+    refuse = 'run_not_found'
+    await assert.rejects(sendFrom(cli, mailbox, { to: 'run:r1', subject: 's', body: 'b' }))
+    assert.deepEqual(gone, ['term_mail'])
+  })
 })

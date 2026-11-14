@@ -358,13 +358,29 @@ export function reviewNote(review: ForgeReview): string {
 
 /** Pages of 100 files read for a merge request's moves: more than this, and it cannot say. */
 const MAX_DIFF_PAGES = 30
+/** Pages of 100 label events read for an issue: its newest addition of the label is among them. */
+const LABEL_EVENT_PAGES = 5
+const RATE_LIMITED = /rate limit|too many requests|\b429\b/i
+const NOT_FOUND = /\b404\b|Not Found/i
+
+/** JSON, or undefined when the text is not JSON: GitLab's answer is never trusted to parse. */
+const parseJson = (text: string): unknown => {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return undefined
+  }
+}
+
+/** What one REST read answered: its text (and headers, when asked for), or that GitLab has no such thing. */
+type RestRead = { missing: true } | { missing: false; text: string; headers: Record<string, string> }
 
 export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'glab'): Forge {
   /** Each project's default branch as GitLab last named it, to read that branch's pipelines. */
   const defaults = new Map<string, string>()
   const hostOf = (repo: RepoRef): string => repo.host ?? 'gitlab.com'
   /** A REST path under the project, its path encoded as GitLab asks (`group%2Fsub%2Fproject`). */
-  const rest = (project: string, path: string): string => `projects/${encodeURIComponent(project)}/${path}`
+  const projectApi = (project: string, path: string): string => `projects/${encodeURIComponent(project)}/${path}`
 
   const glab = (repo: RepoRef, args: string[], options: ExecOptions = {}): Promise<ExecResult> =>
     exec(bin, ['api', '--hostname', hostOf(repo), ...args], { timeoutMs: 30_000, ...options })
@@ -436,29 +452,37 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     return { list: { viewer, prs, rate, base, ...(truncated ? { truncated } : {}) }, rootRef }
   }
 
-  /** A REST read under the project; throws with GitLab's words when it fails. */
-  async function restGet(repo: RepoRef, what: string, path: string): Promise<string> {
-    const res = await glab(repo, [rest(projectPath(repo), path)])
-    if (res.code === 127) throw new GitLabError('glab is not installed, or not on the PATH Orca gives plugins', false)
-    if (res.code !== 0) {
-      const text = `${res.stderr}${res.stdout}`.trim()
-      throw new GitLabError(`glab api ${what}: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
-    }
-    return res.stdout
+  /** A failed glab call as an error with GitLab's words, saying whether it was turned away for its rate. */
+  const failure = (what: string, res: ExecResult): GitLabError => {
+    const text = `${res.stderr}${res.stdout}`.trim()
+    return new GitLabError(`glab api ${what}: ${text.slice(0, 300)}`, RATE_LIMITED.test(text))
   }
 
-  /** A REST read with its status and headers; null when glab gave nothing to read. */
-  async function restResponse(repo: RepoRef, path: string): Promise<{ status: number | null; headers: Record<string, string>; body: unknown } | null> {
-    const res = await glab(repo, ['-i', path], { timeoutMs: 60_000 }).catch(() => null)
-    if (!res || res.code === 127) return null
-    const { status, headers, body } = splitInclude(res.stdout)
-    let parsed: unknown = null
-    try {
-      parsed = JSON.parse(body)
-    } catch {
-      parsed = null
+  /**
+   * Every REST read goes through here: its text, `{ missing: true }` when GitLab answered 404, or
+   * a GitLabError with GitLab's words otherwise. With `include` (`glab api -i`), also its headers,
+   * to page by X-Next-Page; where glab prints no status line, its exit code and words decide.
+   */
+  async function restRead(repo: RepoRef, what: string, path: string, options: { include?: boolean; timeoutMs?: number } = {}): Promise<RestRead> {
+    const res = await glab(repo, [...(options.include ? ['-i'] : []), path], { timeoutMs: options.timeoutMs ?? 30_000 })
+    if (res.code === 127) throw new GitLabError('glab is not installed, or not on the PATH Orca gives plugins', false)
+    if (options.include) {
+      const { status, headers, body } = splitInclude(res.stdout)
+      if (status === 404) return { missing: true }
+      if (status !== null) {
+        if (status >= 200 && status < 300) return { missing: false, text: body, headers }
+        throw failure(what, res)
+      }
     }
-    return { status: status ?? (res.code === 0 ? 200 : null), headers, body: parsed }
+    if (res.code === 0) return { missing: false, text: res.stdout, headers: {} }
+    if (NOT_FOUND.test(`${res.stderr}${res.stdout}`)) return { missing: true }
+    throw failure(what, res)
+  }
+
+  /** A read that may fail without harm: its JSON, or undefined when it failed, is missing or is not JSON. */
+  const readJson = async (repo: RepoRef, what: string, path: string): Promise<unknown> => {
+    const r = await restRead(repo, what, path).catch(() => null)
+    return r && !r.missing ? parseJson(r.text) : undefined
   }
 
   /** Old and new paths from GitLab's per-file diff entries, or null when one is malformed. */
@@ -504,13 +528,7 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
       // GitLab works mergeability out lazily, and GraphQL does not ask it to. Reading the merge
       // request over REST does, for someone who may merge it, and may already have the answer.
       if (pr && pr.state === 'OPEN' && pr.mergeable === 'UNKNOWN') {
-        const res = await glab(repo, [rest(projectPath(repo), `merge_requests/${number}`)]).catch(() => null)
-        let fresh: Obj = {}
-        try {
-          fresh = res?.code === 0 ? obj(JSON.parse(res.stdout)) : {}
-        } catch {
-          fresh = {}
-        }
+        const fresh = obj(await readJson(repo, 'merge request', projectApi(projectPath(repo), `merge_requests/${number}`)))
         const m = mergeabilityOf(fresh.detailed_merge_status, fresh.has_conflicts === true)
         if (m.mergeable !== 'UNKNOWN') pr = { ...pr, ...m }
       }
@@ -519,22 +537,27 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     // Each file's old and new path, from the merge request's diffs (GitLab 15.7 and later), else
     // from its changes on an older GitLab. Anything short of the whole list answers null.
     async fileMoves(repo, number) {
-      const base = rest(projectPath(repo), `merge_requests/${number}`)
+      const base = projectApi(projectPath(repo), `merge_requests/${number}`)
       const entries: unknown[] = []
-      for (let page = 1; page <= MAX_DIFF_PAGES; page++) {
-        const res = await restResponse(repo, `${base}/diffs?per_page=100&page=${page}`)
-        if (!res) return null
-        if (res.status === 404 && page === 1) {
-          // No diffs endpoint here: the older changes endpoint lists every file, unless it overflowed.
-          const old = await restResponse(repo, `${base}/changes`)
-          const body = obj(old?.body)
-          if (old?.status !== 200 || body.overflow === true || !Array.isArray(body.changes)) return null
-          return movesOf(body.changes)
+      try {
+        for (let page = 1; page <= MAX_DIFF_PAGES; page++) {
+          const res = await restRead(repo, 'diffs', `${base}/diffs?per_page=100&page=${page}`, { include: true, timeoutMs: 60_000 })
+          if (res.missing) {
+            if (page > 1) return null
+            // No diffs endpoint here: the older changes endpoint lists every file, unless it overflowed.
+            const old = await restRead(repo, 'changes', `${base}/changes`, { include: true, timeoutMs: 60_000 })
+            const body = obj(old.missing ? undefined : parseJson(old.text))
+            if (old.missing || body.overflow === true || !Array.isArray(body.changes)) return null
+            return movesOf(body.changes)
+          }
+          const list = parseJson(res.text)
+          if (!Array.isArray(list)) return null
+          entries.push(...list)
+          if (!res.headers['x-next-page']) return movesOf(entries)
         }
-        if (res.status !== 200 || !Array.isArray(res.body)) return null
-        entries.push(...res.body)
-        const next = res.headers['x-next-page']
-        if (!next) return movesOf(entries)
+      } catch {
+        // A read that failed says nothing of the moves: the merge request gets the full crew.
+        return null
       }
       // More files than Matriarch reads one by one.
       return null
@@ -544,7 +567,7 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
       act(repo, 'merge', [
         '-X',
         'PUT',
-        rest(projectPath(repo), `merge_requests/${pr.number}/merge`),
+        projectApi(projectPath(repo), `merge_requests/${pr.number}/merge`),
         '-f',
         `sha=${sha}`,
         '-F',
@@ -553,27 +576,21 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
         `should_remove_source_branch=${deleteBranch}`
       ]),
     // Asynchronous, like gh pr update-branch: GitLab answers at once and rebases in the background.
-    updateBranch: (repo, pr) => act(repo, 'rebase', ['-X', 'PUT', rest(projectPath(repo), `merge_requests/${pr.number}/rebase`)]),
-    retarget: (repo, pr, base) => act(repo, 'update', ['-X', 'PUT', rest(projectPath(repo), `merge_requests/${pr.number}`), '-f', `target_branch=${base}`]),
+    updateBranch: (repo, pr) => act(repo, 'rebase', ['-X', 'PUT', projectApi(projectPath(repo), `merge_requests/${pr.number}/rebase`)]),
+    retarget: (repo, pr, base) => act(repo, 'update', ['-X', 'PUT', projectApi(projectPath(repo), `merge_requests/${pr.number}`), '-f', `target_branch=${base}`]),
     // Each job on its own, in the project it ran in: a fork's pipeline runs in the fork.
     async rerun(repo, checks) {
       for (const check of checks) {
         if (check.jobId === null) return { ok: false, error: `${check.name} is not a job GitLab can retry` }
-        const done = await act(repo, 'retry', ['-X', 'POST', rest(jobProject(check.url) ?? projectPath(repo), `jobs/${check.jobId}/retry`)])
+        const done = await act(repo, 'retry', ['-X', 'POST', projectApi(jobProject(check.url) ?? projectPath(repo), `jobs/${check.jobId}/retry`)])
         if (!done.ok) return done
       }
       return { ok: true }
     },
     async isAncestor(repo, sha, ref) {
       // The merge base of a commit and a branch is that commit exactly when the branch has it.
-      const res = await glab(repo, [rest(projectPath(repo), `repository/merge_base?refs[]=${encodeURIComponent(sha)}&refs[]=${encodeURIComponent(ref)}`)])
-      if (res.code !== 0) return null
-      try {
-        const id = str(obj(JSON.parse(res.stdout)).id)
-        return id === null ? null : id === sha
-      } catch {
-        return null
-      }
+      const id = str(obj(await readJson(repo, 'merge base', projectApi(projectPath(repo), `repository/merge_base?refs[]=${encodeURIComponent(sha)}&refs[]=${encodeURIComponent(ref)}`))).id)
+      return id === null ? null : id === sha
     },
     async failureDetails(repo, checks) {
       const details: Record<string, string> = {}
@@ -582,24 +599,24 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
         if (jobId === null) continue
         const project = jobProject(url) ?? projectPath(repo)
         // GitLab says itself when a job failed around its script (a runner or the scheduler failing).
-        const [job, trace] = await Promise.all([glab(repo, [rest(project, `jobs/${jobId}`)]), glab(repo, [rest(project, `jobs/${jobId}/trace`)], { timeoutMs: 60_000 })])
-        let reason: string | null = null
-        try {
-          reason = job.code === 0 ? str(obj(JSON.parse(job.stdout)).failure_reason) : null
-        } catch {
-          reason = null
-        }
-        if (trace.code === 0 && trace.stdout) logs[name] = traceTail(trace.stdout)
+        const [job, trace] = await Promise.all([
+          readJson(repo, 'job', projectApi(project, `jobs/${jobId}`)),
+          restRead(repo, 'trace', projectApi(project, `jobs/${jobId}/trace`), { timeoutMs: 60_000 }).catch(() => null)
+        ])
+        const reason = str(obj(job).failure_reason)
+        if (trace && !trace.missing && trace.text) logs[name] = traceTail(trace.text)
         details[name] = [reason ? `failure_reason: ${reason}` : '', logs[name] ?? ''].filter(Boolean).join('\n')
       }
       return { details, logs }
     },
     publishReview: (repo, pr, _sha, review) =>
-      act(repo, 'notes', ['-X', 'POST', rest(projectPath(repo), `merge_requests/${pr.number}/notes`), '-f', `body=${reviewNote(review)}`]),
+      act(repo, 'notes', ['-X', 'POST', projectApi(projectPath(repo), `merge_requests/${pr.number}/notes`), '-f', `body=${reviewNote(review)}`]),
     async labeledIssues(repo, label) {
       const issues: IssueInfo[] = []
       for (let page = 1; page <= ISSUE_PAGES; page++) {
-        const read = parseIssues(await restGet(repo, 'issues', `issues?state=opened&labels=${encodeURIComponent(label)}&order_by=created_at&sort=asc&per_page=100&page=${page}`))
+        const res = await restRead(repo, 'issues', projectApi(projectPath(repo), `issues?state=opened&labels=${encodeURIComponent(label)}&order_by=created_at&sort=asc&per_page=100&page=${page}`))
+        if (res.missing) throw new GitLabError(`${hostOf(repo)} has no project ${projectPath(repo)}, or glab's account there cannot see its issues`, false)
+        const read = parseIssues(res.text)
         issues.push(...read.issues)
         if (read.rows < 100) return { issues, truncated: false }
       }
@@ -609,9 +626,11 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     // (members/all); lastEditedAt moves with an edit of the title or the description.
     async labelCheck(repo, issue, label): Promise<LabelCheck> {
       const events: Obj[] = []
-      for (let page = 1; page <= ISSUE_PAGES; page++) {
-        const raw = JSON.parse(await restGet(repo, 'label events', `issues/${issue.number}/resource_label_events?per_page=100&page=${page}`)) as unknown
-        const rows = Array.isArray(raw) ? raw.map(obj) : []
+      for (let page = 1; page <= LABEL_EVENT_PAGES; page++) {
+        const res = await restRead(repo, 'label events', projectApi(projectPath(repo), `issues/${issue.number}/resource_label_events?per_page=100&page=${page}`))
+        const raw = res.missing ? undefined : parseJson(res.text)
+        if (!Array.isArray(raw)) throw new GitLabError(`glab api label events: GitLab gave no list for #${issue.number}`, false)
+        const rows = raw.map(obj)
         events.push(...rows)
         if (rows.length < 100) break
       }
@@ -625,34 +644,25 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
       const { data } = await graphql(repo, ISSUE_EDIT_QUERY, { path: projectPath(repo), iid: String(issue.number) })
       const edited = str(obj(obj(data.project).issue).lastEditedAt)
       if (edited && Date.parse(edited) > Date.parse(at)) return { ok: false, why: `it was edited after ${by} added ${label}`, at }
-      const res = await glab(repo, [rest(projectPath(repo), `members/all/${id}`)])
-      if (res.code !== 0) {
-        const text = `${res.stderr}${res.stdout}`.trim()
-        if (/\b404\b|Not Found/i.test(text)) return { ok: false, why: `${label} was added by ${by}, who is not a member of the project`, at }
-        throw new GitLabError(`glab api members: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
-      }
-      const level = num(obj(JSON.parse(res.stdout)).access_level)
+      const member = await restRead(repo, 'members', projectApi(projectPath(repo), `members/all/${id}`))
+      if (member.missing) return { ok: false, why: `${label} was added by ${by}, who is not a member of the project`, at }
+      const level = num(obj(parseJson(member.text)).access_level)
       if (level === null || level < REPORTER) return { ok: false, why: `${label} was added by ${by}, whose role in the project is below Reporter`, at }
       // A bot user (an access token, or one of GitLab's own) can hold Reporter, but its label is
       // no person's go-ahead, as an app's is not on GitHub. Its user record says so; where that
       // record is hidden (a private profile on a locked-down instance), its username does.
       if (GITLAB_BOT_USERNAME.test(by)) return { ok: false, why: `${label} was added by ${by}, a bot, not a person with Reporter access`, at }
-      const who = await glab(repo, [`users/${id}`])
-      if (who.code !== 0) {
-        const text = `${who.stderr}${who.stdout}`.trim()
-        if (!/\b404\b|Not Found/i.test(text)) throw new GitLabError(`glab api users: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
-      } else if (obj(JSON.parse(who.stdout)).bot === true) {
-        return { ok: false, why: `${label} was added by ${by}, a bot, not a person with Reporter access`, at }
-      }
+      const who = await restRead(repo, 'users', `users/${id}`)
+      if (!who.missing && obj(parseJson(who.text)).bot === true) return { ok: false, why: `${label} was added by ${by}, a bot, not a person with Reporter access`, at }
       return { ok: true, by, at }
     },
-    commentIssue: (repo, number, body) => act(repo, 'issue notes', ['-X', 'POST', rest(projectPath(repo), `issues/${number}/notes`), '-f', `body=${body}`]),
+    commentIssue: (repo, number, body) => act(repo, 'issue notes', ['-X', 'POST', projectApi(projectPath(repo), `issues/${number}/notes`), '-f', `body=${body}`]),
     async failedLogs(repo, checks) {
       const logs: Record<string, string> = {}
       for (const { name, jobId, url } of checks.slice(0, 5)) {
         if (jobId === null) continue
-        const res = await glab(repo, [rest(jobProject(url) ?? projectPath(repo), `jobs/${jobId}/trace`)], { timeoutMs: 60_000 })
-        if (res.code === 0 && res.stdout) logs[name] = traceTail(res.stdout)
+        const res = await restRead(repo, 'trace', projectApi(jobProject(url) ?? projectPath(repo), `jobs/${jobId}/trace`), { timeoutMs: 60_000 }).catch(() => null)
+        if (res && !res.missing && res.text) logs[name] = traceTail(res.text)
       }
       return logs
     }
