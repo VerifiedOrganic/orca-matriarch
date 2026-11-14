@@ -1,7 +1,7 @@
 // The supervisor: an Orca agent on its own provider and model that plans the objective, splits
 // it into tasks and starts workers with the tiers the repo configured. Matriarch gives it a brief,
 // then finds the orchestration Run it creates (by a tag in the objective) so escalations reach it.
-import { modelFlags, type MatriarchConfig, type RoleSpec } from './config.ts'
+import { modelFlags, type AdvisorSpec, type MatriarchConfig, type RoleSpec } from './config.ts'
 import { forgeTerms, type ForgeKind } from './forge.ts'
 
 /** `[matriarch:<repo>:<nonce>]`: lets Matriarch find the supervisor's Run among all Runs. */
@@ -34,6 +34,41 @@ export interface BriefInput {
   forge?: ForgeKind
   /** The forge's host, named in a GitLab brief. */
   host?: string
+  /** The advisor it may ask, and Matriarch's mailbox the questions go to; absent when there is none. */
+  advisor?: { role: AdvisorSpec; address: string }
+}
+
+/** An advisor as the supervisor reads it: its agent, model and effort. */
+export const advisorName = (role: RoleSpec): string => [role.agent, role.model, role.effort ? `${role.effort} effort` : null].filter(Boolean).join(' ')
+
+/** How and when the supervisor asks the advisor, as lines indented by `pad`. */
+export function advisorInstructions(role: AdvisorSpec, address: string, pad = ''): string[] {
+  return [
+    `A second opinion: an advisor (${advisorName(role)}) reads the code read-only and answers what you ask it. Ask it`,
+    'when a plan is risky, when a reviewer and a worker disagree, when you are stuck, or before something hard to',
+    'undo (a migration, deleting data, a public API change). Ask one question at a time, with the context it needs',
+    '(what you know, the options, which you lean to and why), sent to Matriarch, which runs the advisor:',
+    `orca orchestration send --to ${address} --subject ${q('Advice: <the question in one line>')} --body ${q('<the context>')} --json`,
+    'Then carry on with other work. The answer comes to this chat as a message titled "Advice: <your question>",',
+    'usually within half an hour, and the decision stays yours. If none comes, go on with your own judgment.'
+  ].map((line) => `${pad}${line}`)
+}
+
+/**
+ * What a running supervisor is told when the advisor changes: one is now available (or moved to
+ * another agent or model), Matriarch's mailbox has a new address, or the advisor was turned off.
+ */
+export function advisorMessage(advisor: { role: AdvisorSpec; address: string } | null): { subject: string; body: string } {
+  if (!advisor) {
+    return { subject: 'Advisor turned off', body: 'The user turned the advisor off. Do not send it questions; decide yourself, as before.' }
+  }
+  return {
+    subject: 'Advisor available',
+    body: [
+      ...advisorInstructions(advisor.role, advisor.address),
+      'Use this address from now on, instead of any earlier one.'
+    ].join('\n')
+  }
 }
 
 /** `orca agent launch` arguments for the supervisor: a native chat by default, briefed and focused. */
@@ -43,7 +78,7 @@ export function supervisorLaunchArgs(role: RoleSpec, root: string, brief: string
   return args
 }
 
-export function supervisorBrief({ repo, root, objective, tag, base, config, forge, host }: BriefInput): string {
+export function supervisorBrief({ repo, root, objective, tag, base, config, forge, host, advisor }: BriefInput): string {
   const tiers = Object.entries(config.workers.tiers)
   const t = forgeTerms(forge)
   const contract = [
@@ -89,6 +124,7 @@ export function supervisorBrief({ repo, root, objective, tag, base, config, forg
       : '   The user merges each PR once Matriarch marks it ready. Say in this chat which PR is ready and what waits on it, and keep other independent tasks moving meanwhile.',
     '6. When Matriarch sends you an escalation, decide the next step yourself: give the worker new instructions',
     '   (orca orchestration send --to dispatch:<id>), start a fixer on a stronger tier, or re-plan.',
+    ...(advisor ? advisorInstructions(advisor.role, advisor.address, '   ') : []),
     '7. After starting the workers, end your turn. Orca wakes you with their reports and with escalations.',
     '8. Once the user has agreed the plan, run it to the end without them: they may be away. Answer workers\'',
     '   questions yourself, decide escalations yourself, and never stop to wait for the user. When something truly',

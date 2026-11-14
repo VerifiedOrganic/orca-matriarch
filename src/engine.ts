@@ -3,6 +3,7 @@
 // and answer the board. Every dependency is injected, so a tick runs in tests without Orca, git,
 // GitHub or GitLab.
 import type { JsonValue } from 'orca/host'
+import type { Advisor } from './advisor.ts'
 import { defaultConfig, type ConfigResult } from './config.ts'
 import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
@@ -75,6 +76,8 @@ export interface EngineDeps {
   executor: Executor | null
   /** Runs AI review rounds; null where there is no crew (tests of other parts). */
   crew?: Crew | null
+  /** Answers the supervisor's questions for a second opinion; absent where there is none. */
+  advisor?: Pick<Advisor, 'step'> | null
   /**
    * Removes a merged PR's worktree when it is safe: answers why not (uncommitted changes, Orca
    * refused) otherwise. Absent where nothing is removed (tests of other parts).
@@ -431,6 +434,27 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     }
     // Workspaces whose PR state is unknown this tick keep their last known lane, unwritten.
     const unknownWs = new Set<string>(listed ? [] : repoWorkspaces.map((w) => w.id))
+
+    // The advisor: the supervisor's questions, answered read-only on the default branch.
+    if (deps.advisor) {
+      try {
+        const advisor = await deps.advisor.step({ repo: repoKey, root: info.root, config, supervisor, acting, base: base?.name ?? null, forge: kind })
+        if (advisor) {
+          view.advisor = advisor
+          if (advisor.answering?.blocked) {
+            board.attention.push({
+              key: `${repoKey}:advisor`,
+              repo: repoKey,
+              message: `${repoKey}: the advisor (${advisor.agent}) needs you. ${advisor.answering.blocked}.`,
+              terminal: advisor.answering.terminal ?? undefined,
+              workspaceId: advisor.answering.workspaceId ?? undefined
+            })
+          }
+        }
+      } catch (error) {
+        view.errors.push(`Advisor: ${(error as Error).message}`)
+      }
+    }
 
     const managed = summaries.filter((s) => follows(s, viewer)).sort((a, b) => a.number - b.number)
 

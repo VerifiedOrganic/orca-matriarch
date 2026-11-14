@@ -6,7 +6,8 @@ import type { JsonValue } from 'orca/host'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { AGENT_CATALOG, agentOptions, MODEL_LISTERS, parseModelList, type LiveModel } from './agents.ts'
 import { readModelCatalog, readOrcaProfile } from './orca-profile.ts'
-import { CONFIG_OFF_PATH, CONFIG_PATH, defaultConfig, forgeSettingOf, parseConfig, validateConfig, type ForgeSetting, type MatriarchConfig } from './config.ts'
+import { createAdvisor, type Advisor } from './advisor.ts'
+import { advisorUsable, CONFIG_OFF_PATH, CONFIG_PATH, defaultConfig, forgeSettingOf, parseConfig, validateConfig, type ForgeSetting, type MatriarchConfig } from './config.ts'
 import { createCrew, launchedTerminal, type Crew } from './crew.ts'
 import { branchName, tick, type ActivityInfo, type EngineDeps, type RepoInfo, type Workspace } from './engine.ts'
 import { nodeExec, type Exec } from './exec.ts'
@@ -31,11 +32,19 @@ export interface WorkerOptions {
   /** Start polling on activate (tests turn it off and call board.refresh). */
   autoStart?: boolean
   crew?: Crew
+  advisor?: Advisor
 }
 
 // The read-only guard lives in guard.ts; re-exported for the tests and callers that used it here.
 export { reviewGuard } from './guard.ts'
-import { reviewGuard } from './guard.ts'
+import { reviewGuard, type Guard } from './guard.ts'
+
+/** Both read-only guards as one: review rounds' worktrees and the advisor's. */
+export function joinGuards(a: Guard, b: Guard): Guard {
+  if (b.paths.length === 0) return a
+  if (a.paths.length === 0) return b
+  return { ids: new Set([...a.ids, ...b.ids]), paths: [...a.paths, ...b.paths], pathOf: new Map([...(a.pathOf ?? []), ...(b.pathOf ?? [])]) }
+}
 import { createLockdown } from './lockdown.ts'
 
 const DISK_FULL = 'The disk is full:'
@@ -228,6 +237,24 @@ export function createWorker(options: WorkerOptions = {}) {
     const gitlab = options.gitlab ?? gitlabForge
     const activity = new ActivityTracker()
     const lockdown = createLockdown(now, { get: (k) => orca.storage.get(k), set: (k, v) => orca.storage.set(k, v) })
+    const readIfThere = async (path: string): Promise<string | null> => {
+      try {
+        return await readFile(path, 'utf8')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      }
+    }
+    const workspaceIdFor = async (path: string): Promise<string | null> => {
+      // A new worktree can take a moment to show up in Orca's list.
+      for (let i = 0; i < 5; i++) {
+        const { workspaces } = await orca.host.call('workspace.list')
+        const hit = (workspaces as Workspace[]).find((w) => w.path === path)
+        if (hit) return hit.id
+        await new Promise((r) => setTimeout(r, 400))
+      }
+      return null
+    }
     const crew =
       options.crew ??
       createCrew({
@@ -237,14 +264,7 @@ export function createWorker(options: WorkerOptions = {}) {
         lockdown,
         log: (m) => orca.log(m),
         store: orca.storage,
-        readFile: async (path) => {
-          try {
-            return await readFile(path, 'utf8')
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-            throw error
-          }
-        },
+        readFile: readIfThere,
         // A reviewer stuck on a prompt: tell the person, and mark the worktree in Orca's own sidebar.
         alert: async (run, r) => {
           const message = `The ${r.name} reviewer (${r.agent}) on #${run.number} needs you: ${r.blocked}`
@@ -252,22 +272,33 @@ export function createWorker(options: WorkerOptions = {}) {
           if (run.worktree) await cli.run(['worktree', 'set', '--worktree', `path:${run.worktree.path}`, '--unread', '--comment', `Matriarch: ${message}`]).catch(() => {})
           void runTick()
         },
-        workspaceIdFor: async (path) => {
-          // A new worktree can take a moment to show up in Orca's list.
-          for (let i = 0; i < 5; i++) {
-            const { workspaces } = await orca.host.call('workspace.list')
-            const hit = (workspaces as Workspace[]).find((w) => w.path === path)
-            if (hit) return hit.id
-            await new Promise((r) => setTimeout(r, 400))
-          }
-          return null
-        }
+        workspaceIdFor
       })
     void crew.load()
-    orca.hooks.on('agent.tool.before', (event) => reviewGuard(event, crew.guard()) ?? undefined)
-    // Reviewers start in their agent's own read-only mode; every other launch passes untouched.
+    // The advisor answers the supervisor's questions read-only, in worktrees guarded like reviews.
+    const advisor =
+      options.advisor ??
+      createAdvisor({
+        orca: cli,
+        exec,
+        now,
+        lockdown,
+        log: (m) => orca.log(m),
+        store: orca.storage,
+        readFile: readIfThere,
+        workspaceIdFor,
+        mailbox: (repo, root) => mailboxFor(repo, root),
+        alert: async (repo, message) => {
+          await orca.host.call('notifications.show', { title: `Matriarch: ${repo} needs you`, body: message }).catch(() => {})
+          void runTick()
+        }
+      })
+    void advisor.load()
+    const readOnlyGuard = () => joinGuards(crew.guard(), advisor.guard())
+    orca.hooks.on('agent.tool.before', (event) => reviewGuard(event, readOnlyGuard()) ?? undefined)
+    // Reviewers and the advisor start in their agent's own read-only mode; every other launch passes untouched.
     orca.hooks.on('agent.launch.before', (event, next) => {
-      const result = lockdown.onLaunch(event, crew.guard())
+      const result = lockdown.onLaunch(event, readOnlyGuard())
       if (!result) return undefined
       if ('deny' in result) {
         orca.log(`refused ${event.agent} in review worktree ${event.workspaceId}: ${result.deny}`)
@@ -374,6 +405,7 @@ export function createWorker(options: WorkerOptions = {}) {
       },
       store: orca.storage,
       crew,
+      advisor,
       freeSpace: async (path) => {
         const s = await statfs(path)
         return Number(s.bavail) * Number(s.bsize)
@@ -526,7 +558,11 @@ export function createWorker(options: WorkerOptions = {}) {
       const tag = supervisorTag(repo, now().toString(36))
       const sup = cfg.config.supervisor
       const ref = (await repoOf(repoView.root).catch(() => null))?.ref
-      const brief = supervisorBrief({ repo, root: repoView.root, objective: objective ?? '', tag, base, config: cfg.config, forge: repoView.forge, host: ref?.host })
+      // The advisor it may ask, and Matriarch's mailbox the questions go to.
+      const role = cfg.config.advisor
+      const address = advisorUsable(role) ? await mailboxFor(repo, repoView.root) : null
+      const advice = advisorUsable(role) && address ? { role, address } : null
+      const brief = supervisorBrief({ repo, root: repoView.root, objective: objective ?? '', tag, base, config: cfg.config, forge: repoView.forge, host: ref?.host, ...(advice ? { advisor: advice } : {}) })
       let receipt: unknown
       try {
         receipt = await cli.run(supervisorLaunchArgs(sup, repoView.root, brief, 'chat'))
@@ -544,6 +580,7 @@ export function createWorker(options: WorkerOptions = {}) {
         if (terminal) await orca.storage.set(`supervisor:terminal:${repo}`, terminal)
         else await orca.storage.delete(`supervisor:terminal:${repo}`)
         await orca.storage.set(`supervisor:pending:${repo}`, { tag, at: now() })
+        await advisor.briefed(repo, advice)
       })
       void runTick()
       return { started: true, message: `Supervisor chat opened (${sup.agent}${sup.model ? ` ${sup.model}` : ''}). Tell it what to build there.` }
@@ -697,7 +734,7 @@ export function createWorker(options: WorkerOptions = {}) {
       const root = rootOf(repo)
       const cfg = root ? await deps.readConfig(root) : null
       const config = cfg?.config ?? defaultConfig()
-      const inUse = [config.supervisor.agent, config.workers.default.agent, ...Object.values(config.workers.tiers).map((t) => t.agent), ...config.reviewers.map((r) => r.agent)]
+      const inUse = [config.supervisor.agent, config.workers.default.agent, ...Object.values(config.workers.tiers).map((t) => t.agent), ...config.reviewers.map((r) => r.agent), ...(config.advisor ? [config.advisor.agent] : [])]
       const [person, models] = await Promise.all([profile(), readModelCatalog(exec, options.orcaDataDir)])
       // Agents that can list their models now are asked: every provider the person signed in to.
       const live: Record<string, LiveModel[]> = {}
