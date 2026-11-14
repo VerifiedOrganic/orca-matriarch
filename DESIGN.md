@@ -182,7 +182,7 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   `agent.launch.before` hook rewrites any launch inside a review worktree, swapping your Orca
   permission choice for:
   - **Claude:** `--permission-mode dontAsk`, an allowlist (read the worktree, read-only git,
-    `cat`/`grep`/`rg`/`ls`, write only `.matriarch/review/**`) and a denylist (push, commit,
+    `cat`/`grep`/`ls`, write only `.matriarch/review/**`) and a denylist (push, commit,
     reset, merge, `gh` and `glab` writes, `gh api`, `glab api`, `rm`, web). The denylist also refuses any command that
     reaches outside the worktree: absolute paths (quoted or not, after `=` or `<`), `~`, `$HOME`,
     and `..` out of it. So a reviewer cannot read your files into a verdict that gets posted.
@@ -200,6 +200,13 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
     read-only commands, writes only to the verdict file, and reads only inside the worktree. It
     resolves real paths: it follows `cd`, and it skips search patterns (a `'/// doc'` grep
     pattern is not an absolute path).
+  - Neither layer allows a flag that runs a program or writes a file (`rg --pre`, `git grep -O`,
+    `fd -x`, `sort -o`, `git -c`, sed's `e` and `w`, awk's pipes), and the guard refuses what
+    could disguise one: an escape or `$'…'` quoting, `{a,b}` expansion, a `$VAR` given to such a
+    tool, environment variables, and git's shortened long options. Claude's allowlist leaves out
+    `rg` and `git grep` altogether, since a rule there is a prefix; its Grep tool searches instead.
+    This matters because `--setting-sources user` keeps your own allow rules, which the guard
+    is then the only check on.
   - Codex's sandbox can read outside the worktree; it has no network, so its only output is the
     verdict.
 - **Output.** Each reviewer writes `.matriarch/review/<sha>/<name>.json`:
