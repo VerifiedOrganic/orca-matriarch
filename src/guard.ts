@@ -56,11 +56,9 @@ export function shellSegments(command: string): { segments: string[]; redirects:
       cur += c
       continue
     }
-    if (c === '\\') {
-      cur += c + (next ?? '')
-      i++
-      continue
-    }
+    // An escape, $'…' or $"…" quoting and {a,b} expansion all make a word other than it reads
+    // (`--out\\put`, `--p{re,}`), which would slip a flag past the checks below.
+    if (c === '\\' || c === '{' || (c === '$' && (next === "'" || next === '"'))) return null
     if (c === "'" || c === '"') {
       quote = c
       cur += c
@@ -100,7 +98,7 @@ export function shellSegments(command: string): { segments: string[]; redirects:
 const words = (segment: string): string[] => segment.match(/'[^']*'|"(?:\\.|[^"])*"|\S+/g)?.map((w) => w.replace(/^['"]|['"]$/g, '')) ?? []
 
 const READ_ONLY = new Set([
-  'cat', 'head', 'tail', 'less', 'more', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ls', 'tree', 'wc', 'file', 'stat', 'du',
+  'cat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ls', 'tree', 'wc', 'file', 'stat', 'du',
   'sort', 'uniq', 'cut', 'tr', 'jq', 'yq', 'diff', 'cmp', 'comm', 'nl', 'column', 'basename', 'dirname', 'realpath',
   'readlink', 'pwd', 'echo', 'printf', 'true', 'false', 'test', '[', 'cd', 'od', 'hexdump', 'strings', 'bat', 'fd', 'which', 'type',
   // Checksums only read: a reviewer checks a lockfile or an artifact against them.
@@ -111,16 +109,28 @@ const GIT_READ = new Set([
   'shortlog', 'describe', 'name-rev', 'rev-list', 'whatchanged', 'for-each-ref', 'show-ref', 'count-objects'
 ])
 
+/** The option a word names, without its =value. */
+const optName = (a: string): string => a.split('=')[0]
+/** Whether `a` is `long` or a shortening of it, which git and GNU tools accept for a long option. */
+const shortens = (a: string, long: string, min = 3): boolean => a.startsWith('--') && optName(a).length >= min && long.startsWith(optName(a))
+/** Whether `a` is a cluster of short options (-iO, -Hx) holding one of `letters`. */
+const clusterHas = (a: string, letters: string): boolean => /^-[^-]/.test(a) && [...a.slice(1)].some((ch) => letters.includes(ch))
+/** The operands of a command: its words that are not options. */
+const operands = (args: readonly string[]): string[] => args.filter((a) => !a.startsWith('-'))
+
 function gitAllowed(args: string[]): boolean {
   let i = 0
+  // Not -c, --git-dir or --work-tree: a config value (core.fsmonitor, diff.external) runs a program.
   while (i < args.length && args[i].startsWith('-')) {
-    if (args[i] === '-C' || args[i] === '-c') i += 2
-    else if (['--no-pager', '--no-optional-locks', '-P'].includes(args[i]) || /^--(git-dir|work-tree)=/.test(args[i])) i++
+    if (args[i] === '-C') i += 2
+    else if (['--no-pager', '--no-optional-locks', '-P'].includes(args[i])) i++
     else return false
   }
   const sub = args[i]
   const rest = args.slice(i + 1)
-  if (GIT_READ.has(sub)) return !rest.some((a) => a === '--output' || a.startsWith('--output='))
+  // git grep -O / --open-files-in-pager runs a program on the files it finds.
+  if (sub === 'grep' && rest.some((a) => clusterHas(a, 'O') || shortens(a, '--open-files-in-pager', 4))) return false
+  if (GIT_READ.has(sub)) return !rest.some((a) => shortens(a, '--output'))
   if (sub === 'branch') return rest.every((a) => ['-a', '-r', '-v', '-vv', '--list', '--show-current', '--contains', '--merged', '--no-merged'].includes(a) || !a.startsWith('-'))
     && !rest.some((a) => /^-[dDmMcC]|^--(delete|move|copy|set-upstream)/.test(a)) && rest.filter((a) => !a.startsWith('-')).length === 0
   if (sub === 'remote') return rest.every((a) => a === '-v' || a === 'show' || a === 'get-url')
@@ -231,20 +241,92 @@ export function staysInside(segments: readonly string[], root: string | null): b
   return true
 }
 
+/** One sed command that only prints, deletes from the output, quits or numbers lines, after an address. */
+const SED_ADDR = String.raw`(?:\d+|\$|/(?:[^/\\]|\\.)*/I?)`
+const SED_PRINT = new RegExp(String.raw`^\s*(?:${SED_ADDR}(?:\s*,\s*${SED_ADDR})?)?\s*!?\s*[pdq=]?\s*$`)
+
+/** sed only to print lines: -n/-E and scripts of addresses with p, d, q or =. Not -i, -f, w, r or e. */
+function sedAllowed(args: readonly string[]): boolean {
+  const scripts: string[] = []
+  let fromOption = false
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a === '-e' || a === '--expression') {
+      scripts.push(args[++i] ?? '')
+      fromOption = true
+    } else if (a.startsWith('--expression=')) {
+      scripts.push(a.slice(13))
+      fromOption = true
+    } else if (a.startsWith('-')) {
+      if (!['-n', '-E', '-r', '--quiet', '--silent', '--regexp-extended', '--posix'].includes(a)) return false
+    } else if (!fromOption && scripts.length === 0) scripts.push(a)
+  }
+  return scripts.length > 0 && scripts.every((s) => s.split(/[;\n]/).every((cmd) => SED_PRINT.test(cmd)))
+}
+
+/** awk's program without its -F and -v values: no system(), no pipe to or from a command, no getline or print into a file. */
+function awkAllowed(args: readonly string[]): boolean {
+  const program: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]
+    if (a === '-F' || a === '-v') i++
+    else if (a === '-f') return false
+    else if (!a.startsWith('-')) program.push(a)
+  }
+  return !program.some((a) => /system\s*\(|getline|\||print[^|]*>/.test(a))
+}
+
+/**
+ * Flags that make a read-only tool run a program or write a file, by tool. A tool not listed
+ * has none. Long options are matched with their shortenings where the tool accepts them.
+ */
+const RISKY_FLAGS: Record<string, (args: readonly string[]) => boolean> = {
+  rg: (args) => args.some((a) => a.startsWith('--pre') || a.startsWith('--hostname-bin')),
+  ag: (args) => args.some((a) => shortens(a, '--pager', 4)),
+  fd: (args) => args.some((a) => a.startsWith('--exec') || clusterHas(a, 'xX')),
+  bat: (args) => args.some((a) => a.startsWith('--pager')),
+  sort: (args) => args.some((a) => clusterHas(a, 'o') || shortens(a, '--output') || shortens(a, '--compress-program', 4)),
+  tree: (args) => args.some((a) => clusterHas(a, 'o')),
+  file: (args) => args.some((a) => clusterHas(a, 'C') || shortens(a, '--compile', 4)),
+  yq: (args) => args.some((a) => clusterHas(a, 'i') || a.startsWith('--inplace') || a.startsWith('--in-place')),
+  // With a second operand these write their output there.
+  uniq: (args) => operands(args).length > 1,
+  xxd: (args) => operands(args).length > 1
+}
+/** Tools whose words a $VAR could turn into a flag: one with flags that matter, or a pattern. */
+const FLAG_SENSITIVE = new Set(['git', 'gh', 'glab', 'sed', 'awk', 'find', 'mkdir', 'tee', ...Object.keys(RISKY_FLAGS)])
+
+/** Whether a segment expands a variable outside single quotes ($f, "$f", ${f}). */
+function expandsVariable(segment: string): boolean {
+  let single = false
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i]
+    if (c === "'") single = !single
+    else if (!single && c === '$' && /[A-Za-z0-9_{@*#?!-]/.test(segment[i + 1] ?? '')) return true
+  }
+  return false
+}
+
 function segmentAllowed(segment: string, root: string | null): boolean {
   const w = words(segment)
-  // Leading VAR=value assignments only set shell variables.
-  while (w.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0])) w.shift()
-  if (w.length === 0) return true
+  let k = 0
+  while (k < w.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[k])) k++
+  // A line of only assignments sets shell variables, which later words may read. Not uppercase
+  // names: those are the environment (PATH, LESSOPEN, GIT_CONFIG_*, PAGER), which programs act on.
+  if (k === w.length) return w.every((a) => /^[a-z_][a-z0-9_]*=/.test(a))
+  // VAR=value before a command puts it in that command's environment: GIT_EXTERNAL_DIFF and the like.
+  if (k > 0) return false
   const [cmd, ...args] = w
+  if (FLAG_SENSITIVE.has(cmd) && expandsVariable(segment)) return false
   if (cmd === 'git') return gitAllowed(args)
   if (cmd === 'gh') return ghAllowed(args)
   if (cmd === 'glab') return glabAllowed(args)
-  if (cmd === 'sed') return !args.some((a) => a === '-i' || a.startsWith('-i') || a === '--in-place' || a.startsWith('--in-place') || /(^|[;{])\s*[wW]\s/.test(a))
-  if (cmd === 'awk') return !args.some((a) => /system\s*\(|print[^|]*>|\|\s*"/.test(a))
-  if (cmd === 'find') return !args.some((a) => ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprintf', '-fls'].includes(a))
+  if (cmd === 'sed') return sedAllowed(args)
+  if (cmd === 'awk') return awkAllowed(args)
+  if (cmd === 'find') return !args.some((a) => ['-delete', '-exec', '-execdir', '-ok', '-okdir', '-fprint', '-fprint0', '-fprintf', '-fls'].includes(a))
   if (cmd === 'mkdir') return root !== null && args.filter((a) => !a.startsWith('-')).every((d) => resolve(root, d).startsWith(`${resolve(root)}/.matriarch/`))
   if (cmd === 'tee') return root !== null && args.filter((a) => !a.startsWith('-')).every((f) => isVerdictFile(root, f))
+  if (Object.hasOwn(RISKY_FLAGS, cmd) && RISKY_FLAGS[cmd](args)) return false
   return READ_ONLY.has(cmd)
 }
 
