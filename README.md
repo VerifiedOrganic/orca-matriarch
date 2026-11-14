@@ -98,9 +98,10 @@ manages only PRs you opened from a branch that belongs to an Orca workspace.
 - **Board:** cards by state with the agent and model, CI, comments and rounds used, and in dry
   run what Matriarch would do next. **Run AI review now** on any card runs the crew on that
   commit, in dry run too.
-- **Supervisor:** each project's chat, with the Run it coordinates and how many workers it has.
+- **Supervisor:** each project's chat, with the Run it coordinates and how many of its workers
+  are running, against the project's limit.
 - **Needs you:** a reviewer waiting on a prompt, an escalation that reached you, a nearly full
-  disk. The status bar shows the same at a glance.
+  disk, a supervisor that went over its worker limits. The status bar shows the same at a glance.
 - **Full tab:** tab bar **+** → **Matriarch board**.
 
 <img src="docs/picker.png" width="400" alt="Settings: picking a worker's model on OpenCode, with the list filtered as you type and grouped by provider.">
@@ -116,6 +117,13 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - later rounds check only what changed (**Later rounds: check the fixes**);
 - reviewers on the same agent as the PR's author are skipped (you can turn that off);
 - **Reviews at once** (default 2) limits how many review crews run together.
+- **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
+  supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
+  The supervisor's brief states them, and a running supervisor is told when you change them.
+  Matriarch refuses a Claude Code supervisor's `worker-start` over a limit, with what to do
+  instead (wait for a worker to finish, for tomorrow, or for space). Orca lets a plugin stop only
+  Claude Code's tool calls, so a supervisor on another agent can go over; **Needs you** then says
+  so. Limits hold in dry run too: they guard your disk and accounts, not the PRs.
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback
 model you choose; otherwise it shows the reviewer as **Needs you**.
@@ -138,7 +146,9 @@ start agents and read their state. It asks Orca for these capabilities:
   storage.
 - **Own settings** (`settings:own`): autopilot on or off, and how often it checks GitHub and GitLab.
 
-It also adds two **hooks** that apply only to agents launched in a review worktree:
+It also adds two **hooks**. They change nothing for agents outside a review worktree, except
+that a Claude Code agent's `orca orchestration worker-start` in one of your projects is refused
+when it would go over that project's worker limits (see [What it costs](#what-it-costs)):
 
 - **Before an agent launches** (`agent.launch.before`), a reviewer's command is rewritten so it
   starts read-only, whatever permission mode you chose in Orca:

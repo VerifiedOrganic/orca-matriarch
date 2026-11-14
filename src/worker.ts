@@ -36,6 +36,7 @@ export interface WorkerOptions {
 // The read-only guard lives in guard.ts; re-exported for the tests and callers that used it here.
 export { reviewGuard } from './guard.ts'
 import { reviewGuard } from './guard.ts'
+import { createLimitsGuard, limitsChanged, limitsMessage } from './limits.ts'
 import { createLockdown } from './lockdown.ts'
 
 const DISK_FULL = 'The disk is full:'
@@ -264,7 +265,17 @@ export function createWorker(options: WorkerOptions = {}) {
         }
       })
     void crew.load()
-    orca.hooks.on('agent.tool.before', (event) => reviewGuard(event, crew.guard()) ?? undefined)
+    // The supervisor's worker starts are held to each project's limits (limits.ts). Orca waits on
+    // this hook only for Claude Code; for another agent the refusal is ignored and the board says so.
+    const limitsGuard = createLimitsGuard(now)
+    orca.hooks.on('agent.tool.before', (event) => {
+      const review = reviewGuard(event, crew.guard())
+      if (review) return review
+      const limit = limitsGuard.decide(event)
+      if (!limit) return undefined
+      orca.log(`${limit.repo}: refused a worker start by ${event.agent}: ${limit.deny}`)
+      return { deny: limit.deny }
+    })
     // Reviewers start in their agent's own read-only mode; every other launch passes untouched.
     orca.hooks.on('agent.launch.before', (event, next) => {
       const result = lockdown.onLaunch(event, crew.guard())
@@ -378,6 +389,7 @@ export function createWorker(options: WorkerOptions = {}) {
         const s = await statfs(path)
         return Number(s.bavail) * Number(s.bsize)
       },
+      onLimits: (state) => limitsGuard.update(state),
       removeWorktree: async (path, options) => {
         // Only a clean worktree goes: anything uncommitted, even an untracked file, keeps it.
         const status = await exec('git', ['-C', path, 'status', '--porcelain'], { timeoutMs: 15_000 })
@@ -427,6 +439,7 @@ export function createWorker(options: WorkerOptions = {}) {
           const next = await exclusive(async () => tick(deps, { autopilot: await isOn(), stillOn: isOn }))
           // Orca accepts only plain JSON from a worker: drop undefined fields once, here.
           board = JSON.parse(JSON.stringify(next)) as Board
+          limitsGuard.keep(new Set(board.repos.map((r) => r.repo)))
           // Back off while Orca or a forge keeps failing (rate limits included), not only when the board is empty.
           const trouble = (board.errors.length > 0 && board.tracks.length === 0) || board.repos.some((r) => r.errors.some((e) => /^(GitHub|GitLab):/.test(e)))
           failures = trouble ? failures + 1 : 0
@@ -734,11 +747,14 @@ export function createWorker(options: WorkerOptions = {}) {
       // A running supervisor got its worker commands in its brief, when its chat began: tell it the
       // new ones, so the next worker it starts runs on the new agent, model and thinking level.
       const run = board.repos.find((r) => r.repo === repo)?.supervisor.run
-      if (run && JSON.stringify(before?.config.workers ?? null) !== JSON.stringify(checked.config.workers)) {
-        const m = workerSettingsMessage(checked.config)
+      const tell = async (m: { subject: string; body: string }, what: string) => {
+        if (!run) return
         await sendMessage(cli, { to: run, subject: m.subject, body: m.body, from: await mailboxFor(repo, root) })
-          .catch((error: Error) => orca.log(`${repo}: could not tell the supervisor about the new worker settings: ${error.message}`))
+          .catch((error: Error) => orca.log(`${repo}: could not tell the supervisor about the new ${what}: ${error.message}`))
       }
+      if (JSON.stringify(before?.config.workers ?? null) !== JSON.stringify(checked.config.workers)) await tell(workerSettingsMessage(checked.config), 'worker settings')
+      // Its limits too, which its brief gave it and Matriarch now holds it to.
+      if (limitsChanged(before?.config.limits, checked.config.limits)) await tell(limitsMessage(checked.config.limits), 'worker limits')
       // The forge setting decides which forge the project is read from: look it up again.
       repoOf = createRepoResolver(exec)
       await runTick()

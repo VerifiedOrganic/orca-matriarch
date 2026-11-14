@@ -3,6 +3,7 @@
 // then finds the orchestration Run it creates (by a tag in the objective) so escalations reach it.
 import { modelFlags, type MatriarchConfig, type RoleSpec } from './config.ts'
 import { forgeTerms, type ForgeKind } from './forge.ts'
+import { limitLines } from './limits.ts'
 
 /** `[matriarch:<repo>:<nonce>]`: lets Matriarch find the supervisor's Run among all Runs. */
 export const supervisorTag = (repo: string, nonce: string): string => `[matriarch:${repo}:${nonce}]`
@@ -77,6 +78,7 @@ export function supervisorBrief({ repo, root, objective, tag, base, config, forg
     '   Always pass the --effort shown. If Orca refuses it ("does not support effort"), start that one worker without',
     '   --effort and say so, but pass it again on every later start: Orca\'s model list catches up with the agent\'s.',
     '   Never change the agent or the model.',
+    ...limitLines(config.limits).map((line) => `   ${line}`),
     '   Worktrees that never become a PR (a gate, an audit, a spike) are yours to clean up: once you have recorded',
     '   the result and no worker runs there, remove it (orca worktree rm --worktree path:<path> --json). Matriarch',
     '   removes each PR\'s worktree itself once the PR merges.',

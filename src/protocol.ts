@@ -119,6 +119,14 @@ export interface RepoView {
     terminal: string | null
     /** Supervised workers in its Run. */
     workers: number
+    /** Of those, the ones still running their task. */
+    live?: number
+    /** Workers it may run at once (limits.maxWorkers); 0 for no cap. */
+    maxWorkers?: number
+    /** Workers started today, counted from when Matriarch first saw each. */
+    startsToday?: number
+    /** Workers it may start a day (limits.maxWorkerStartsPerDay); 0 for no cap. */
+    maxStarts?: number
   }
   errors: string[]
   warnings: string[]

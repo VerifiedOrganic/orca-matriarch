@@ -34,7 +34,7 @@
     ready: true, attention: [],
     at: now - 12_000, autopilot: false, since: now - 24 * H, rate: { remaining: 4870, resetAt: '13:00' }, errors: [],
     repos: [
-      { repo: 'acme/app', root: '/src/app', mergeMode: 'auto', supervisor: { agent: 'claude', model: 'claude-opus-5-5', run: 'run:r-41a', pending: false, terminal: null, workers: 3 }, errors: [], warnings: ['reviewers[2].model: Orca cannot pass --model to gemini; it will run its default model'] },
+      { repo: 'acme/app', root: '/src/app', mergeMode: 'auto', supervisor: { agent: 'claude', model: 'claude-opus-5-5', run: 'run:r-41a', pending: false, terminal: null, workers: 3, live: 2, maxWorkers: 4, startsToday: 5, maxStarts: 0 }, errors: [], warnings: ['reviewers[2].model: Orca cannot pass --model to gemini; it will run its default model'] },
       { repo: 'acme/infra', root: '/src/infra', mergeMode: 'manual', supervisor: { agent: 'claude', model: 'claude-opus-5-5', run: null, pending: false, terminal: null, workers: 0 }, errors: [], warnings: [] }
     ],
     tracks: [
@@ -91,7 +91,7 @@
     review: { enabled: true, trigger: 'ci-green', pass: 'all-blocking-approve', blockAt: 'major', differentProviderThanAuthor: true, maxRounds: 3, publish: 'orca-only', followUp: 'focused', fallback: role('claude', 'claude-sonnet-5-5') },
     fix: { ci: { enabled: true, maxRounds: 3 }, comments: { enabled: true, maxRounds: 3 }, conflicts: { enabled: true, maxRounds: 2 } },
     merge: { mode: 'manual', method: 'squash', requireHuman: [], updateBranch: 'rebase', onBaseRed: 'pause', deleteBranch: true, removeWorktree: true, removeFinishedWorktrees: true },
-    escalation: { supervisorFirst: true, humanAfterMinutes: 30 }, limits: { maxConcurrentReviews: 2 }
+    escalation: { supervisorFirst: true, humanAfterMinutes: 30 }, limits: { maxConcurrentReviews: 2, maxWorkers: 4, maxWorkerStartsPerDay: 0, minFreeDiskGB: 10 }
   }
   const agent = (id, label, installed, lockable, models, efforts) => ({ id, label, installed, lockable, takesModel: true, efforts, defaultModel: models[0] ?? null, defaultEffort: null,
     models: models.map((m) => ({ id: m, label: m, efforts })) })

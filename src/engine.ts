@@ -11,6 +11,7 @@ import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader } from './forge
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
 import { ledgerKey, loadLedger, record, roundsUsed, type PrLedger } from './ledger.ts'
+import { countStarts, dayOf, isWorking, loadStarts, type LimitState } from './limits.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
 import { MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
@@ -82,10 +83,10 @@ export interface EngineDeps {
   removeWorktree?: (path: string, options?: { keepBranch?: boolean }) => Promise<{ removed: boolean; reason?: string }>
   /** Bytes free on the disk holding a path; null when it cannot tell. */
   freeSpace?: (path: string) => Promise<number | null>
+  /** Each project's workers and disk against its limits, for the hook that refuses a worker start. */
+  onLimits?: (state: LimitState) => void
 }
 
-/** Below this, the board says the disk is nearly full: a full disk stalls every agent's build. */
-export const LOW_DISK_BYTES = 10 * 1024 ** 3
 const gb = (bytes: number): string => `${(bytes / 1024 ** 3).toFixed(1)} GB`
 
 interface PendingCleanup {
@@ -375,20 +376,54 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         run: supervisor,
         pending: Boolean(pending?.tag && !supervisor),
         terminal: ((await deps.store.get(`supervisor:terminal:${repoKey}`)) as string | null) ?? null,
-        workers: supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor).length : 0
+        workers: supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor).length : 0,
+        maxWorkers: config.limits.maxWorkers,
+        maxStarts: config.limits.maxWorkerStartsPerDay
       },
       errors: [...cfg.errors],
       warnings: [...cfg.warnings]
     }
     board.repos.push(view)
     // A nearly full disk stalls builds, Orca's saves and Matriarch's own, with nothing on screen:
-    // say so once per board, before it fills.
+    // say so once per board, before it fills. The same floor stops the supervisor starting workers.
     const free = deps.freeSpace ? await deps.freeSpace(info.root).catch(() => null) : null
-    if (free !== null && free < LOW_DISK_BYTES && !board.attention.some((a) => a.key === 'disk')) {
+    const limits = config.limits
+    if (free !== null && limits.minFreeDiskGB > 0 && free < limits.minFreeDiskGB * 1024 ** 3 && !board.attention.some((a) => a.key === 'disk')) {
       board.attention.push({
         key: 'disk',
         repo: repoKey,
         message: `Only ${gb(free)} free on the disk with ${repoKey}. Agents' builds, Orca and Matriarch stop saving once it is full: free some space to keep the pod moving.`
+      })
+    }
+    // The supervisor's workers against the limits: on its row, and to the hook that refuses a
+    // worker start over one. A start is counted once Matriarch first sees its worker.
+    const mine = supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor) : []
+    const live = mine.filter(isWorking).length
+    let starts = loadStarts(await deps.store.get(`starts:${repoKey}`))
+    if (ownersKnown) {
+      const next = countStarts(starts, mine.map((w) => w.dispatchId), now)
+      if (JSON.stringify(next) !== JSON.stringify(starts)) await deps.store.set(`starts:${repoKey}`, next as unknown as JsonValue)
+      starts = next
+    }
+    const startsToday = starts && starts.day === dayOf(now) ? starts.count : 0
+    view.supervisor.live = live
+    view.supervisor.startsToday = startsToday
+    if (ownersKnown) {
+      deps.onLimits?.({ repo: repoKey, root: info.root, workspaces: repoWorkspaces.map((w) => ({ id: w.id, path: w.path })), live, startsToday, day: dayOf(now), freeBytes: free, limits })
+    }
+    // Orca waits on the hook only for Claude Code: a supervisor on another agent can go over.
+    const over =
+      limits.maxWorkers > 0 && live > limits.maxWorkers
+        ? `${live} workers are running, over its limit of ${limits.maxWorkers} at once`
+        : limits.maxWorkerStartsPerDay > 0 && startsToday > limits.maxWorkerStartsPerDay
+          ? `${startsToday} workers started today, over its limit of ${limits.maxWorkerStartsPerDay} a day`
+          : null
+    if (over) {
+      board.attention.push({
+        key: `limits:${repoKey}`,
+        repo: repoKey,
+        message: `${repoKey}: ${over}. Matriarch can refuse a worker start only from a Claude Code supervisor: ask the supervisor to wait for its workers to finish, or raise the limit in Settings.`,
+        terminal: view.supervisor.terminal ?? undefined
       })
     }
     // A config with errors may have lost a guard (a protected path, a reviewer): watch only.

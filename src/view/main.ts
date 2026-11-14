@@ -521,6 +521,13 @@ function work(tracks: TrackView[], b: Board, headers: boolean): HTMLElement[] {
   return [tabs(), state.view === 'timeline' ? timeline(tracks, b, headers) : boardView(tracks)]
 }
 
+/** Its running workers against the cap, and today's starts against theirs when there is one. */
+export function workerCount(s: RepoView['supervisor']): string {
+  const live = s.live ?? s.workers
+  const running = s.maxWorkers ? `${live} of ${s.maxWorkers} workers running` : `${live} worker${live === 1 ? '' : 's'} running`
+  return s.maxStarts ? `${running} · ${s.startsToday ?? 0} of ${s.maxStarts} started today` : running
+}
+
 function supervisorCard(r: RepoView): HTMLElement {
   const s = r.supervisor
   const phase = s.run ? 'running' : s.pending ? 'starting' : 'idle'
@@ -546,7 +553,7 @@ function supervisorCard(r: RepoView): HTMLElement {
       el('b', {}, 'Supervisor'),
       el('span', { class: `badge badge-${phase}` }, badge),
       el('span', { class: 'muted' }, who),
-      phase === 'running' ? el('span', { class: 'muted' }, `· ${s.workers} worker${s.workers === 1 ? '' : 's'}`) : null,
+      phase === 'running' ? el('span', { class: 'muted', title: `${s.workers} worker${s.workers === 1 ? '' : 's'} in its Run in all` }, `· ${workerCount(s)}`) : null,
       el('span', { class: 'spacer' }),
       phase === 'idle'
         ? el('button', { class: 'primary', disabled: state.busy || r.empty === true, title: r.empty ? `Push a first commit to ${forgeOf(r)} first` : 'Opens a briefed chat; nothing starts until you agree a plan there', onclick: openChat }, 'Open supervisor chat')
