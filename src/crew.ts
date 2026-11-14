@@ -191,6 +191,53 @@ export function launchedTerminal(result: unknown): string | null {
   return str(outcome.handle) ?? str(outcome.terminalId) ?? str(r.terminal) ?? str(r.handle) ?? str(r.terminalId) ?? str(obj(r.launch).handle)
 }
 
+/** What a locked launch needs: the CLI, the clock and the launch hook's record. */
+export type LaunchDeps = Pick<CrewDeps, 'orca' | 'now' | 'lockdown' | 'lockConfirmMs'>
+
+/**
+ * Starts an agent in a review worktree, locked down read-only by its own agent, and confirms the
+ * launch hook did that. An agent Matriarch cannot lock down is not started unless `readOnly` is
+ * false; one Orca started without the lockdown is stopped at once. Used for reviewers and for the
+ * advisor. `lock` is undefined when there is no hook record to check (tests of other parts).
+ */
+export async function launchLocked(
+  deps: LaunchDeps,
+  input: { path: string; role: RoleSpec; readOnly?: boolean; prompt: string; notLockable: string }
+): Promise<{ terminal: string | null; lock?: LockMode | null; error: string | null }> {
+  const { path, role } = input
+  const lockable = LOCKABLE_AGENTS.includes(role.agent)
+  if (!lockable && input.readOnly !== false) return { terminal: null, error: input.notLockable }
+  if (!lockable) deps.lockdown?.exempt(path, role.agent)
+  const args = ['agent', 'launch', '--agent', role.agent, '--worktree', `path:${path}`, '--surface', 'terminal', '--prompt', input.prompt, ...modelFlags(role)]
+  const since = deps.now()
+  let terminal: string | null
+  try {
+    terminal = launchedTerminal(await deps.orca.run(args))
+  } catch (error) {
+    return { terminal: null, error: `launch failed: ${(error as Error).message}` }
+  }
+  if (!deps.lockdown) return { terminal, error: null }
+  // The hook runs while Orca starts the agent; give a slow answer a moment.
+  // A reload of the plugin mid-launch sends the hook to the new copy: its record counts too.
+  const lock = deps.lockdown
+  const check = async () => lock.confirmed(path, role.agent, since) ?? (lock.recall ? await lock.recall(path, role.agent, since) : null)
+  let mode = await check()
+  for (let waited = 0; !mode && waited < (deps.lockConfirmMs ?? LOCK_CONFIRM_MS); waited += 250) {
+    await new Promise((r) => setTimeout(r, 250))
+    mode = await check()
+  }
+  if (mode) return { terminal, lock: mode, error: null }
+  // Orca started it without the lockdown (the hook timed out or did not run): stop it.
+  if (terminal) await deps.orca.run(['terminal', 'close', '--terminal', terminal]).catch(() => {})
+  return {
+    terminal,
+    lock: null,
+    error: terminal
+      ? 'stopped: Orca started it without Matriarch\'s read-only lockdown (the launch hook did not answer in time)'
+      : 'Orca started it without Matriarch\'s read-only lockdown and gave no terminal to stop; close it in the review worktree'
+  }
+}
+
 export interface StartInput {
   pr: PrSnapshot
   /** The repository's main checkout. */
@@ -363,58 +410,32 @@ export function createCrew(deps: CrewDeps): Crew {
     previous: { sha: string; findings: CrewFinding[] } | null,
     focused = false
   ): Promise<CrewReviewer> {
-        const brief = reviewerBrief({ pr, reviewer, round, maxRounds, previous, focused })
-        const args = ['agent', 'launch', '--agent', reviewer.agent, '--worktree', `path:${path}`, '--surface', 'terminal', '--prompt', brief]
-        args.push(...modelFlags(reviewer))
-        const entry: CrewReviewer = {
-          name: reviewer.name,
-          agent: reviewer.agent,
-          model: reviewer.model ?? null,
-          effort: reviewer.effort ?? null,
-          focus: reviewer.focus ?? null,
-          blocking: reviewer.blocking,
-          status: 'running',
-          terminal: null,
-          startedAt: deps.now(),
-          endedAt: null,
-          error: null,
-          verdict: null
-        }
-        const failed = (error: string) => Object.assign(entry, { status: 'failed', error, endedAt: deps.now() })
-        const lockable = LOCKABLE_AGENTS.includes(reviewer.agent)
-        if (!lockable && reviewer.readOnly !== false) {
-          failed(`not started: Matriarch can start only claude and codex reviewers read-only. Set "readOnly": false on "${reviewer.name}" to run ${reviewer.agent} with your usual permissions.`)
-          return entry
-        }
-        if (!lockable) deps.lockdown?.exempt(path, reviewer.agent)
-        const since = deps.now()
-        try {
-          entry.terminal = launchedTerminal(await deps.orca.run(args))
-        } catch (error) {
-          failed(`launch failed: ${(error as Error).message}`)
-        }
-        if (entry.status === 'running' && deps.lockdown) {
-          // The hook runs while Orca starts the agent; give a slow answer a moment.
-          // A reload of the plugin mid-launch sends the hook to the new copy: its record counts too.
-          const lock = deps.lockdown
-          const check = async () => lock.confirmed(path, reviewer.agent, since) ?? (lock.recall ? await lock.recall(path, reviewer.agent, since) : null)
-          let mode = await check()
-          for (let waited = 0; !mode && waited < (deps.lockConfirmMs ?? LOCK_CONFIRM_MS); waited += 250) {
-            await new Promise((r) => setTimeout(r, 250))
-            mode = await check()
-          }
-          entry.lock = mode
-          if (!mode) {
-            // Orca started it without the lockdown (the hook timed out or did not run): stop it.
-            if (entry.terminal) await deps.orca.run(['terminal', 'close', '--terminal', entry.terminal]).catch(() => {})
-            failed(
-              entry.terminal
-                ? 'stopped: Orca started it without Matriarch\'s read-only lockdown (the launch hook did not answer in time)'
-                : 'Orca started it without Matriarch\'s read-only lockdown and gave no terminal to stop; close it in the review worktree'
-            )
-          }
-        }
-        return entry
+    const brief = reviewerBrief({ pr, reviewer, round, maxRounds, previous, focused })
+    const entry: CrewReviewer = {
+      name: reviewer.name,
+      agent: reviewer.agent,
+      model: reviewer.model ?? null,
+      effort: reviewer.effort ?? null,
+      focus: reviewer.focus ?? null,
+      blocking: reviewer.blocking,
+      status: 'running',
+      terminal: null,
+      startedAt: deps.now(),
+      endedAt: null,
+      error: null,
+      verdict: null
+    }
+    const started = await launchLocked(deps, {
+      path,
+      role: reviewer,
+      readOnly: reviewer.readOnly,
+      prompt: brief,
+      notLockable: `not started: Matriarch can start only claude and codex reviewers read-only. Set "readOnly": false on "${reviewer.name}" to run ${reviewer.agent} with your usual permissions.`
+    })
+    entry.terminal = started.terminal
+    if (started.lock !== undefined) entry.lock = started.lock
+    if (started.error) Object.assign(entry, { status: 'failed', error: started.error, endedAt: deps.now() })
+    return entry
   }
 
   /** The reviewer at `i` started again, locked down, with its own settings. */

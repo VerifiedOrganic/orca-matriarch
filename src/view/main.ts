@@ -3,7 +3,7 @@
 // the top picks one (or all of them, or adding a new one), and each project shows its
 // supervisor, its settings and its own work as a swimlane timeline or a board by lane.
 import type { MatriarchConfig } from '../config.ts'
-import type { Board, ProjectInfo, RepoView, TrackView } from '../protocol.ts'
+import type { AdvisorView, Board, ProjectInfo, RepoView, TrackView } from '../protocol.ts'
 import { el, sv } from './dom.ts'
 import { ago, bars, byGroup, concurrency, GROUPS, LANES, marksIn, scale, summary, ticks, type Group } from './layout.ts'
 import { draftConfig, settingsForm, settingsState, type SettingsState } from './settings.ts'
@@ -543,6 +543,26 @@ export function issuesLine(r: RepoView): string | null {
   ].filter(Boolean).join(' · ')
 }
 
+/** The supervisor's advisor: who it is, and the question it is answering, waiting on, or last answered. */
+function advisorLine(a: AdvisorView): HTMLElement {
+  const who = [a.agent, a.model, a.effort ? `${a.effort} effort` : null].filter(Boolean).join(' · ')
+  const q = (text: string) => `"${text.length > 70 ? `${text.slice(0, 69)}…` : text}"`
+  const now = Date.now()
+  const doing: (string | HTMLElement)[] = !a.usable
+    ? ['not started: Matriarch runs only a Claude or Codex advisor read-only']
+    : a.answering?.blocked
+      ? ['needs you: ', a.answering.terminal ? el('a', { title: 'Open its terminal', onclick: () => focusTerminal(a.answering!.terminal!) }, a.answering.blocked) : a.answering.blocked]
+      : a.answering
+        ? [`answering ${q(a.answering.question)} · ${ago(now - a.answering.since)}`]
+        : a.queued > 0
+          ? [`${a.queued} question${a.queued === 1 ? '' : 's'} waiting${a.waiting ? `: ${a.waiting}` : ''}`]
+          : a.last
+            ? [`${a.last.answered ? 'answered' : 'no answer to'} ${q(a.last.question)} ${ago(now - a.last.at)} ago`]
+            : ['the supervisor can ask it for a second opinion']
+  return el('div', { class: 'sup-advisor', title: a.answering?.lock ?? 'Read-only, in a throwaway worktree' },
+    el('b', {}, 'Advisor'), el('span', { class: 'muted' }, ` · ${who} · `), ...doing)
+}
+
 function supervisorCard(r: RepoView): HTMLElement {
   const s = r.supervisor
   const phase = s.run ? 'running' : s.pending ? 'starting' : 'idle'
@@ -583,6 +603,7 @@ function supervisorCard(r: RepoView): HTMLElement {
             ? 'Talk to it in its chat. Matriarch links it here once you agree a plan and it creates its orchestration Run.'
             : `Running in ${s.run}. Its workers show below as worktrees, then as PRs.`),
     issuesLine(r) ? el('div', { class: 'muted sup-issues' }, issuesLine(r)) : null,
+    r.advisor ? advisorLine(r.advisor) : null,
     error ? el('div', { class: 'sup-hint' }, error) : null
   )
 }

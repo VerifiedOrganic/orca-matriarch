@@ -1,9 +1,9 @@
-// A project's settings as a form. Who does the work comes first: the supervisor, the workers and
-// the reviewers, each a card with its agent, model and effort on one line. The rules follow in
+// A project's settings as a form. Who does the work comes first: the supervisor and its advisor,
+// the workers and the reviewers, each a card with its agent, model and effort on one line. The rules follow in
 // groups that stay closed until clicked, each saying its current values in one line. It edits a
 // draft; Save, in a footer that stays in view, sends it to the worker, which checks it and writes
 // the project's .orca/matriarch.json.
-import type { MatriarchConfig, ReviewerSpec, RoleSpec, Severity } from '../config.ts'
+import type { AdvisorSpec, MatriarchConfig, ReviewerSpec, RoleSpec, Severity } from '../config.ts'
 import type { AgentOption } from '../protocol.ts'
 import { checkbox, el, select, textInput, toggle, type Child } from './dom.ts'
 import { modelPicker } from './model-picker.ts'
@@ -178,7 +178,6 @@ function card(title: string, hint: string, badges: Child[], ...children: Child[]
 }
 
 function reviewerItem(s: SettingsState, r: ReviewerSpec, index: number, act: SettingsActions): HTMLElement {
-  const lockable = option(s, r.agent)?.lockable ?? false
   return el(
     'div',
     { class: 'item' },
@@ -191,15 +190,20 @@ function reviewerItem(s: SettingsState, r: ReviewerSpec, index: number, act: Set
       if (v.trim()) r.focus = v
       else delete r.focus
     }, { class: 'focus-input', placeholder: 'What it looks for, e.g. bugs and missing tests', 'aria-label': 'What it looks for', title: 'Added to its brief' }),
-    lockable
-      ? el('span', { class: 'item-note' }, '🔒 Starts read-only')
-      : el('div', { class: 'item-note' },
-          checkbox(r.readOnly === false, 'Run it without the read-only lockdown', (on) => {
-            if (on) r.readOnly = false
-            else delete r.readOnly
-          }, { class: 'check warn-text' }),
-          el('span', { class: 'set-hint' }, 'Matriarch can lock down only Claude and Codex. Without this, it does not start this reviewer.'))
+    readOnlyNote(s, r, 'reviewer')
   )
+}
+
+/** Under the advisor's controls: read-only, or the opt-out for an agent Matriarch cannot lock down. */
+function readOnlyNote(s: SettingsState, role: AdvisorSpec, what: string): HTMLElement {
+  return option(s, role.agent)?.lockable ?? false
+    ? el('span', { class: 'item-note' }, '🔒 Starts read-only')
+    : el('div', { class: 'item-note' },
+        checkbox(role.readOnly === false, 'Run it without the read-only lockdown', (on) => {
+          if (on) role.readOnly = false
+          else delete role.readOnly
+        }, { class: 'check warn-text' }),
+        el('span', { class: 'set-hint' }, `Matriarch can lock down only Claude and Codex. Without this, it does not start this ${what}.`))
 }
 
 function tierItem(s: SettingsState, t: { name: string; role: RoleSpec }, index: number, act: SettingsActions): HTMLElement {
@@ -270,6 +274,13 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
   live.push(() => (offPill.hidden = d.review.enabled))
   const supervisor = card('Supervisor', 'Plans the work in its chat, starts workers, and gets escalations.', [],
     roleControls(s, d.supervisor, act))
+  const advisor = card('Advisor', "A second opinion the supervisor can ask for: on a risky plan, a disagreement or a decision that is hard to undo. It reads the code read-only and answers in the supervisor's chat.", [],
+    row('Use an advisor', 'Off: the supervisor decides alone.', toggle(d.advisor !== null, (on) => {
+      d.advisor = on ? newRole(s, ['claude', 'codex']) : null
+      act.redraw()
+    })),
+    d.advisor ? roleControls(s, d.advisor, act) : null,
+    d.advisor ? readOnlyNote(s, d.advisor, 'advisor') : null)
   const workers = card('Workers', 'Each task runs in its own worktree on this agent, unless the supervisor picks a tier.', [],
     roleControls(s, d.workers.default, act),
     ...s.tiers.map((t, i) => tierItem(s, t, i, act)),
@@ -291,11 +302,15 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       })),
       d.review.fallback ? roleControls(s, d.review.fallback, act) : null))
   reviewers.classList.add('wide')
+  workers.classList.add('wide')
 
   // The rules.
   const review = group('review', 'Review', () => !d.review.enabled
     ? 'Off: PRs are not reviewed'
-    : [TRIGGER_SHORT[d.review.trigger], PASS_SHORT[d.review.pass], plural(d.review.maxRounds, 'round'), d.review.publish === 'github' ? 'posted on the PR' : null].filter(Boolean).join(' · '),
+    : [
+        TRIGGER_SHORT[d.review.trigger], PASS_SHORT[d.review.pass], plural(d.review.maxRounds, 'round'), d.review.publish === 'github' ? 'posted on the PR' : null,
+        d.review.light.paths.length ? (d.review.light.crew === 'none' ? 'light changes not reviewed' : 'light changes: one reviewer') : null
+      ].filter(Boolean).join(' · '),
     row('Review every PR', 'With the reviewers above.', toggle(d.review.enabled, (on) => (d.review.enabled = on))),
     dependent(
       choice('Start a review', null, d.review.trigger, [['ci-green', 'after CI passes'], ['pr-open', 'as soon as the PR opens']], (v) => (d.review.trigger = v)),
@@ -308,6 +323,9 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       row('Review rounds per PR', 'Then it escalates instead of asking again.', number(d.review.maxRounds, (n) => (d.review.maxRounds = n), 1, 10)),
       choice('Later rounds', null, d.review.followUp, [['focused', 'check the fixes and what changed (cheaper)'], ['full', 'review the whole PR again']], (v) => (d.review.followUp = v)),
       row("Skip the author's agent", 'Reviewers on the same agent that wrote the PR sit it out.', toggle(d.review.differentProviderThanAuthor, (on) => (d.review.differentProviderThanAuthor = on))),
+      row('Light changes', 'A PR that changes only files like these gets a lighter review. Leave it empty to review every PR in full.',
+        textInput(d.review.light.paths.join(', '), (v) => (d.review.light.paths = globList(v)), { placeholder: 'e.g. **/*.md, docs/**' }), { stack: true }),
+      choice('A light change gets', null, d.review.light.crew, [['one', 'one reviewer (the first that must approve)'], ['none', 'no AI review']], (v) => (d.review.light.crew = v)),
       choice('Where reviews go', null, d.review.publish, [['orca-only', 'stay in Orca'], ['github', 'also posted on the PR (a comment review on GitHub, a note on GitLab)']], (v) => (d.review.publish = v))))
 
   const fixes = group('fixes', 'Fixes and escalation', () => {
@@ -437,7 +455,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
     problems,
     notes,
     el('h3', { class: 'settings-heading' }, 'Who does the work'),
-    el('div', { class: 'roles' }, supervisor, workers, reviewers),
+    el('div', { class: 'roles' }, supervisor, advisor, workers, reviewers),
     el('h3', { class: 'settings-heading' }, 'Rules'),
     el('div', { class: 'groups' }, review, fixes, merging, limits, issues, project),
     danger,

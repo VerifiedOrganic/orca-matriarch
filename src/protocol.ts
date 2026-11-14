@@ -105,6 +105,33 @@ export interface TrackView {
   marks: Mark[]
 }
 
+/** The advisor the supervisor can ask for a second opinion, and what it is doing. */
+export interface AdvisorView {
+  agent: string
+  model: string | null
+  effort: string | null
+  /** False when Matriarch cannot start it read-only (not claude or codex, and not opted out). */
+  usable: boolean
+  /** The question it is answering now. */
+  answering: {
+    question: string
+    since: number
+    /** Waiting on a person: a prompt in its terminal. */
+    blocked: string | null
+    /** The terminal to open to answer it. */
+    terminal: string | null
+    workspaceId: string | null
+    /** How it was started: read-only, and by what. */
+    lock: string | null
+  } | null
+  /** Questions waiting their turn. */
+  queued: number
+  /** Why waiting questions are not being answered now. */
+  waiting: string | null
+  /** The last question it finished. */
+  last: { question: string; at: number; answered: boolean; note: string } | null
+}
+
 export interface RepoView {
   repo: string
   /** Set for a project on GitLab; GitHub when absent. */
@@ -131,6 +158,8 @@ export interface RepoView {
     /** Workers it may start a day (limits.maxWorkerStartsPerDay); 0 for no cap. */
     maxStarts?: number
   }
+  /** The advisor, when the project has one or a question is still in flight. */
+  advisor?: AdvisorView
   errors: string[]
   warnings: string[]
   /** Its forge has no commits for it yet: nothing to branch from or open PRs against. */

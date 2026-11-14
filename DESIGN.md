@@ -64,8 +64,13 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
     { "name": "security", "agent": "codex", "model": "gpt-6-astra", "focus": "authz, injection, secrets, unsafe input", "blocking": true }
   ],
   "arbiter": null,
+  // A second opinion the supervisor can ask for; null (off) by default. Read-only like a reviewer.
+  "advisor": { "agent": "claude", "model": "claude-fable-5-2", "effort": "max" },
   "review": { "enabled": true, "trigger": "ci-green", "pass": "all-blocking-approve", "blockAt": "major",
-              "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github" }, // "github": on the PR, GitLab too
+              "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github", // "github": on the PR, GitLab too
+              "followUp": "focused", "fallback": null,
+              // A PR changing only these files gets "one" reviewer (the first must-approve one) or "none".
+              "light": { "paths": ["**/*.md", "**/*.mdx", "**/*.txt", "docs/**"], "crew": "one" } },
   "fix": { "ci": { "enabled": true, "maxRounds": 3, "rerunFlaky": true }, "comments": { "enabled": true, "maxRounds": 3 },
            "conflicts": { "enabled": true, "maxRounds": 2 } },
   "merge": { "mode": "manual", "method": "squash", "requireHuman": [], "updateBranch": "rebase",
@@ -260,6 +265,33 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   The trust boundary is the label: triage access on GitHub, Reporter and up on GitLab.
 - **Not yet run live.** Its workers push branches and open PRs, so the first run should be on a
   task you choose.
+
+### Advisor
+
+`src/advisor.ts`. An optional role above the supervisor (`advisor` in the config), on its own
+agent, model and effort, that the supervisor asks for a second opinion. It sees only what the
+supervisor chooses to ask.
+
+- **Asking.** With an advisor set, the brief tells the supervisor when to ask (a risky plan, a
+  reviewer and a worker disagreeing, being stuck, a step that is hard to undo) and the command:
+  `orca orchestration send --to <Matriarch's mailbox> --subject 'Advice: …' --body '<context>'`.
+  The mailbox is Matriarch's own terminal in the project; its handle changes when Orca restarts
+  and recreates it. Matriarch records what each supervisor was told (its Run, the address, the
+  advisor) and mails it again when any of these change, or when the advisor is turned off.
+- **Reading.** Each tick, `orchestration check --terminal <mailbox> --peek` reads new mail;
+  questions are saved, by message id, before a plain `check` marks the batch read, so a crash in
+  between loses nothing and nothing is taken twice. Mail that is not a question is dropped.
+- **Answering.** One question at a time per project, up to 10 waiting: a throwaway worktree of
+  the default branch (a `matriarch/review-` branch, so the board skips it), the advisor launched
+  there exactly as a reviewer is (same lockdown, same launch confirmation, same tool guard), and
+  told to write `{"answer": …}` to `.matriarch/review/advice-<id>/answer.json`, inside the verdict
+  folder the lockdown already lets it write. The answer is mailed to `run:<id>`, then the worktree
+  goes. Quiet for 30 minutes, over 2 hours, its terminal closed, its agent quit or resumed
+  without the lockdown: the supervisor hears there is no answer.
+- **Dry run.** Like automatic reviews it starts only with autopilot on. In dry run questions wait,
+  and the board says so; answers and notices to the supervisor wait in an outbox until autopilot.
+- **Board.** The supervisor's card shows the advisor and its question; one stuck on a prompt
+  shows under **Needs you** with its terminal.
 
 ## Merging (phase 5)
 

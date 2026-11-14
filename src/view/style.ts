@@ -63,6 +63,7 @@ a:hover { text-decoration: underline; }
 .sup-head .spacer { flex: 1; }
 .sup summary { cursor: pointer; color: var(--m-blue); }
 .sup-hint { color: var(--m-fixing); font-size: 11px; min-height: 0; }
+.sup-advisor { font-size: 11px; overflow-wrap: anywhere; }
 .sup-hint:empty { display: none; }
 .badge { font-size: 11px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--orca-border); white-space: nowrap; }
 .badge-running { color: var(--m-ready); border-color: var(--m-ready); }

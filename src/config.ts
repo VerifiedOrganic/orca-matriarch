@@ -50,6 +50,20 @@ export interface ReviewerSpec extends RoleSpec {
 }
 
 /**
+ * The advisor: a second opinion the supervisor can ask for, on its own agent and model. It reads
+ * the code read-only in a throwaway worktree, locked down like a reviewer, so only claude and
+ * codex start unless `readOnly` is false.
+ */
+export interface AdvisorSpec extends RoleSpec {
+  readOnly?: boolean
+}
+
+/** Whether Matriarch can start this advisor: read-only on claude or codex, or opted out of that. */
+export function advisorUsable(advisor: AdvisorSpec | null): advisor is AdvisorSpec {
+  return advisor !== null && (LOCKABLE_AGENTS.includes(advisor.agent) || advisor.readOnly === false)
+}
+
+/**
  * Where the project lives, when its origin alone does not say: GitLab on a host glab is not
  * signed in to yet, or behind an ssh alias that hides the real host. Matriarch detects it
  * otherwise (github.com is GitHub; another host is GitLab when glab is signed in to it).
@@ -81,6 +95,8 @@ export interface MatriarchConfig {
   workers: { default: RoleSpec; tiers: Record<string, RoleSpec> }
   reviewers: ReviewerSpec[]
   arbiter: RoleSpec | null
+  /** A second opinion the supervisor can ask for; off (null) by default. */
+  advisor: AdvisorSpec | null
   review: {
     enabled: boolean
     trigger: 'ci-green' | 'pr-open'
@@ -96,6 +112,11 @@ export interface MatriarchConfig {
     followUp: 'focused' | 'full'
     /** When a reviewer's account hits its usage limit, it is started again on this instead. */
     fallback: RoleSpec | null
+    /**
+     * A PR that changes only files matching `paths` (docs, text) gets a lighter review: `one`
+     * reviewer, or `none` at all. An empty list turns it off.
+     */
+    light: { paths: string[]; crew: 'one' | 'none' }
   }
   fix: { ci: CiFixPolicy; comments: FixPolicy; conflicts: FixPolicy }
   merge: {
@@ -153,6 +174,7 @@ export function defaultConfig(): MatriarchConfig {
       { name: 'security', agent: 'codex', focus: 'authz, injection, secrets, unsafe input', blocking: true }
     ],
     arbiter: null,
+    advisor: null,
     review: {
       enabled: true,
       trigger: 'ci-green',
@@ -162,7 +184,8 @@ export function defaultConfig(): MatriarchConfig {
       maxRounds: 3,
       publish: 'github',
       followUp: 'focused',
-      fallback: null
+      fallback: null,
+      light: { paths: ['**/*.md', '**/*.mdx', '**/*.txt', 'docs/**'], crew: 'one' }
     },
     fix: {
       ci: { enabled: true, maxRounds: 3, rerunFlaky: true },
@@ -349,7 +372,7 @@ export function validateConfig(raw: unknown): ConfigResult {
   if (!isObj(raw)) {
     return { config: d, errors: [`${CONFIG_PATH}: expected a JSON object`], warnings: [] }
   }
-  r.unknownKeys(raw, ['version', 'forge', 'supervisor', 'workers', 'reviewers', 'arbiter', 'review', 'fix', 'merge', 'escalation', 'limits', 'issues'], 'config')
+  r.unknownKeys(raw, ['version', 'forge', 'supervisor', 'workers', 'reviewers', 'arbiter', 'advisor', 'review', 'fix', 'merge', 'escalation', 'limits', 'issues'], 'config')
   if (raw.version !== undefined && raw.version !== 1) r.errors.push('config.version: only version 1 is supported')
   const forge = r.forge(raw.forge)
 
@@ -415,6 +438,27 @@ export function validateConfig(raw: unknown): ConfigResult {
 
   const arbiter = r.role(raw.arbiter, 'arbiter', d.arbiter)
 
+  let advisor: AdvisorSpec | null = d.advisor
+  if (raw.advisor !== undefined && raw.advisor !== null) {
+    if (!isObj(raw.advisor)) r.errors.push('advisor: expected an object with an agent, or null')
+    else {
+      r.unknownKeys(raw.advisor, ['agent', 'model', 'effort', 'readOnly'], 'advisor')
+      const role = r.roleFields(raw.advisor, 'advisor', null)
+      if (role) {
+        advisor = { ...role }
+        const readOnly = r.bool(raw.advisor, 'readOnly', true, 'advisor')
+        const lockable = LOCKABLE_AGENTS.includes(role.agent)
+        if (!readOnly && lockable) r.warnings.push(`advisor.readOnly: ignored; a ${role.agent} advisor always starts read-only`)
+        else if (!readOnly) {
+          advisor.readOnly = false
+          r.warnings.push(`advisor: runs ${role.agent} with your usual permissions for it (readOnly: false), in a throwaway worktree`)
+        } else if (!lockable) {
+          r.warnings.push(`advisor: Matriarch can start only claude and codex read-only, so the ${role.agent} advisor is not offered to the supervisor. Set "readOnly": false on it to run it with your usual permissions.`)
+        }
+      }
+    }
+  }
+
   const rv = r.section(raw, 'review', 'config')
   if (rv) r.unknownKeys(rv, Object.keys(d.review), 'review')
   const review: MatriarchConfig['review'] = {
@@ -426,7 +470,15 @@ export function validateConfig(raw: unknown): ConfigResult {
     maxRounds: r.int(rv, 'maxRounds', d.review.maxRounds, 'review', 1, 10),
     publish: r.oneOf(rv, 'publish', ['github', 'orca-only'] as const, d.review.publish, 'review'),
     followUp: r.oneOf(rv, 'followUp', ['focused', 'full'] as const, d.review.followUp, 'review'),
-    fallback: rv?.fallback === undefined || rv?.fallback === null ? null : r.role(rv.fallback, 'review.fallback', null)
+    fallback: rv?.fallback === undefined || rv?.fallback === null ? null : r.role(rv.fallback, 'review.fallback', null),
+    light: (() => {
+      const o = rv ? r.section(rv, 'light', 'review') : undefined
+      if (o) r.unknownKeys(o, ['paths', 'crew'], 'review.light')
+      return {
+        paths: r.strings(o, 'paths', d.review.light.paths, 'review.light'),
+        crew: r.oneOf(o, 'crew', ['one', 'none'] as const, d.review.light.crew, 'review.light')
+      }
+    })()
   }
   if (review.enabled && reviewers.length === 0) r.warnings.push('review.enabled: no reviewers configured, so no AI review will run')
   if (review.fallback && !LOCKABLE_AGENTS.includes(review.fallback.agent)) {
@@ -502,7 +554,7 @@ export function validateConfig(raw: unknown): ConfigResult {
   }
 
   return {
-    config: { version: 1, ...(forge ? { forge } : {}), supervisor, workers: { default: workerDefault, tiers }, reviewers, arbiter, review, fix, merge, escalation, limits, issues },
+    config: { version: 1, ...(forge ? { forge } : {}), supervisor, workers: { default: workerDefault, tiers }, reviewers, arbiter, advisor, review, fix, merge, escalation, limits, issues },
     errors: r.errors,
     warnings: r.warnings
   }

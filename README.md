@@ -38,6 +38,13 @@ Anything that needs a decision goes to the supervisor first, then to you after a
 supervisor is told to keep the run moving without you, and Matriarch never answers an agent's
 permission prompt for you: those show as **Needs you**.
 
+**Advisor (optional).** A project can have an advisor above the supervisor, on its own agent and
+model (Claude on Fable at max effort, say). The supervisor asks it for a second opinion when it
+chooses to: a risky plan, a reviewer and a worker who disagree, being stuck, a step that is hard
+to undo. Matriarch runs it read-only in a throwaway worktree of the main branch, locked down like
+a reviewer, and mails its answer back to the supervisor's chat. It answers one question at a time,
+only with autopilot on, and costs nothing until the supervisor asks.
+
 ## Requirements
 
 - Orca **1.4.257** or newer, with orchestration turned on (Settings → Experimental), so the
@@ -78,7 +85,8 @@ Matriarch is not in Orca's plugin directory yet.
    github.com, or on a GitLab host glab is signed in to, and it needs at least one commit on its
    main branch; the list says when it does not, and what to run.
 3. In **Settings**, pick the agent, model and effort for the supervisor, the workers (plus any
-   worker tiers, such as a cheaper one for small tasks) and each reviewer. Then **Save**. The
+   worker tiers, such as a cheaper one for small tasks), each reviewer and, if you want one, the
+   advisor. Then **Save**. The
    agents offered are the ones turned on in your Orca settings and installed; the model box
    searches the models each agent offers you now.
 4. Click **Open supervisor chat** and tell it what to build.
@@ -119,7 +127,8 @@ manages only PRs you opened from a branch that belongs to an Orca workspace.
   run what Matriarch would do next. **Run AI review now** on any card runs the crew on that
   commit, in dry run too.
 - **Supervisor:** each project's chat, with the Run it coordinates, how many of its workers
-  are running against the project's limit, and the labeled issues it took or that wait.
+  are running against the project's limit, the labeled issues it took or that wait, and its
+  advisor: the question it is answering, or the last one it answered.
 - **Needs you:** a reviewer waiting on a prompt, an escalation that reached you, a nearly full
   disk, a supervisor that went over its worker limits. The status bar shows the same at a glance.
 - **Full tab:** tab bar **+** → **Matriarch board**.
@@ -136,6 +145,8 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - **Review rounds per PR** (default 3) caps the rounds before it asks someone instead;
 - later rounds check only what changed (**Later rounds: check the fixes**);
 - reviewers on the same agent as the PR's author are skipped (you can turn that off);
+- a PR that changes only docs and text files (**Light changes**: `**/*.md`, `**/*.mdx`,
+  `**/*.txt`, `docs/**` by default) gets one reviewer, or none if you choose;
 - **Reviews at once** (default 2) limits how many review crews run together.
 - **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
   supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
@@ -147,6 +158,9 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback
 model you choose; otherwise it shows the reviewer as **Needs you**.
+
+An advisor runs only when the supervisor asks it something, once per question, so a strong model
+there costs one agent session per question.
 
 ## Permissions
 
@@ -166,9 +180,10 @@ start agents and read their state. It asks Orca for these capabilities:
   storage.
 - **Own settings** (`settings:own`): autopilot on or off, and how often it checks GitHub and GitLab.
 
-It also adds two **hooks**. They change nothing for agents outside a review worktree, except
-that a Claude Code agent's `orca orchestration worker-start` in one of your projects is refused
-when it would go over that project's worker limits (see [What it costs](#what-it-costs)):
+It also adds two **hooks**. They change nothing for agents outside a review worktree (a review
+round's, or the advisor's), except that a Claude Code agent's `orca orchestration worker-start`
+in one of your projects is refused when it would go over that project's worker limits (see
+[What it costs](#what-it-costs)):
 
 - **Before an agent launches** (`agent.launch.before`), a reviewer's command is rewritten so it
   starts read-only, whatever permission mode you chose in Orca:
@@ -180,13 +195,14 @@ when it would go over that project's worker limits (see [What it costs](#what-it
     --strict-mcp-config`.
   - Codex: the bypass flags are removed and it runs with `--sandbox workspace-write
     --ask-for-approval never`, no network, no extra writable folders and no MCP servers.
-  - Any other agent is refused as a reviewer unless you mark that reviewer **Run it without the
+  - Any other agent is refused as a reviewer or advisor unless you mark it **Run it without the
     read-only lockdown**.
 - **Before an agent uses a tool** (`agent.tool.before`), a reviewer's tool call that would write
   outside its notes, or run a command that is not read-only, is blocked.
 
-A reviewer that did not start locked down is stopped and started again, or shown as failed.
-Supervisor and worker launches are not changed.
+A reviewer that did not start locked down is stopped and started again, or shown as failed; an
+advisor is stopped and the supervisor is told there is no answer. Supervisor and worker launches
+are not changed.
 
 ## What it runs on your machine
 
@@ -202,9 +218,11 @@ Supervisor and worker launches are not changed.
 | `orca agent launch --surface chat …` | **Open supervisor chat**: the supervisor, on your model, with its brief |
 | `orca terminal create` | once per project: a terminal titled "Matriarch mailbox" (`cat > /dev/null`), which Orca requires as the sender of Matriarch's messages |
 | `orca orchestration worker-list`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
-| `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations and labeled issues to the supervisor |
+| `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations, labeled issues and the advisor's answers to the supervisor |
+| `orca orchestration check --terminal <mailbox> --peek`, then `check --terminal <mailbox>` | with an advisor: read the supervisor's questions sent to Matriarch's mailbox, then mark them read |
 | `git fetch origin …`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | a review round: a throwaway worktree at the PR head, one agent per reviewer, removed afterwards |
-| `orca terminal close` | a reviewer that started without its lockdown is stopped |
+| `git fetch origin <main>`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | autopilot, with an advisor: one throwaway worktree of the main branch per question, the advisor in it, removed once it answers |
+| `orca terminal close` | a reviewer or advisor that started without its lockdown is stopped |
 | `gh api repos/<repo>/pulls/<n>/reviews` | autopilot, when **Where reviews go** includes the PR: one comment review per round |
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
 | `gh pr edit <n> --base <branch>` | autopilot: move a stacked PR to where its parent merged, when GitHub left it on the parent's branch |
@@ -250,8 +268,8 @@ replace them.
 Matriarch talks to the network only through `gh`, to GitHub, and `glab`, to the GitLab hosts your
 projects are on. It sends nothing anywhere else and has no telemetry. Each PR's history and
 review state stay in the plugin's own storage on your machine; each project's settings are in its
-`.orca/matriarch.json`; reviewers' notes are written in their throwaway worktree and removed with
-it.
+`.orca/matriarch.json`; reviewers' notes and the advisor's answers are written in their throwaway
+worktree and removed with it.
 
 ## Limits
 
@@ -268,7 +286,7 @@ it.
   - checked against gitlab.com's API. Merging, rebasing, notes and approvals have not been run on
     a real project yet, nor on a self-hosted GitLab (which needs one recent enough to have the
     GraphQL fields Matriarch reads; DESIGN.md lists them).
-- Read-only reviewers on Claude Code and Codex only.
+- Read-only reviewers and advisor on Claude Code and Codex only.
 - It relies on Orca's orchestration behaving as it does in 1.4.257, and on the files above.
   Settings says when you run a different Orca.
 - Orca tells plugins only a workspace's name and branch, so when two projects' own checkouts are
