@@ -706,8 +706,9 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
           // Its records are pruned a week after this.
           if (!(await deps.store.get(`closed:${repoKey}#${number}`))) {
             await deps.store.set(`closed:${repoKey}#${number}`, now)
-            // Once, when Matriarch first sees it merged, whoever merged it.
-            if (pr.state === 'MERGED') deps.alert?.({ kind: 'merged', title: `${repoKey} #${number} merged`, body: pr.title, repo: repoKey, number, url: pr.url })
+            // Once, when Matriarch first sees it merged, whoever merged it; like every alert, only
+            // while it acts (Orca has no notification for this one: it goes to the webhook only).
+            if (pr.state === 'MERGED' && acting) deps.alert?.({ kind: 'merged', title: `${repoKey} #${number} merged`, body: pr.title, repo: repoKey, number, url: pr.url })
           }
           if (pr.state === 'MERGED' && ledger.merge && ledger.merge.status !== 'merged') {
             await deps.store.set(ledgerKey(repoKey, number), { ...ledger, merge: { ...ledger.merge, status: 'merged' } } as unknown as JsonValue)
@@ -741,6 +742,10 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       }
     }
 
+    // Worktrees removed this tick: gone from here on, so no PR or row writes to their history again.
+    const gone = new Set<string>()
+    // The log line for a merged PR's removed worktree, written after that PR's lane this tick.
+    const cleanedUp = new Map<number, LogEntry>()
     // Worktrees of merged PRs: removed once no worker is live there and nothing is uncommitted.
     if (acting && deps.removeWorktree && config.merge.removeWorktree) {
       // Once per project: PRs merged before this cleanup existed are found by their ledgers.
@@ -771,11 +776,13 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         const res = await deps.removeWorktree(ws.path).catch((error: Error) => ({ removed: false, reason: error.message }))
         if (res.removed) {
           deps.log(`${repoKey}: removed the worktree of merged #${c.number} (${ws.path})`)
+          gone.add(ws.path)
           // The merged PR stays on the board for a while under its own key once its worktree is
-          // gone: its timeline and activity log go with it.
-          const h = loadHistory(await deps.store.get(historyKey(ws.id)))
-          const entry: LogEntry = { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: no agent ran there and nothing in it was uncommitted` }
-          await deps.store.set(historyKey(`pr:${repoKey}#${c.number}`), addLog(h, entry) as unknown as JsonValue)
+          // gone. When the worktree's history was this PR's, it goes with it; this tick's lane and
+          // marks are written there below.
+          const own = loadHistory(await deps.store.get(historyKey(ws.id)))
+          if (own.pr === undefined || own.pr === c.number) await deps.store.set(historyKey(`pr:${repoKey}#${c.number}`), { ...own, pr: c.number } as unknown as JsonValue)
+          cleanedUp.set(c.number, { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: no agent ran there and nothing in it was uncommitted` })
           continue
         }
         still.push({ ...c, kept: res.reason ?? 'not removed' })
@@ -805,13 +812,20 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
           continue
         }
         const res = await deps.removeWorktree(ws.path, { keepBranch: true }).catch((error: Error) => ({ removed: false, reason: error.message }))
-        if (res.removed) deps.log(`${repoKey}: removed ${ws.name}, a finished worktree that never became a PR (${ws.path})`)
-        else still[ws.path] = since
+        if (res.removed) {
+          deps.log(`${repoKey}: removed ${ws.name}, a finished worktree that never became a PR (${ws.path})`)
+          gone.add(ws.path)
+        } else still[ws.path] = since
       }
       if (JSON.stringify(still) !== JSON.stringify(seen)) await deps.store.set(finishedKey, still as unknown as JsonValue)
     }
 
     const seenWorkspaces = new Set<string>()
+    for (const item of items) if (item.ws && gone.has(item.ws.path)) item.ws = undefined
+    // A worktree's history belongs to the first PR on it (the lowest number, when two are first
+    // seen together); any other PR on that worktree keeps its own, by number.
+    const firstOn = new Map<string, number>()
+    for (const { ws, snap } of items) if (ws) firstOn.set(ws.id, Math.min(firstOn.get(ws.id) ?? Infinity, snap.number))
 
     // Stacked PRs: one whose base is the head branch of another PR Matriarch follows merges only
     // after it, and is moved and rebased once that one merged. Only a PR from a short-lived branch
@@ -949,7 +963,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       }
       if (ledger !== item.ledger) await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
 
-      const trackKey = ws?.id ?? `pr:${repoKey}#${snap.number}`
+      const prKey = `pr:${repoKey}#${snap.number}`
+      const trackKey = ws && ((loadHistory(await deps.store.get(historyKey(ws.id))).pr ?? firstOn.get(ws.id)) === snap.number) ? ws.id : prKey
       let history = loadHistory(await deps.store.get(historyKey(trackKey)))
       if (history.lastSha !== snap.headSha) {
         if (history.lastSha) {
@@ -964,7 +979,12 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       history = noteLane(history, p.lane, p.reason, now)
       for (const m of marks) history = addMark(history, m)
       for (const e of logged) history = addLog(history, e)
-      history = { ...prune(history, now), seenAt: now }
+      const cleaned = cleanedUp.get(snap.number)
+      if (cleaned) {
+        history = addLog(history, cleaned)
+        cleanedUp.delete(snap.number)
+      }
+      history = { ...prune(history, now), seenAt: now, pr: snap.number }
       await deps.store.set(historyKey(trackKey), history as unknown as JsonValue)
       if (ws) seenWorkspaces.add(ws.id)
 
@@ -983,7 +1003,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       board.tracks.push({
         key: trackKey,
         repo: repoKey,
-        workspace: ws ? { id: ws.id, name: ws.name, branch: branchName(ws.branch) } : { id: trackKey, name: snap.headRef, branch: snap.headRef },
+        workspace: ws ? { id: ws.id, name: ws.name, branch: branchName(ws.branch) } : { id: prKey, name: snap.headRef, branch: snap.headRef },
         pr: {
           number: snap.number,
           title: snap.title,
@@ -1041,9 +1061,15 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       })
     }
 
+    // A merged PR no longer on the board whose worktree went this tick: its line goes to its log.
+    for (const [number, entry] of cleanedUp) {
+      const key = historyKey(`pr:${repoKey}#${number}`)
+      await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
+    }
+
     // Worktrees with no PR yet: building while their agent works, idle otherwise.
     for (const ws of repoWorkspaces) {
-      if (seenWorkspaces.has(ws.id)) continue
+      if (seenWorkspaces.has(ws.id) || gone.has(ws.path)) continue
       if (unknownWs.has(ws.id)) {
         // The forge could not say what this worktree's PR is doing: show the last known lane, and
         // leave its history alone rather than rewrite it as idle.

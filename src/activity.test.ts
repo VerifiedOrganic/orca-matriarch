@@ -22,6 +22,17 @@ describe('the log in a track history', () => {
     assert.deepEqual(h.log.map((e) => [e.kind, e.lane, e.text]), [['lane', 'awaiting-ci', 'CI running'], ['lane', 'fixing-ci', 'CI failing on abc: test']])
   })
 
+  test('the same line again right after itself is counted, not repeated', () => {
+    let h = emptyHistory()
+    const failed = { kind: 'send-ci-failure', text: 'Tried to send 1 failing check', error: 'Orca refused' }
+    for (let at = 1; at <= 5; at++) h = addLog(h, { at, ...failed })
+    h = addLog(h, { at: 6, ...failed, error: 'another reason' })
+    h = addLog(h, { at: 7, ...failed })
+    assert.deepEqual(h.log.map((e) => [e.at, e.count ?? 1, e.lastAt ?? e.at]), [[1, 5, 5], [6, 1, 6], [7, 1, 7]])
+    // Kept while it keeps coming, though it first came before the window.
+    assert.equal(prune(h, 100, 96).log[0].count, 5)
+  })
+
   test('is pruned to the window and capped, and an older history without one reads as empty', () => {
     let h = emptyHistory()
     for (let i = 0; i < 400; i++) h = addLog(h, { at: i, kind: 'push', text: `commit ${i}` })
@@ -135,6 +146,92 @@ describe('the engine', () => {
     const skipped = harness([failing], () => ({ ok: false, skipped: 'not built yet' }))
     await tick(skipped.deps, { autopilot: true })
     assert.deepEqual(skipped.log().map((x) => x.kind), ['lane'])
+  })
+})
+
+describe('one log per PR', () => {
+  const T = 1_800_000_000_000
+  /** An engine over a changing set of PRs, worktrees and executor answers. */
+  function world(opts: { config?: object; answer?: () => Outcome } = {}) {
+    const store = new Map<string, unknown>()
+    let now = T
+    const main: Workspace = { id: 'ws-main', kind: 'worktree', name: 'app', path: '/r', branch: 'main', hostId: null }
+    const login: Workspace = { id: 'ws-login', kind: 'worktree', name: 'login', path: '/r/wt/login', branch: 'feature/login', hostId: null }
+    const w = { prs: [] as PrSnapshot[], workspaces: [main, login] }
+    const deps: EngineDeps = {
+      now: () => now,
+      log: () => {},
+      workspaces: async () => w.workspaces,
+      repoOf: async () => ({ ref: { owner: 'acme', name: 'app' }, key: 'acme/app', root: '/r' }),
+      readConfig: async () => validateConfig({ review: { enabled: false }, ...opts.config }),
+      github: {
+        listOpen: async () => ({ viewer: 'me', rate: null, prs: w.prs.filter((p) => p.state === 'OPEN').map((p) => ({ number: p.number, headRef: p.headRef, headSha: p.headSha, author: p.author, updatedAt: p.updatedAt, rollup: p.ci })) }),
+        detail: async (_r, n) => ({ pr: { ...w.prs.find((p) => p.number === n)!, fetchedAt: now }, rate: null })
+      },
+      workers: async () => [],
+      activity: () => null,
+      supervisor: async () => null,
+      store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v), keys: async () => [...store.keys()], delete: async (k) => void store.delete(k) },
+      executor: { execute: async () => (opts.answer ? opts.answer() : { ok: true }) },
+      removeWorktree: async (path) => {
+        w.workspaces = w.workspaces.filter((x) => x.path !== path)
+        return { removed: true }
+      }
+    }
+    const log = (key: string) => loadHistory(store.get(historyKey(key))).log
+    return { w, deps, log, store, step: async (autopilot = true) => { const b = await tick(deps, { autopilot }); now += 45_000; return b } }
+  }
+
+  test('an action that fails every check is one line with a count', async () => {
+    const h = world({ answer: () => ({ ok: false, error: 'orca: orchestration unavailable' }) })
+    h.w.prs = [pr({ number: 12, headRef: 'feature/login', ci: 'failing', checks: [check('test', 'failure')] })]
+    for (let i = 0; i < 10; i++) await h.step()
+    const failed = h.log('ws-login').filter((e) => e.error)
+    assert.equal(failed.length, 1)
+    assert.equal(failed[0].count, 10)
+    assert.equal(failed[0].lastAt, T + 9 * 45_000)
+  })
+
+  test('two PRs on one branch keep their own logs, and neither sees the other\'s commits', async () => {
+    const h = world({ config: { merge: { removeWorktree: false } } })
+    h.w.prs = [pr({ number: 5, headRef: 'feature/login', headSha: 'a'.repeat(40) })]
+    await h.step(false)
+    h.w.prs = [{ ...h.w.prs[0], state: 'MERGED' }]
+    await h.step(false)
+    // A follow-up from the same branch, while the merged one is still on the board.
+    h.w.prs.push(pr({ number: 9, headRef: 'feature/login', headSha: 'b'.repeat(40) }))
+    const before = h.log('ws-login').length
+    let board = await h.step(false)
+    for (let i = 0; i < 4; i++) board = await h.step(false)
+    assert.equal(board.tracks.find((t) => t.pr?.number === 5)!.key, 'ws-login', 'the first PR keeps the worktree\'s row')
+    assert.equal(board.tracks.find((t) => t.pr?.number === 9)!.key, 'pr:acme/app#9')
+    assert.equal(h.log('ws-login').length, before, 'the first PR\'s log gets nothing from the second')
+    assert.deepEqual(h.log('pr:acme/app#9').map((e) => e.kind), ['lane'], 'one lane line, no false commits')
+    assert.equal(board.tracks.find((t) => t.pr?.number === 9)!.workspace.id, 'ws-login', 'it still opens the worktree')
+    // Two PRs first seen together from one branch (two bases): the lower number takes the worktree's row.
+    const two = world()
+    two.w.prs = [pr({ number: 21, headRef: 'feature/login', baseRef: 'release' }), pr({ number: 20, headRef: 'feature/login' })]
+    const b2 = await two.step(false)
+    assert.deepEqual(b2.tracks.filter((t) => t.pr).map((t) => `${t.pr!.number}:${t.key}`).sort(), ['20:ws-login', '21:pr:acme/app#21'])
+  })
+
+  test('a merged PR whose worktree is removed takes its history along, that tick\'s lines included', async () => {
+    const h = world()
+    h.w.prs = [pr({ number: 12, headRef: 'feature/login' })]
+    await h.step()
+    h.w.prs = [{ ...h.w.prs[0], state: 'MERGED' }]
+    // The tick that sees the merge removes the worktree, nothing running there.
+    const board = await h.step()
+    const merged = board.tracks.find((t) => t.pr?.number === 12)!
+    assert.equal(merged.key, 'pr:acme/app#12', 'from the tick it is removed')
+    assert.equal(merged.workspace.id, 'pr:acme/app#12', 'nothing left to open')
+    assert.ok(!board.tracks.some((t) => t.key === 'ws-login'), 'no row for the removed worktree')
+    const moved = h.log('pr:acme/app#12')
+    assert.deepEqual(moved.map((e) => e.kind), ['lane', 'notify', 'lane', 'cleanup'], 'its whole log; the merge, then the cleanup it led to')
+    assert.equal(moved[2].lane, 'merged')
+    const left = h.log('ws-login').length
+    await h.step()
+    assert.equal(h.log('ws-login').length, left, 'nothing more goes to the removed worktree')
   })
 })
 

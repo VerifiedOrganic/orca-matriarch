@@ -285,6 +285,8 @@ ol.log .log-text { overflow-wrap: anywhere; }
 ol.log li.lane .log-text { color: var(--orca-muted-foreground); }
 ol.log li.lane .log-text b { color: var(--orca-foreground); font-weight: 500; }
 ol.log li.failed time { color: var(--m-fixing); }
+ol.log .log-count { color: var(--orca-muted-foreground); white-space: nowrap; }
+.row .label:focus-visible { outline: 2px solid color-mix(in srgb, var(--m-blue) 50%, transparent); outline-offset: -2px; }
 .log-note { font-size: 11px; padding: 2px 0; }
 .log-details { border-top: 1px dashed var(--orca-border); padding-top: 3px; font-size: 11px; }
 .log-details summary { cursor: pointer; color: var(--orca-muted-foreground); }

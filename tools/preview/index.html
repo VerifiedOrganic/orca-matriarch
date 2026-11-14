@@ -130,7 +130,7 @@
     { at: now - 120 * M, kind: 'send-rebase', text: 'Asked the worker to rebase onto main, round 1', to: 'worker', subject: 'Rebase #42 onto main (round 1 of 2)' },
     { at: now - 170 * M, kind: 'review-done', text: 'AI review finished: 2 of 2 approve' },
     { at: now - 200 * M, kind: 'send-ci-failure', text: 'Sent the worker 1 failing check (test), round 1', to: 'worker', subject: 'CI failed on #42 (round 1 of 3)' },
-    { at: now - 202 * M, kind: 'update-branch', text: 'Tried to update the branch from its base (rebase)', error: 'GitHub: the branch was updated by someone else; trying again next check' }
+    { at: now - 212 * M, lastAt: now - 203 * M, count: 12, kind: 'update-branch', text: 'Tried to update the branch from its base (rebase)', error: 'GitHub: the branch was updated by someone else; trying again next check' }
   ]
   // Away alerts: ?alerts=off has no webhook yet, ?alerts=failed shows a failed post.
   const alertsView = {

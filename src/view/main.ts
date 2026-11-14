@@ -377,6 +377,8 @@ function logList(t: TrackView): HTMLElement {
           e.lane ? el('span', { class: 'dot', style: `background:${LANES[e.lane] ? COLOR[LANES[e.lane].group] : 'var(--m-quiet)'};margin-right:5px` }) : null,
           e.lane ? el('b', {}, `${LANES[e.lane]?.label ?? e.lane}: `) : null,
           e.text,
+          // The same line, again and again: counted, with when it last came.
+          e.count && e.count > 1 ? el('span', { class: 'log-count', title: `${e.count} times, last ${new Date(e.lastAt ?? e.at).toLocaleString()}` }, ` ×${e.count}, last ${clock(e.lastAt ?? e.at)}`) : null,
           e.subject ? el('div', { class: 'muted' }, `“${e.subject}”`) : null,
           e.error ? el('div', { class: 'warn-text' }, e.error) : null))))
 }
@@ -387,7 +389,8 @@ function rowLog(t: TrackView): HTMLElement {
     el('div', { class: 'row-log-head' },
       el('b', {}, 'What Matriarch did'),
       el('span', { class: 'muted' }, t.pr ? `#${t.pr.number} · ${t.workspace.name}` : t.workspace.name),
-      t.key.startsWith('pr:') ? null : el('button', { class: 'ghost', title: 'Show the worktree in Orca', onclick: () => openTrack(t) }, 'Open the worktree'),
+      // A PR whose worktree is gone has none to open.
+      t.workspace.id.startsWith('pr:') ? null : el('button', { class: 'ghost', title: 'Show the worktree in Orca', onclick: () => openTrack(t) }, 'Open the worktree'),
       el('button', { class: 'ghost', title: 'Close the log', onclick: () => toggleLog(t, false) }, 'Close')),
     logList(t))
 }
@@ -484,7 +487,21 @@ function timeline(tracks: TrackView[], b: Board, headers: boolean): HTMLElement 
     const open = state.log?.key === t.key
     rows.push(
       el('div', { class: open ? 'row selected' : 'row' },
-        el('div', { class: 'label', title: `${LANES[t.lane].label}: ${t.reason}\nClick for what Matriarch did here`, 'aria-expanded': open ? 'true' : 'false', onclick: () => toggleLog(t) },
+        el('div', {
+          class: 'label',
+          title: `${LANES[t.lane].label}: ${t.reason}\nClick for what Matriarch did here`,
+          role: 'button',
+          tabindex: 0,
+          'data-track-key': t.key,
+          'aria-expanded': open ? 'true' : 'false',
+          onclick: () => toggleLog(t),
+          onkeydown: (e) => {
+            const key = (e as KeyboardEvent).key
+            if (key !== 'Enter' && key !== ' ') return
+            e.preventDefault()
+            toggleLog(t)
+          }
+        },
           el('span', { class: 'dot', style: `background:${COLOR[LANES[t.lane].group]};margin-right:6px` }), rowLabel(t)),
         svg)
     )
@@ -894,12 +911,15 @@ function render(force = false): void {
   const page = currentPage(b)
   if (page.kind === 'add' && state.projects === null && !state.busy) void loadProjects()
   const repo = page.kind === 'project' ? b.repos.find((r) => r.repo === page.repo)! : null
+  // A timeline row reached by keyboard keeps the focus when the page is drawn again.
+  const focusedRow = active instanceof HTMLElement && root.contains(active) ? active.dataset.trackKey : undefined
   root.replaceChildren(
     header(b),
     projectBar(b, page),
     focusNote(page) ?? '',
     ...(page.kind === 'add' ? addPage(b) : page.kind === 'alerts' ? alertsPage(b) : page.kind === 'all' ? allPage(b) : projectPage(b, repo!))
   )
+  if (focusedRow) (root.querySelector(`[data-track-key="${window.CSS.escape(focusedRow)}"]`) as HTMLElement | null)?.focus()
 }
 
 // A render put off while the person typed happens once they leave the field.

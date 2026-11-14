@@ -9,6 +9,12 @@ export interface TrackHistory {
   marks: Mark[]
   /** What Matriarch did on this track and why, oldest first; read by the panel on demand. */
   log: LogEntry[]
+  /**
+   * The PR this history belongs to. A worktree's history (kept under its id) is the first PR's on
+   * that worktree, so one row runs from building to merged; a later PR on the same worktree keeps
+   * its own, under `pr:<repo>#<n>`.
+   */
+  pr?: number
   /** The PR head commit last seen, to mark pushes. */
   lastSha?: string
   /** When the engine last saw this track's workspace; pruning goes by it. */
@@ -34,6 +40,7 @@ export function loadHistory(raw: unknown): TrackHistory {
     // Histories saved before the log existed have none.
     log: Array.isArray(r.log) ? r.log.filter((e) => typeof e?.at === 'number' && typeof e?.text === 'string') : [],
     ...(typeof r.lastSha === 'string' ? { lastSha: r.lastSha } : {}),
+    ...(typeof r.pr === 'number' ? { pr: r.pr } : {}),
     ...(typeof r.seenAt === 'number' ? { seenAt: r.seenAt } : {})
   }
 }
@@ -53,14 +60,26 @@ export function noteLane(h: TrackHistory, lane: Lane, reason: string, now: numbe
   }
   if (last && last.to === null) segments[segments.length - 1] = { ...last, to: Math.max(now, last.from) }
   segments.push({ lane, from: now, to: null, reason })
-  return { ...h, segments, log: [...h.log, { at: now, kind: 'lane', lane, text: reason }] }
+  return addLog({ ...h, segments }, { at: now, kind: 'lane', lane, text: reason })
 }
 
 export function addMark(h: TrackHistory, mark: Mark): TrackHistory {
   return { ...h, marks: [...h.marks, mark] }
 }
 
+/** The same line again, apart from when: what came, to whom, and how it went all match. */
+const sameLine = (a: LogEntry, b: LogEntry): boolean =>
+  a.kind === b.kind && a.text === b.text && a.lane === b.lane && a.to === b.to && a.subject === b.subject && a.error === b.error
+
+/**
+ * Adds a line to the log. The same line again right after itself (an action that fails every
+ * check, say) is counted on the line before instead, so a stuck PR does not fill the log.
+ */
 export function addLog(h: TrackHistory, entry: LogEntry): TrackHistory {
+  const last = h.log[h.log.length - 1]
+  if (last && sameLine(last, entry)) {
+    return { ...h, log: [...h.log.slice(0, -1), { ...last, count: (last.count ?? 1) + (entry.count ?? 1), lastAt: entry.lastAt ?? entry.at }] }
+  }
   return { ...h, log: [...h.log, entry] }
 }
 
@@ -69,7 +88,7 @@ export function prune(h: TrackHistory, now: number, keepMs = KEEP_MS): TrackHist
   const cutoff = now - keepMs
   const segments = h.segments.filter((s) => s.to === null || s.to >= cutoff).slice(-MAX_SEGMENTS)
   const marks = h.marks.filter((m) => m.at >= cutoff).slice(-MAX_MARKS)
-  const log = h.log.filter((e) => e.at >= cutoff).slice(-MAX_LOG)
+  const log = h.log.filter((e) => (e.lastAt ?? e.at) >= cutoff).slice(-MAX_LOG)
   if (segments.length === h.segments.length && marks.length === h.marks.length && log.length === h.log.length) return h
   return { ...h, segments, marks, log }
 }
