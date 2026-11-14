@@ -1,6 +1,6 @@
 import { assert, describe, test } from 'orca/testing'
 import {
-  adviceQuestions, ADVICE_MAX_MS, advisorBrief, answerPath, createAdvisor, MAX_QUEUED, outputLines, parseAnswer, parseMail,
+  adviceQuestions, ADVICE_MAX_MS, ADVICE_REPLY, advisorBrief, answerPath, createAdvisor, MAX_QUEUED, outputLines, parseAnswer, parseMail,
   type AdviceRun, type Advisor, type AdvisorDeps, type MailItem
 } from './advisor.ts'
 import { validateConfig, type AdvisorSpec, type MatriarchConfig } from './config.ts'
@@ -21,13 +21,15 @@ const mail = (id: string, subject: string, body = ''): MailItem => ({ id, from: 
 const at = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1]
 
 describe('the advisor: mail and answers', () => {
-  test('reads both views of a mailbox check, and takes "Advice:" and "Re: Advice:" messages as questions', () => {
+  test('reads both views of a mailbox check, and takes "Advice:" messages as questions, not a reply to an answer', () => {
     const concise = parseMail({ messages: [{ id: 'm1', type: 'status', from: 'term_sup', subject: 'Advice: one PR or two?', body: 'ctx' }, { id: 'm2', from: 'd1', subject: 'Re: #12' }] })
     const full = parseMail({ messages: [{ id: 'm3', from_handle: 'run:r1', subject: 'advice:  rollback plan?', body: 'b', read: 0 }], count: 1 })
     assert.deepEqual(concise.map((m) => m.id), ['m1', 'm2'])
     assert.equal(full[0].from, 'run:r1')
     const qs = adviceQuestions([...concise, ...full, mail('m4', 'Re: Advice: and the backfill?')], 5)
-    assert.deepEqual(qs.map((q) => [q.id, q.question, q.context]), [['m1', 'one PR or two?', 'ctx'], ['m3', 'rollback plan?', 'b'], ['m4', 'and the backfill?', '']])
+    // A reply ("thanks") would start a second, possibly costly, run on the same question.
+    assert.deepEqual(qs.map((q) => [q.id, q.question, q.context]), [['m1', 'one PR or two?', 'ctx'], ['m3', 'rollback plan?', 'b']])
+    assert.ok(ADVICE_REPLY.test('Re: Advice: and the backfill?') && ADVICE_REPLY.test('RE: re: Advice: x') && !ADVICE_REPLY.test('Advice: x'))
     assert.deepEqual(parseMail(null), [])
     // A record without its subject or body was not read whole.
     assert.equal(parseMail({ messages: [{ id: 'm5', type: 'status' }] })[0].complete, false)
@@ -203,10 +205,10 @@ function advisorHarness(opts: HarnessOptions = {}) {
   deps.log = (m) => void logs.push(m)
   let senderAsks = 0
   const senders = async () => (senderAsks++, opts.senders ?? ['term_sup'])
-  const step = (over: { acting?: boolean; supervisor?: string | null; config?: MatriarchConfig; base?: string | null } = {}) =>
+  const step = (over: { acting?: boolean; notActing?: string | null; supervisor?: string | null; config?: MatriarchConfig; base?: string | null } = {}) =>
     advisor!.step({
       repo: 'acme/app', root: '/r', config: over.config ?? withAdvisor(), supervisor: over.supervisor === undefined ? 'run:r1' : over.supervisor,
-      acting: over.acting ?? true, base: over.base === undefined ? 'main' : over.base, supervisorSenders: senders
+      acting: over.acting ?? true, notActing: over.notActing ?? null, base: over.base === undefined ? 'main' : over.base, supervisorSenders: senders
     })
   const creates = () => calls.filter((c) => c[0] === 'worktree' && c[1] === 'create')
   return {
@@ -293,10 +295,14 @@ describe('the advisor at work', () => {
   test('in dry run, or with no supervisor, questions wait; nothing starts and nothing is sent', async () => {
     const h = advisorHarness()
     h.ask('m1', 'q')
-    const dry = await h.step({ acting: false })
+    const dry = await h.step({ acting: false, notActing: 'autopilot is off' })
     assert.deepEqual([dry?.queued, dry?.waiting], [1, 'autopilot is off'])
     assert.equal(h.launches().length, 0)
-    assert.equal(h.sent.length, 0)
+    // How the advisor is set up is a notice, sent whatever autopilot says; no answer goes.
+    assert.deepEqual(h.sent.map((m) => m.subject), ['Advisor available'])
+    // With autopilot on but the settings in error, the board says that, not "autopilot is off".
+    const broken = await h.step({ acting: false, notActing: 'the settings have errors' })
+    assert.equal(broken?.waiting, 'the settings have errors')
     const lonely = await h.step({ supervisor: null })
     assert.deepEqual([lonely?.queued, h.launches().length], [1, 0])
     await h.step()
@@ -485,12 +491,12 @@ describe('the advisor at work', () => {
     assert.equal(h.sent.length, 2)
     assert.ok(h.sent[1].body.includes('--to term_mail2'))
     assert.equal(h.sent[1].from, 'term_mail2')
-    // Not in dry run.
+    // Turned off: the supervisor hears it whatever autopilot says, since the person changed Settings.
     const off = await h.step({ config: withAdvisor(null), acting: false })
-    assert.equal(h.sent.length, 2)
     assert.equal(off, null)
-    await h.step({ config: withAdvisor(null) })
     assert.equal(h.sent[2].subject, 'Advisor turned off')
+    await h.step({ config: withAdvisor(null) })
+    assert.equal(h.sent.length, 3, 'once')
   })
 
   test('turning it off mid-question stops it and drops the waiting ones, saying so; more than the queue holds is turned away', async () => {
@@ -539,7 +545,10 @@ describe('the advisor starts locked down', () => {
   test('an agent Matriarch cannot lock down is not offered; with readOnly false it runs exempt', async () => {
     const lockdown = createLockdown(() => 1_000_000)
     const h = advisorHarness({ lockdown })
-    assert.equal(await h.step({ config: withAdvisor({ agent: 'grok' }) }), null)
+    // Set but not startable: the board says why, and the supervisor is not offered it.
+    const view = await h.step({ config: withAdvisor({ agent: 'grok' }) })
+    assert.equal(view?.usable, false)
+    assert.equal(view?.agent, 'grok')
     assert.equal(h.sent.length, 0)
     h.ask('m1', 'q')
     await h.step({ config: withAdvisor({ agent: 'grok', readOnly: false }) })
@@ -686,6 +695,40 @@ describe('only the supervisor asks the advisor', () => {
     // Read once: the dropped ones are not looked at again.
     const saved = h.store.get('advice:acme/app') as { seen: string[] }
     assert.deepEqual(saved.seen, ['m1', 'm2', 'm3'])
+    // The board counts them, so a person can see someone else is writing to the mailbox.
+    assert.equal(view?.dropped?.count, 2)
+  })
+
+  test('a supervisor Matriarch cannot recognise is not told about the advisor, and the board says why', async () => {
+    // A chat opened by hand: no launch receipt, and Orca hides a chat Run's coordinator.
+    const h = advisorHarness({ senders: [] })
+    const view = await h.step()
+    assert.equal(h.sent.length, 0, 'not offered an advisor whose answers it would never get')
+    assert.equal(view?.unreachable, 'the advisor answers only a supervisor opened from Matriarch')
+    const known = advisorHarness({ senders: ['orca_session_id:sup-1'] })
+    const fine = await known.step()
+    assert.deepEqual(known.sent.map((m) => m.subject), ['Advisor available'])
+    assert.equal(fine?.unreachable, undefined)
+  })
+
+  test('Matriarch turned off for the project: the supervisor hears it, in dry run too', async () => {
+    const h = advisorHarness()
+    await h.step({ acting: false })
+    h.ask('m1', 'waiting in dry run')
+    await h.step({ acting: false })
+    await h.advisor.stop({ repo: 'acme/app', root: '/r', supervisor: async () => 'run:r1' })
+    assert.deepEqual(h.sent.map((m) => m.subject), ['Advisor available', 'Advisor turned off', 'Advice: 1 waiting question dropped'])
+    assert.equal(h.store.get('advice:acme/app'), null)
+  })
+
+  test('a reply to an answer is read and logged, not answered again', async () => {
+    const h = advisorHarness()
+    await h.briefed()
+    h.raw({ id: 'm1', from: 'term_sup', subject: 'Re: Advice: one PR or two?', body: 'thanks' })
+    const view = await h.step()
+    assert.equal(h.launches().length, 0)
+    assert.equal(view?.queued, 0)
+    assert.ok(h.logs.some((l) => l.includes('a reply to an answer of the advisor is not a question')))
   })
 
   test('who the supervisor is, is asked only when a question came; with nobody known, nothing is answered', async () => {

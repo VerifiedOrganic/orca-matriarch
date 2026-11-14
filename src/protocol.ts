@@ -155,6 +155,10 @@ export interface AdvisorView {
   waiting: string | null
   /** The last question it finished. */
   last: { question: string; at: number; answered: boolean; note: string } | null
+  /** Set when the running supervisor cannot be recognised as a sender, so its questions would be dropped. */
+  unreachable?: string
+  /** Questions dropped because they did not come from the supervisor: how many, and the last one's time. */
+  dropped?: { count: number; at: number }
 }
 
 export interface RepoView {

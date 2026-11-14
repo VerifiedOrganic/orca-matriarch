@@ -15,7 +15,8 @@ anything that lets it do more than that, for example:
   or send something it should not;
 - an issue that reaches the supervisor when the [label rule](README.md#issues-as-objectives) says
   it should not, or whose title or text Matriarch passes on as its own words or the user's;
-- a question that reaches the advisor from anyone but the project's supervisor;
+- a question that reaches the advisor from an address that is not one of the supervisor's (see
+  below for what the check is);
 - the [away-alert](README.md#away-alerts) webhook URL kept anywhere but Orca's secrets, or shown
   or logged beyond its host.
 
@@ -25,7 +26,14 @@ Not vulnerabilities in Matriarch:
   let label issues;
 - a supervisor going over its worker limits: they keep cost and disk in hand and are not a
   security boundary (the refusal before a start works only for Claude Code in a terminal);
-- what the advisor advises: it only reads, and the supervisor weighs its answer.
+- what the advisor advises: it only reads, and the supervisor weighs its answer;
+- another agent on your machine posing as the supervisor to the advisor. The check is an address
+  match: a question is answered only when Orca stored it as sent from the supervisor's chat
+  session, its terminal or the handle its Run is bound to. Orca does not authenticate senders,
+  so an agent that learned one of those addresses can send as it. What that allows is limited:
+  the advisor runs read-only, so the cost is one agent session per question, and the text it
+  writes reaches the supervisor framed as a second opinion, which the supervisor weighs and does
+  not obey.
 
 ## Reporting a vulnerability
 

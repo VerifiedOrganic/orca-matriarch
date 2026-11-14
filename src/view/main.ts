@@ -668,8 +668,16 @@ function advisorLine(a: AdvisorView): HTMLElement {
           : a.last
             ? [`${a.last.answered ? 'answered' : 'no answer to'} ${q(a.last.question)} ${ago(now - a.last.at)} ago`]
             : ['the supervisor can ask it for a second opinion']
+  // Questions from anyone but the supervisor are dropped; the person sees that someone tried.
+  const notes = [
+    // This supervisor cannot be told about it (a chat opened by hand), so it would never get answers.
+    a.unreachable ? el('div', { class: 'muted' }, `Not offered to this supervisor: ${a.unreachable}.`) : null,
+    a.dropped
+      ? el('div', { class: 'muted' }, `${a.dropped.count} question${a.dropped.count === 1 ? '' : 's'} from someone other than the supervisor dropped, the last ${ago(now - a.dropped.at)} ago`)
+      : null
+  ].filter((n): n is HTMLElement => n !== null)
   return el('div', { class: 'sup-advisor', title: a.answering?.lock ?? 'Read-only, in a throwaway worktree' },
-    el('b', {}, 'Advisor'), el('span', { class: 'muted' }, ` · ${who} · `), ...doing)
+    el('b', {}, 'Advisor'), el('span', { class: 'muted' }, ` · ${who} · `), ...doing, ...notes)
 }
 
 function supervisorCard(r: RepoView): HTMLElement {

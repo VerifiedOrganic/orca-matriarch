@@ -51,7 +51,8 @@ export function advisorInstructions(role: AdvisorSpec, address: string, pad = ''
     '(what you know, the options, which you lean to and why), sent to Matriarch, which runs the advisor:',
     `orca orchestration send --to ${address} --subject ${q('Advice: <the question in one line>')} --body ${q('<the context>')} --json`,
     'Then carry on with other work. The answer comes to this chat as a message titled "Advice: <your question>",',
-    'usually within half an hour, and the decision stays yours. If none comes, go on with your own judgment.'
+    'usually within half an hour, and the decision stays yours. If none comes, go on with your own judgment.',
+    'A follow-up is a new message with its own "Advice:" subject: a reply to an answer is not read.'
   ].map((line) => `${pad}${line}`)
 }
 

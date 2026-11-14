@@ -147,9 +147,11 @@ sees only what the supervisor sends it.
 - **One at a time:** one question per project, up to 10 waiting. One that gets no answer (quiet
   for 30 minutes, or running over 2 hours) is ended, and the supervisor is told.
 - **Who may ask:** only the supervisor Matriarch opened with **Open supervisor chat**. Anything
-  else that reaches Matriarch's mailbox is dropped, and a supervisor chat you start by hand gets
-  no answers.
-- **When:** only with autopilot on. In dry run questions wait, and the board says so.
+  else that reaches Matriarch's mailbox is dropped, and the board counts what was dropped. A
+  supervisor chat you start by hand is not offered the advisor at all, since Matriarch could not
+  tell its questions from anyone else's; the board says so. A follow-up is a new `Advice:`
+  message; a reply to an answer is read and not answered again.
+- **When:** answers only with autopilot on. In dry run questions wait, and the board says so.
 - **Cost:** nothing until the supervisor asks, then one agent session per question.
 
 ### Issues as objectives
@@ -317,7 +319,10 @@ a poll.
   webhook) of a reviewer stuck on a prompt in it;
 - refuses a worker start over a limit, from a supervisor or worker that is Claude Code in a
   terminal;
-- tells a running supervisor about the new worker settings or limits when you save them;
+- tells a running supervisor what you changed in Settings: the worker settings, the limits, the
+  advisor turned on, changed or off, and that Matriarch was turned off for the project (with
+  any questions that were waiting). Those notices only say how Matriarch is set up, and you made
+  the change, so they go whatever autopilot says;
 - keeps the supervisor's questions to the advisor, read from its mailbox, until autopilot is on.
 
 **Only with autopilot on,** Matriarch:
@@ -499,6 +504,9 @@ with it. No issue text is stored.
   far they have run only in Matriarch's tests, against stand-ins for Orca, GitHub and GitLab, not
   on a real project or a live Orca. The advisor's mailbox, and how Orca names the sender of a
   question, depend most on Orca's behaving as its 1.4.257 source reads.
+- The advisor answers only the supervisor's questions by matching the address Orca stored for
+  the sender. Orca does not authenticate senders, so another agent on your machine that learned
+  the supervisor's address could ask as it; see [SECURITY.md](SECURITY.md) for what that allows.
 - Read-only reviewers and advisor on Claude Code and Codex only.
 - The worker-start refusal works only for Claude Code in a terminal; every other case relies on
   stopping the worker after it started.

@@ -444,9 +444,12 @@ the supervisor chooses to ask.
   `orca orchestration send --to <Matriarch's mailbox> --subject 'Advice: …' --body '<context>'`.
   Once Orca says the mailbox is gone (closed, or lost in a restart), Matriarch drops it and makes
   a new one. It records what each supervisor was told (its Run, the address, the advisor) and
-  mails it again when any of these change, or when the advisor is turned off.
+  mails it again when any of these change, or when the advisor is turned off. A supervisor whose
+  sender Matriarch cannot name (a chat opened by hand) is not told at all, since every question
+  it sent would be dropped; the board says so.
 - **Reading.** Each tick, `orchestration check --terminal <mailbox> --peek --full` reads new mail
-  as Orca stores it; questions (`Advice: …`, also `Re: Advice: …`) are saved, by message id,
+  as Orca stores it; questions (`Advice: …`; a reply such as `Re: Advice: …` is logged and not
+  answered again, and a follow-up is a new `Advice:`) are saved, by message id,
   before a plain `check --full` marks the batch read, so a crash in between loses nothing and
   nothing is taken twice. Mail that came between the two is taken from that batch. A message is
   marked read only once its subject or body was read. Mail that is not a question is dropped.
@@ -458,7 +461,8 @@ the supervisor chooses to ask.
   `outcome.kind` is `structured`) and the terminal from a terminal launch, and reads the handle
   the Run is bound to now (`run-show --full`: `coordinator_handle`; Orca hides a Run's
   coordinator session id). A supervisor Matriarch did not launch is known only by that handle,
-  so a chat started by hand gets no answers.
+  so a chat started by hand gets no answers. The board counts dropped questions. This is an
+  address match, not authentication: Orca does not authenticate senders (see SECURITY.md).
 - **Answering.** One question at a time per project, up to 10 waiting: a throwaway worktree of
   the default branch (a `matriarch/review-` branch, so the board skips it), the advisor launched
   there exactly as a reviewer is (same lockdown, same launch confirmation, same tool guard), and
@@ -473,15 +477,19 @@ the supervisor chooses to ask.
   over 2 hours (waiting on a person or not), its terminal closed, its agent quit, or an agent
   resumed there without the lockdown (closed at once): the supervisor hears there is no answer.
 - **Dry run.** Like automatic reviews it starts only with autopilot on. In dry run questions wait,
-  and the board says so; answers and notices to the supervisor wait in an outbox until autopilot.
+  and the board says why (autopilot off, or settings with errors); answers wait in an outbox
+  until autopilot. Notices of how the advisor is set up (available, changed, moved, off) go
+  whatever autopilot says, like every notice of a change the person made in Settings.
 - **Polled.** Like review rounds, every project with an advisor at work, mail waiting or a
   worktree left (`advice:active`) is looked after each tick, also when no tick sees the project
   (its workspaces closed): timeouts, terminal checks, removals and mail go on. Only a project the
   tick sees starts a new question.
 - **Turned off.** Turning the advisor off stops the question being answered and drops the waiting
   ones, and the supervisor is told both. Turning Matriarch off for the project does the same,
-  removes the worktree and clears the project's advisor state.
-- **Board.** The supervisor's card shows the advisor and its question; one stuck on a prompt
+  removes the worktree and clears the project's advisor state; the supervisor hears it in dry
+  run too.
+- **Board.** The supervisor's card shows the advisor and its question, an advisor set that
+  Matriarch cannot start (with why), and how many questions it dropped; one stuck on a prompt
   shows under **Needs you** with its terminal.
 
 ## Merging (phase 5)

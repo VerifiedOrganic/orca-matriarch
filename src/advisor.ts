@@ -4,8 +4,11 @@
 // the questions and answers them one at a time: a throwaway worktree at the default branch, the
 // advisor started there read-only, locked down by its own agent exactly like a reviewer, and the
 // answer it writes mailed back to the supervisor. The worktree goes once it answers or gives up.
-// Like automatic reviews it starts only with autopilot on; in dry run questions wait. Everything
-// lives in plugin storage, so a restart picks a question up where it was.
+// Like automatic reviews it starts only with autopilot on; in dry run questions wait, and so do
+// answers. What only tells the supervisor how the advisor is set up (that there is one, where to
+// ask, that it was turned off) goes whatever autopilot says, as the person's own Settings change
+// does. Only a supervisor Matriarch can recognise as the sender is told about it or answered.
+// Everything lives in plugin storage, so a restart picks a question up where it was.
 import type { JsonValue } from 'orca/host'
 import { advisorUsable, type AdvisorSpec, type MatriarchConfig } from './config.ts'
 import {
@@ -83,8 +86,10 @@ export interface AdviceQuestion {
   at: number
 }
 
-/** "Advice: …", also as a reply ("Re: Advice: …"). */
-const ADVICE = /^\s*(?:re\s*:\s*)*advice\s*:\s*/i
+/** A question's subject: "Advice: …". A reply to an answer ("Re: Advice: …") is not a question. */
+const ADVICE = /^\s*advice\s*:\s*/i
+/** A reply to one of the advisor's answers: read, logged, and not answered again. */
+export const ADVICE_REPLY = /^\s*(?:re|aw|fwd?)\s*:\s*(?:(?:re|aw|fwd?)\s*:\s*)*advice\s*:/i
 
 /** The questions among a batch of mail: messages whose subject starts "Advice:". */
 export function adviceQuestions(items: readonly MailItem[], at: number): AdviceQuestion[] {
@@ -197,10 +202,12 @@ export interface AdviceState {
   last: { question: string; at: number; answered: boolean; note: string } | null
   /** The project's main checkout, so the poll can send from its mailbox when no tick sees it. */
   root: string | null
+  /** Questions dropped because their sender was not the supervisor: how many, and the last one's time. */
+  dropped: { count: number; at: number } | null
 }
 
 export function emptyAdviceState(): AdviceState {
-  return { v: 1, queue: [], running: null, seen: [], outbox: [], told: null, leftovers: [], last: null, root: null }
+  return { v: 1, queue: [], running: null, seen: [], outbox: [], told: null, leftovers: [], last: null, root: null, dropped: null }
 }
 
 /** Something to look after even when no tick sees the project: an advisor at work, mail, a worktree. */
@@ -219,7 +226,8 @@ function loadState(raw: unknown): AdviceState {
     told: r.told && typeof r.told === 'object' ? (r.told as AdviceState['told']) : null,
     leftovers: list<string>(r.leftovers).filter((s) => typeof s === 'string'),
     last: r.last && typeof r.last === 'object' ? (r.last as AdviceState['last']) : null,
-    root: typeof r.root === 'string' ? r.root : null
+    root: typeof r.root === 'string' ? r.root : null,
+    dropped: typeof obj(r.dropped).count === 'number' && typeof obj(r.dropped).at === 'number' ? (r.dropped as AdviceState['dropped']) : null
   }
 }
 
@@ -262,8 +270,10 @@ export interface AdviceStepInput {
   config: MatriarchConfig
   /** The supervisor's Run mailbox (`run:<id>`), when one is known. */
   supervisor: string | null
-  /** Autopilot is on and the config has no errors: start the advisor and send mail. */
+  /** Autopilot is on, Matriarch can act and the config has no errors: start the advisor and send answers. */
   acting: boolean
+  /** Why it is not acting, in words for the board; null when it is. */
+  notActing?: string | null
   /** The default branch the advisor reads; null when the forge could not be read this tick. */
   base: string | null
   forge?: ForgeKind
@@ -278,8 +288,10 @@ export interface AdviceStepInput {
 export interface AdvicePollInput {
   /** Projects this tick already stepped (or stopped): left alone here. */
   skip: ReadonlySet<string>
-  /** Autopilot is on: answers and notices may be sent. */
+  /** Autopilot is on and Matriarch can act: answers may be sent. */
   acting: boolean
+  /** Why it is not acting, in words for the board; null when it is. */
+  notActing?: string | null
   /** The supervisor's Run mailbox for a project, when one is known. */
   supervisor(repo: string): Promise<string | null>
 }
@@ -305,7 +317,7 @@ export interface Advisor {
    * is stopped and its worktree removed, the waiting ones dropped, the supervisor told, and the
    * project's advisor state cleared. Nothing to do costs one storage read.
    */
-  stop(input: { repo: string; root: string; supervisor: () => Promise<string | null>; acting: boolean }): Promise<void>
+  stop(input: { repo: string; root: string; supervisor: () => Promise<string | null> }): Promise<void>
   /**
    * Looks after every project with an advisor at work, mail waiting or a worktree left, that this
    * tick did not step (its workspaces closed, say): timeouts, terminal checks, removals and mail
@@ -398,10 +410,12 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       for (const m of items) if (!m.complete) deps.log(`${repo}: a message in Matriarch's mailbox came without its subject or body (${m.id})`)
       if (fresh.length === 0) return false
       state.seen = [...state.seen, ...fresh.map((m) => m.id)].slice(-MAX_SEEN)
+      for (const m of fresh) if (ADVICE_REPLY.test(m.subject)) deps.log(`${repo}: a reply to an answer of the advisor is not a question, and is not answered: "${clip(m.subject, 80)}"`)
       for (const q of adviceQuestions(fresh, deps.now())) {
         known ??= new Set(await senders().catch(() => []))
         if (!q.from || !known.has(q.from)) {
           deps.log(`${repo}: dropped a question for the advisor from ${q.from ?? 'an unknown sender'}, which is not the supervisor: "${clip(q.question, 80)}"`)
+          state.dropped = { count: (state.dropped?.count ?? 0) + 1, at: deps.now() }
           continue
         }
         // The one about to start does not wait: it does not count against the queue.
@@ -580,7 +594,12 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
   }
 
   /** What the board shows of a project's advisor. */
-  function viewOf(state: AdviceState, shown: AdvisorSpec | null, usable: boolean, at: { acting: boolean; supervisor: string | null; waitingForBase: boolean }): AdvisorView {
+  function viewOf(
+    state: AdviceState,
+    shown: AdvisorSpec | null,
+    usable: boolean,
+    at: { acting: boolean; notActing?: string | null; supervisor: string | null; waitingForBase: boolean; unreachable?: boolean }
+  ): AdvisorView {
     const run = state.running
     return {
       agent: shown?.agent ?? run?.agent ?? '',
@@ -600,11 +619,13 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       queued: state.queue.length,
       waiting:
         state.queue.length === 0 && state.outbox.length === 0 ? null
-        : !at.acting ? 'autopilot is off'
+        : !at.acting ? (at.notActing ?? 'autopilot is off')
         : !at.supervisor ? 'no supervisor is running to answer'
         : at.waitingForBase ? 'waiting to read the default branch'
         : null,
-      last: state.last
+      last: state.last,
+      ...(at.unreachable ? { unreachable: 'the advisor answers only a supervisor opened from Matriarch' } : {}),
+      ...(state.dropped ? { dropped: state.dropped } : {})
     }
   }
 
@@ -651,7 +672,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       await deps.store.set(stateKey(repo), state as unknown as JsonValue)
     },
 
-    async stop({ repo, root, supervisor: supervisorOf, acting }) {
+    async stop({ repo, root, supervisor: supervisorOf }) {
       const key = stateKey(repo)
       const raw = await deps.store.get(key)
       if (raw === null || raw === undefined) return
@@ -659,7 +680,9 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       const supervisor = await supervisorOf().catch(() => null)
       await stopAll(state, 'Matriarch was turned off for this project')
       if (state.told?.advisor && supervisor) state.outbox.unshift(advisorMessage(null))
-      if (acting && supervisor) await flush(state, repo, root, supervisor)
+      // The person turned Matriarch off here: the supervisor hears what that ends, whatever
+      // autopilot says, as it does of any change they make in Settings.
+      if (supervisor) await flush(state, repo, root, supervisor)
       const still: string[] = []
       for (const p of state.leftovers) if (!(await removeWorktree(p))) still.push(p)
       if (still.length > 0) {
@@ -682,9 +705,11 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       }
       const advisor = input.config.advisor
       const role = advisorUsable(advisor) ? advisor : null
+      // Answers wait for autopilot; notices of how the advisor is set up do not (see the top).
       const canSend = input.acting && input.supervisor !== null
-      // No advisor, nothing in flight and nobody to tell: nothing to do.
-      if (!role && !state.running && state.queue.length === 0 && state.outbox.length === 0 && state.leftovers.length === 0 && !state.told?.advisor) return null
+      let unreachable = false
+      // No advisor set, nothing in flight and nobody to tell: nothing to do.
+      if (!advisor && !state.running && state.queue.length === 0 && state.outbox.length === 0 && state.leftovers.length === 0 && !state.told?.advisor) return null
 
       // Worktrees that could not be removed before are tried again.
       if (state.leftovers.length > 0) {
@@ -697,7 +722,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
         // Turned off (or no longer one Matriarch can start): stop what is in flight, and tell a
         // supervisor that knew about it.
         await stopAll(state, 'the advisor was turned off')
-        if (state.told?.advisor && canSend) {
+        if (state.told?.advisor && input.supervisor) {
           const m = advisorMessage(null)
           const from = await deps.mailbox(input.repo, input.root).catch(() => null)
           try {
@@ -720,7 +745,10 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
             state.told = { ...t, run: input.supervisor }
           } else if (!t || t.run !== input.supervisor || t.address !== want.address || t.advisor !== want.advisor) {
             // It started before there was an advisor, the advisor changed, or the mailbox moved.
-            if (canSend) {
+            // Only a supervisor Matriarch can recognise as a sender is told: one it cannot (a chat
+            // someone opened by hand) would ask, and every question would be dropped.
+            unreachable = (await input.supervisorSenders().catch(() => [])).length === 0
+            if (!unreachable) {
               const m = advisorMessage({ role, address })
               try {
                 await sendMessage(deps.orca, { to: input.supervisor, subject: m.subject, body: m.body, from: address })
@@ -743,15 +771,18 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       await setActive(input.repo, needsTending(state))
       if (JSON.stringify(state) !== before) await save()
 
-      if (!role && !state.running && state.outbox.length === 0) return null
+      // An advisor that is set but cannot be started still shows, with why.
+      if (!advisor && !state.running && state.outbox.length === 0) return null
       return viewOf(state, role ?? advisor, role !== null, {
         acting: input.acting,
+        notActing: input.notActing ?? null,
         supervisor: input.supervisor,
-        waitingForBase: !input.base && !state.running
+        waitingForBase: !input.base && !state.running,
+        unreachable
       })
     },
 
-    async poll({ skip, acting, supervisor: supervisorOf }) {
+    async poll({ skip, acting, notActing, supervisor: supervisorOf }) {
       const v = await deps.store.get(ACTIVE)
       const repos = (Array.isArray(v) ? v : []).filter((r): r is string => typeof r === 'string' && !skip.has(r))
       const views: { repo: string; view: AdvisorView }[] = []
@@ -770,7 +801,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
         state.outbox = state.outbox.slice(-MAX_OUTBOX)
         await setActive(repo, needsTending(state))
         if (JSON.stringify(state) !== before) await deps.store.set(key, state as unknown as JsonValue)
-        if (state.running || state.outbox.length > 0) views.push({ repo, view: viewOf(state, null, true, { acting, supervisor, waitingForBase: false }) })
+        if (state.running || state.outbox.length > 0) views.push({ repo, view: viewOf(state, null, true, { acting, notActing: notActing ?? null, supervisor, waitingForBase: false }) })
       }
       return views
     }

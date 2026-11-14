@@ -174,6 +174,18 @@ const LANE_ORDER: Lane[] = [
 
 const short = (sha: string): string => sha.slice(0, 7)
 
+/**
+ * Why Matriarch does not act for a project this tick, in words for the board, or null when it
+ * does: autopilot is on, there is something to act with, and the settings have no errors (a
+ * config with errors may have lost a guard, such as a protected path or a reviewer).
+ */
+export function notActing(autopilot: boolean, deps: Pick<EngineDeps, 'executor'>, errors: readonly string[] = []): string | null {
+  if (!autopilot) return 'autopilot is off'
+  if (deps.executor === null) return 'Matriarch cannot act in this host'
+  if (errors.length > 0) return 'the settings have errors'
+  return null
+}
+
 /** The forge that reads a project, or null when this host has none for it. */
 function readerFor(deps: EngineDeps, ref: RepoRef): ForgeReader | null {
   return forgeKind(ref) === 'gitlab' ? (deps.gitlab ?? null) : deps.github
@@ -512,7 +524,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       advised.add(repoKey)
       if (deps.advisor?.stop) {
         await deps.advisor
-          .stop({ repo: repoKey, root: info.root, supervisor: () => deps.supervisor(repoKey), acting: opts.autopilot && deps.executor !== null })
+          .stop({ repo: repoKey, root: info.root, supervisor: () => deps.supervisor(repoKey) })
           .catch((error: Error) => deps.log(`${repoKey}: could not stop the advisor: ${error.message}`))
       }
       continue
@@ -584,7 +596,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       })
     }
     // A config with errors may have lost a guard (a protected path, a reviewer): watch only.
-    const acting = opts.autopilot && deps.executor !== null && cfg.errors.length === 0
+    const whyNot = notActing(opts.autopilot, deps, cfg.errors)
+    const acting = whyNot === null
     if (opts.autopilot && cfg.errors.length > 0) view.errors.push('The config has errors, so Matriarch only watches this repository until they are fixed.')
 
     // The supervisor's workers against the limits (limits.ts): on its row, and to the hook that
@@ -705,7 +718,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         config,
         supervisor,
         pending: view.supervisor.pending,
-        acting: opts.autopilot && cfg.errors.length === 0,
+        acting,
         now,
         store: deps.store,
         tellSupervisor: deps.tellSupervisor,
@@ -763,7 +776,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       advised.add(repoKey)
       try {
         const advisor = await deps.advisor.step({
-          repo: repoKey, root: info.root, config, supervisor, acting, base: base?.name ?? null, forge: kind,
+          repo: repoKey, root: info.root, config, supervisor, acting, notActing: whyNot, base: base?.name ?? null, forge: kind,
           supervisorSenders: async () => (deps.supervisorSenders ? deps.supervisorSenders(repoKey, supervisor) : [])
         })
         if (advisor) {
@@ -1294,8 +1307,9 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
   // An advisor at work for a project no tick sees now (its workspaces closed) still times out,
   // is checked for prompts and unlocked resumes, and has its worktree removed and its mail sent.
   if (deps.advisor?.poll) {
+    const pollWhy = notActing(opts.autopilot, deps)
     const elsewhere = await deps.advisor
-      .poll({ skip: advised, acting: opts.autopilot && deps.executor !== null, supervisor: (repo) => deps.supervisor(repo) })
+      .poll({ skip: advised, acting: pollWhy === null, notActing: pollWhy, supervisor: (repo) => deps.supervisor(repo) })
       .catch((error: Error) => (board.errors.push(`Advisor: ${error.message}`), []))
     for (const { repo, view } of elsewhere) {
       const needs = advisorAttention(repo, view)

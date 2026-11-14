@@ -357,7 +357,8 @@ test('a tick hands issues over only when the project turned it on, survives stor
         store.set(k, v)
       }
     },
-    executor: null,
+    // Something to act with: like any action, a handoff needs it (with autopilot on and no config errors).
+    executor: { execute: async () => ({ ok: true }) },
     tellSupervisor: async (_repo, _root, _to, m) => void told.push(m.subject)
   }
   const off = await tick(deps, { autopilot: true })
