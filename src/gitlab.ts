@@ -270,6 +270,11 @@ export function normalizeMr(raw: unknown, repo: string, host: string, viewer: st
 
 /** GitLab's Reporter role: the lowest that may add labels to issues. */
 const REPORTER = 20
+/**
+ * The usernames GitLab gives bot users: a project or group access token's
+ * (`project_<id>_bot_<hex>`, `group_<id>_bot_<hex>`), and its own bots (support-bot, alert-bot, ...).
+ */
+export const GITLAB_BOT_USERNAME = /^(?:project|group)_\d+_bot(?:_\w+)?$|-bot$/i
 
 export const ISSUE_EDIT_QUERY = `query($path: ID!, $iid: String!) {
   project(fullPath: $path) { issue(iid: $iid) { lastEditedAt } }
@@ -625,7 +630,19 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
         throw new GitLabError(`glab api members: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
       }
       const level = num(obj(JSON.parse(res.stdout)).access_level)
-      return level !== null && level >= REPORTER ? { ok: true, by, at } : { ok: false, why: `${label} was added by ${by}, whose role in the project is below Reporter`, at }
+      if (level === null || level < REPORTER) return { ok: false, why: `${label} was added by ${by}, whose role in the project is below Reporter`, at }
+      // A bot user (an access token, or one of GitLab's own) can hold Reporter, but its label is
+      // no person's go-ahead, as an app's is not on GitHub. Its user record says so; where that
+      // record is hidden (a private profile on a locked-down instance), its username does.
+      if (GITLAB_BOT_USERNAME.test(by)) return { ok: false, why: `${label} was added by ${by}, a bot, not a person with Reporter access`, at }
+      const who = await glab(repo, [`users/${id}`])
+      if (who.code !== 0) {
+        const text = `${who.stderr}${who.stdout}`.trim()
+        if (!/\b404\b|Not Found/i.test(text)) throw new GitLabError(`glab api users: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
+      } else if (obj(JSON.parse(who.stdout)).bot === true) {
+        return { ok: false, why: `${label} was added by ${by}, a bot, not a person with Reporter access`, at }
+      }
+      return { ok: true, by, at }
     },
     commentIssue: (repo, number, body) => act(repo, 'issue notes', ['-X', 'POST', rest(projectPath(repo), `issues/${number}/notes`), '-f', `body=${body}`]),
     async failedLogs(repo, checks) {

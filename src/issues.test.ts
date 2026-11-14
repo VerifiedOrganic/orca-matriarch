@@ -141,6 +141,25 @@ describe('who added the label', () => {
     const outsider = reply(null, null)
     assert.match((await createGitLab(outsider.exec).labelCheck!(GITLAB_REPO, issue(3), 'matriarch') as { why: string }).why, /not a member/)
   })
+
+  test('GitLab: a bot with Reporter is no go-ahead, by its user record or, where that is hidden, its username', async () => {
+    const reply = (username: string, user: { code?: number; stdout?: string; stderr?: string }) =>
+      fakeGlab((args) => {
+        const path = args.find((a) => a.startsWith('projects/') || a.startsWith('users/')) ?? ''
+        if (args.includes('graphql')) return { stdout: included({ project: { issue: { lastEditedAt: null } } }) }
+        if (path.includes('resource_label_events')) return { stdout: JSON.stringify([{ action: 'add', created_at: '2026-11-14T08:00:00Z', user: { id: 9, username }, label: { name: 'matriarch' } }]) }
+        if (path.includes('members/all/9')) return { stdout: JSON.stringify({ access_level: 30 }) }
+        if (path === 'users/9') return user
+        return { stdout: '{}' }
+      })
+    const check = async (r: ReturnType<typeof reply>) => createGitLab(r.exec).labelCheck!(GITLAB_REPO, issue(3), 'matriarch')
+    assert.match(((await check(reply('deploy', { stdout: JSON.stringify({ id: 9, bot: true }) }))) as { why: string }).why, /deploy, a bot, not a person/)
+    assert.match(((await check(reply('project_42_bot_3f9a1c', { stdout: '{}' }))) as { why: string }).why, /a bot, not a person/, 'an access token by its name')
+    assert.match(((await check(reply('support-bot', { code: 1, stderr: 'glab: 404 Not Found (HTTP 404)' }))) as { why: string }).why, /a bot/)
+    assert.deepEqual(await check(reply('lachie', { code: 1, stderr: 'glab: 404 Not Found (HTTP 404)' })), { ok: true, by: 'lachie', at: '2026-11-14T08:00:00Z' }, 'a hidden profile falls back to the name')
+    assert.deepEqual(await check(reply('lachie', { stdout: JSON.stringify({ id: 9, bot: false }) })), { ok: true, by: 'lachie', at: '2026-11-14T08:00:00Z' })
+    await assert.rejects(check(reply('lachie', { code: 1, stderr: 'glab: 502 Bad Gateway' })), /glab api users/)
+  })
 })
 
 describe('the message to the supervisor', () => {
