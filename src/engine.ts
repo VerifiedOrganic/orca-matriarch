@@ -7,8 +7,9 @@ import { defaultConfig, type ConfigResult } from './config.ts'
 import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
 import type { Executor } from './executor.ts'
-import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader } from './forge.ts'
+import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader, type Outcome } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
+import { followIssues } from './issues.ts'
 import { addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
 import { ledgerKey, loadLedger, record, roundsUsed, type PrLedger } from './ledger.ts'
 import { countStarts, dayOf, isWorking, loadStarts, type LimitState } from './limits.ts'
@@ -85,6 +86,10 @@ export interface EngineDeps {
   freeSpace?: (path: string) => Promise<number | null>
   /** Each project's workers and disk against its limits, for the hook that refuses a worker start. */
   onLimits?: (state: LimitState) => void
+  /** Sends the supervisor's Run a message from Matriarch's mailbox (a labeled issue). */
+  tellSupervisor?: (repo: string, root: string, to: string, message: { subject: string; body: string }) => Promise<void>
+  /** Posts a comment on an issue on the project's forge. */
+  commentIssue?: (ref: RepoRef, number: number, body: string) => Promise<Outcome>
 }
 
 const gb = (bytes: number): string => `${(bytes / 1024 ** 3).toFixed(1)} GB`
@@ -429,6 +434,28 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     // A config with errors may have lost a guard (a protected path, a reviewer): watch only.
     const acting = opts.autopilot && deps.executor !== null && cfg.errors.length === 0
     if (opts.autopilot && cfg.errors.length > 0) view.errors.push('The config has errors, so Matriarch only watches this repository until they are fixed.')
+    // Labeled issues: the supervisor's next objectives (issues.ts).
+    if (config.issues.enabled) {
+      const issues = await followIssues({
+        repo: repoKey,
+        ref: info.ref,
+        root: info.root,
+        forge,
+        config,
+        supervisor,
+        pending: view.supervisor.pending,
+        acting: opts.autopilot && cfg.errors.length === 0,
+        now,
+        store: deps.store,
+        tellSupervisor: deps.tellSupervisor,
+        commentIssue: deps.commentIssue,
+        stillOn: opts.stillOn
+      })
+      view.issues = issues.view
+      view.warnings.push(...issues.warnings)
+      view.errors.push(...issues.errors)
+      if (issues.attention) board.attention.push(issues.attention)
+    }
 
     const byBranch = new Map<string, Workspace>()
     for (const ws of repoWorkspaces) {

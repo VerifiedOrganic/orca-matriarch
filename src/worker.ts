@@ -11,7 +11,7 @@ import { createCrew, launchedTerminal, type Crew } from './crew.ts'
 import { branchName, tick, type ActivityInfo, type EngineDeps, type RepoInfo, type Workspace } from './engine.ts'
 import { nodeExec, type Exec } from './exec.ts'
 import { createExecutor } from './executor.ts'
-import { forgeTerms, gitlabRef, parseRemote, repoKey, type ForgeReader, type RepoRef } from './forge.ts'
+import { forgeKind, forgeTerms, gitlabRef, parseRemote, repoKey, type ForgeReader, type RepoRef } from './forge.ts'
 import { createGitHub, parseGitHubRemote, type GitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
 import { ledgerKey, loadLedger, record, roundsUsed } from './ledger.ts'
@@ -390,6 +390,11 @@ export function createWorker(options: WorkerOptions = {}) {
         return Number(s.bavail) * Number(s.bsize)
       },
       onLimits: (state) => limitsGuard.update(state),
+      tellSupervisor: async (repo, root, to, m) => sendMessage(cli, { to, subject: m.subject, body: m.body, from: await mailboxFor(repo, root) }),
+      commentIssue: async (ref, number, body) => {
+        const forge = forgeKind(ref) === 'gitlab' ? gitlabForge : githubForge
+        return forge.commentIssue ? forge.commentIssue(ref, number, body) : { ok: false, error: `cannot comment on ${forgeTerms(forgeKind(ref)).name} issues here` }
+      },
       removeWorktree: async (path, options) => {
         // Only a clean worktree goes: anything uncommitted, even an untracked file, keeps it.
         const status = await exec('git', ['-C', path, 'status', '--porcelain'], { timeoutMs: 15_000 })

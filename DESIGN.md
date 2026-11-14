@@ -72,7 +72,9 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
              "onBaseRed": "pause", "deleteBranch": true },
   "escalation": { "supervisorFirst": true, "humanAfterMinutes": 30 },
   // maxWorkers and maxWorkerStartsPerDay: 0 for no cap; minFreeDiskGB: 0 for no floor.
-  "limits": { "maxConcurrentReviews": 2, "maxWorkers": 4, "maxWorkerStartsPerDay": 0, "minFreeDiskGB": 10 }
+  "limits": { "maxConcurrentReviews": 2, "maxWorkers": 4, "maxWorkerStartsPerDay": 0, "minFreeDiskGB": 10 },
+  // Labeled issues become the supervisor's objectives (see Supervisor).
+  "issues": { "enabled": false, "label": "matriarch", "comment": false }
 }
 ```
 
@@ -235,6 +237,15 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   (`agent-tool-plugin-hooks.ts`: other agents' calls are only reported), so a supervisor on
   another agent can go over; Needs you says so. A worker counts as started when Matriarch first
   sees it; the workers already there when it first looks are not counted.
+- **Issues as objectives** (`src/issues.ts`). With `issues.enabled`, Matriarch reads the open
+  issues carrying `issues.label` every 5 minutes, over REST (GitHub's REST budget is separate from
+  the GraphQL one the PR reads spend; GitLab's `projects/:id/issues`). Under autopilot each new one
+  goes to the running supervisor once, as plain mail titled "New objective:", with the link, the
+  title, and the body in a fence and marked as the issue's text; the brief says the label is the
+  user's go-ahead and asks for `Closes #<n>` in the PR. Handed issues are kept in plugin storage,
+  saved before the optional comment, so a failed comment never hands one over twice. With no
+  supervisor running, Needs you says they wait; in dry run the board says it would hand them over.
+  The trust boundary is the label: triage access on GitHub, Reporter and up on GitLab.
 - **Not yet run live.** Its workers push branches and open PRs, so the first run should be on a
   task you choose.
 

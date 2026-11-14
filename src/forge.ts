@@ -44,10 +44,22 @@ export interface Outcome {
   skipped?: string
 }
 
+/** An open issue, as handed to the supervisor. */
+export interface IssueInfo {
+  number: number
+  title: string
+  /** As written on the forge: the issue's text, not the user's instructions. */
+  body: string
+  url: string
+  author: string | null
+}
+
 /** Reads a forge's open PRs cheaply, and one PR in full. */
 export interface ForgeReader {
   listOpen(repo: RepoRef, options?: ListOptions): Promise<OpenList>
   detail(repo: RepoRef, number: number): Promise<{ pr: PrSnapshot | null; rate: RateInfo | null }>
+  /** Open issues with this label, oldest first (up to 50); absent where a forge cannot say. */
+  labeledIssues?(repo: RepoRef, label: string): Promise<IssueInfo[]>
 }
 
 /** One AI review as it goes on the PR: a summary, and the findings anchored to lines. */
@@ -68,6 +80,8 @@ export interface ForgeActions {
   publishReview(repo: RepoRef, pr: PrSnapshot, sha: string, review: ForgeReview): Promise<Outcome>
   /** The last lines of each failed check's log, by check name, where the forge keeps one. */
   failedLogs(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
+  /** Posts one comment on an issue as the signed-in person. */
+  commentIssue?(repo: RepoRef, number: number, body: string): Promise<Outcome>
 }
 
 export interface Forge extends ForgeReader, ForgeActions {

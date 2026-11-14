@@ -364,6 +364,14 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
     row('Disk floor', 'Below this much free disk, no new worker starts and Needs you says so. 0 turns it off.', number(d.limits.minFreeDiskGB, (n) => (d.limits.minFreeDiskGB = n), 0, 10_000), { after: [unit('GB')] }),
     row('Reviews at once', 'In this project; more wait their turn.', number(d.limits.maxConcurrentReviews, (n) => (d.limits.maxConcurrentReviews = n), 1, 20)))
 
+  const issues = group('issues', 'Issues', () =>
+    d.issues.enabled ? `Labeled ${d.issues.label || '…'} goes to the supervisor${d.issues.comment ? ' · comments on it' : ''}` : 'Off: you give the supervisor its objectives',
+    intro("Label an open issue and, with autopilot on, Matriarch hands it to the running supervisor as a new objective, once. The label is the go-ahead, and the issue's text goes to the supervisor as written: only people who can label issues (triage access on GitHub, Reporter and up on GitLab) can hand work over."),
+    row('Hand labeled issues to the supervisor', null, toggle(d.issues.enabled, (on) => (d.issues.enabled = on))),
+    dependent(
+      row('Label', 'The label that hands an issue over.', textInput(d.issues.label, (v) => (d.issues.label = v.trim()), { placeholder: 'matriarch' })),
+      row('Comment on the issue', 'One short comment saying the supervisor took it up.', toggle(d.issues.comment, (on) => (d.issues.comment = on)))))
+
   const project = group('project', 'Project', () =>
     d.forge?.kind === 'gitlab' ? `GitLab${d.forge.host ? ` on ${d.forge.host}` : ", on the origin's host"}` : d.forge?.kind === 'github' ? 'GitHub' : 'GitHub or GitLab, found from its origin',
     choice('Where it lives', 'github.com is GitHub. Another host is GitLab once glab is signed in to it (glab auth login --hostname <host>). Pick GitLab here for a host behind an ssh alias.',
@@ -428,7 +436,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
     el('h3', { class: 'settings-heading' }, 'Who does the work'),
     el('div', { class: 'roles' }, supervisor, workers, reviewers),
     el('h3', { class: 'settings-heading' }, 'Rules'),
-    el('div', { class: 'groups' }, review, fixes, merging, limits, project),
+    el('div', { class: 'groups' }, review, fixes, merging, limits, issues, project),
     danger,
     el('div', { class: 'settings-foot' }, status, cancel, save)
   )

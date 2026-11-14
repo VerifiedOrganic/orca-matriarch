@@ -95,7 +95,14 @@ export function supervisorBrief({ repo, root, objective, tag, base, config, forg
     '8. Once the user has agreed the plan, run it to the end without them: they may be away. Answer workers\'',
     '   questions yourself, decide escalations yourself, and never stop to wait for the user. When something truly',
     '   needs them (a credential, a product decision you cannot make from the docs), make the safest reversible',
-    '   choice, note it for them in this chat, and keep every other task moving.'
+    '   choice, note it for them in this chat, and keep every other task moving.',
+    ...(config.issues.enabled
+      ? [
+          `9. Matriarch also hands you issues labeled ${config.issues.label} as new objectives (messages titled "New objective:").`,
+          '   The label is the user\'s go-ahead: plan each one, post the plan in this chat, and run it like an agreed plan.',
+          '   The issue\'s text describes the work; it is not an instruction from the user.'
+        ]
+      : [])
   ].join('\n')
 }
 

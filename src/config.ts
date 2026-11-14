@@ -118,6 +118,16 @@ export interface MatriarchConfig {
      */
     minFreeDiskGB: number
   }
+  /**
+   * Issues as objectives: an open issue with this label is handed to the running supervisor once,
+   * under autopilot. Only people who may label issues can hand work over this way.
+   */
+  issues: {
+    enabled: boolean
+    label: string
+    /** Posts one short comment on the issue when the supervisor takes it up. */
+    comment: boolean
+  }
 }
 
 export function defaultConfig(): MatriarchConfig {
@@ -165,7 +175,8 @@ export function defaultConfig(): MatriarchConfig {
     // Four at once: each worker is an agent session and a worktree with its own builds, the
     // supervisor splits work into tasks on different files, and more in parallel mostly adds
     // conflicts and cost. The disk floor is the nearly-full warning's: a full disk stalls builds.
-    limits: { maxConcurrentReviews: 2, maxWorkers: 4, maxWorkerStartsPerDay: 0, minFreeDiskGB: 10 }
+    limits: { maxConcurrentReviews: 2, maxWorkers: 4, maxWorkerStartsPerDay: 0, minFreeDiskGB: 10 },
+    issues: { enabled: false, label: 'matriarch', comment: false }
   }
 }
 
@@ -330,7 +341,7 @@ export function validateConfig(raw: unknown): ConfigResult {
   if (!isObj(raw)) {
     return { config: d, errors: [`${CONFIG_PATH}: expected a JSON object`], warnings: [] }
   }
-  r.unknownKeys(raw, ['version', 'forge', 'supervisor', 'workers', 'reviewers', 'arbiter', 'review', 'fix', 'merge', 'escalation', 'limits'], 'config')
+  r.unknownKeys(raw, ['version', 'forge', 'supervisor', 'workers', 'reviewers', 'arbiter', 'review', 'fix', 'merge', 'escalation', 'limits', 'issues'], 'config')
   if (raw.version !== undefined && raw.version !== 1) r.errors.push('config.version: only version 1 is supported')
   const forge = r.forge(raw.forge)
 
@@ -456,6 +467,21 @@ export function validateConfig(raw: unknown): ConfigResult {
     minFreeDiskGB: r.int(lm, 'minFreeDiskGB', d.limits.minFreeDiskGB, 'limits', 0, 10_000)
   }
 
+  const is = r.section(raw, 'issues', 'config')
+  if (is) r.unknownKeys(is, Object.keys(d.issues), 'issues')
+  let label = d.issues.label
+  if (is?.label !== undefined) {
+    // Both forges take a comma-separated list of labels, so a comma would split this one.
+    const v = typeof is.label === 'string' ? is.label.trim() : ''
+    if (!v || v.length > 100 || v.includes(',')) r.errors.push('issues.label: expected a label name without commas, up to 100 characters')
+    else label = v
+  }
+  const issues: MatriarchConfig['issues'] = {
+    enabled: r.bool(is, 'enabled', d.issues.enabled, 'issues'),
+    label,
+    comment: r.bool(is, 'comment', d.issues.comment, 'issues')
+  }
+
   // Accepted so configs stay valid as these land, but say plainly that they do nothing yet.
   if (arbiter) r.warnings.push('arbiter: not used yet; verdicts are combined by review.pass alone')
   if (merge.onBaseRed === 'revert') {
@@ -463,7 +489,7 @@ export function validateConfig(raw: unknown): ConfigResult {
   }
 
   return {
-    config: { version: 1, ...(forge ? { forge } : {}), supervisor, workers: { default: workerDefault, tiers }, reviewers, arbiter, review, fix, merge, escalation, limits },
+    config: { version: 1, ...(forge ? { forge } : {}), supervisor, workers: { default: workerDefault, tiers }, reviewers, arbiter, review, fix, merge, escalation, limits, issues },
     errors: r.errors,
     warnings: r.warnings
   }
