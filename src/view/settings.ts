@@ -379,7 +379,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       d.limits.minFreeDiskGB > 0 ? `${d.limits.minFreeDiskGB} GB disk floor` : 'no disk floor',
       `${cap(d.limits.maxConcurrentReviews, 'review')} at once`
     ].filter(Boolean).join(' · '),
-    intro("The supervisor is told these, and Matriarch refuses a worker it starts over one, with what to do instead. It can refuse only a Claude Code supervisor's start: another agent's goes through, and Needs you says it went over. They hold in dry run too."),
+    intro("The supervisor is told these, and Matriarch refuses a worker it starts over one, with what to do instead. It refuses only starts from the supervisor's terminal or its workers' on Claude Code: a supervisor in a chat or on another agent can go over, and Needs you says so. Your own sessions are never refused. They hold in dry run too."),
     row('Workers at once', "The supervisor's workers running together. 0 for no limit.", number(d.limits.maxWorkers, (n) => (d.limits.maxWorkers = n), 0, 50)),
     row('Worker starts a day', 'Counted from midnight. 0 for no limit.', number(d.limits.maxWorkerStartsPerDay, (n) => (d.limits.maxWorkerStartsPerDay = n), 0, 1000)),
     row('Disk floor', 'Below this much free disk, no new worker starts and Needs you says so. 0 turns it off.', number(d.limits.minFreeDiskGB, (n) => (d.limits.minFreeDiskGB = n), 0, 10_000), { after: [unit('GB')] }),
@@ -387,7 +387,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
 
   const issues = group('issues', 'Issues', () =>
     d.issues.enabled ? `Labeled ${d.issues.label || '…'} goes to the supervisor${d.issues.comment ? ' · comments on it' : ''}` : 'Off: you give the supervisor its objectives',
-    intro("Label an open issue and, with autopilot on, Matriarch hands it to the running supervisor as a new objective, once. The label is the go-ahead, and the issue's text goes to the supervisor as written: only people who can label issues (triage access on GitHub, Reporter and up on GitLab) can hand work over."),
+    intro("Label an open issue and, with autopilot on, Matriarch hands it to the running supervisor as a new objective, once. The label is the go-ahead, so it counts only when someone allowed to triage issues (triage access or more on GitHub, Reporter and up on GitLab) added it last, and the issue was not edited after. The issue's text goes to the supervisor as written."),
     row('Hand labeled issues to the supervisor', null, toggle(d.issues.enabled, (on) => (d.issues.enabled = on))),
     dependent(
       row('Label', 'The label that hands an issue over.', textInput(d.issues.label, (v) => (d.issues.label = v.trim()), { placeholder: 'matriarch' })),

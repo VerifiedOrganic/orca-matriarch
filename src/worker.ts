@@ -315,13 +315,16 @@ export function createWorker(options: WorkerOptions = {}) {
     const readOnlyGuard = () => joinGuards(crew.guard(), advisor.guard())
     // The supervisor's worker starts are held to each project's limits (limits.ts). Orca waits on
     // this hook only for Claude Code; for another agent the refusal is ignored and the board says so.
-    const limitsGuard = createLimitsGuard(now)
+    // Kept in storage, so a restart starts from the last counts rather than from none.
+    const limitsGuard = createLimitsGuard({ now, save: (snapshot) => void orca.storage.set('limits:guard', snapshot as unknown as JsonValue).catch(() => {}) })
+    void orca.storage.get('limits:guard').then((saved) => limitsGuard.restore(saved), () => {})
     orca.hooks.on('agent.tool.before', (event) => {
       const review = reviewGuard(event, readOnlyGuard())
       if (review) return review
       const limit = limitsGuard.decide(event)
       if (!limit) return undefined
-      orca.log(`${limit.repo}: refused a worker start by ${event.agent}: ${limit.deny}`)
+      // Orca waits on this answer only from Claude Code; for another agent it is a note in the log.
+      orca.log(event.agent === 'claude' ? `${limit.repo}: refused a worker start by claude: ${limit.deny}` : `${limit.repo}: ${event.agent} started a worker over a limit (Orca does not wait on its hook): ${limit.deny}`)
       return { deny: limit.deny }
     })
     // Reviewers and the advisor start in their agent's own read-only mode; every other launch passes untouched.
@@ -440,6 +443,7 @@ export function createWorker(options: WorkerOptions = {}) {
         return Number(s.bavail) * Number(s.bsize)
       },
       onLimits: (state) => limitsGuard.update(state),
+      onProjects: (repos) => limitsGuard.keep(new Set(repos)),
       tellSupervisor: async (repo, root, to, m) => sendMessage(cli, { to, subject: m.subject, body: m.body, from: await mailboxFor(repo, root) }),
       commentIssue: async (ref, number, body) => {
         const forge = forgeKind(ref) === 'gitlab' ? gitlabForge : githubForge
@@ -496,7 +500,6 @@ export function createWorker(options: WorkerOptions = {}) {
           const next = await exclusive(async () => tick(deps, { autopilot: await isOn(), stillOn: isOn }))
           // Orca accepts only plain JSON from a worker: drop undefined fields once, here.
           board = JSON.parse(JSON.stringify(next)) as Board
-          limitsGuard.keep(new Set(board.repos.map((r) => r.repo)))
           // Back off while Orca or a forge keeps failing (rate limits included), not only when the board is empty.
           const trouble = (board.errors.length > 0 && board.tracks.length === 0) || board.repos.some((r) => r.errors.some((e) => /^(GitHub|GitLab):/.test(e)))
           failures = trouble ? failures + 1 : 0

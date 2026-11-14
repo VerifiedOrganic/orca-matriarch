@@ -103,14 +103,25 @@ is not signed in to yet, pick it under **Forge** in Settings.
 Turn on **Hand labeled issues to the supervisor** under **Settings → Issues**. Then label an open
 issue `matriarch` (or the label you pick there). With autopilot on, Matriarch hands it to the
 running supervisor once, as a new objective: the label is the go-ahead, and the PR that does it
-says `Closes #<n>`. Matriarch reads the labeled issues every 5 minutes. With no supervisor
-running, **Needs you** says the issue waits for one; in dry run the board says it would hand it
-over. **Comment on the issue** posts one short comment when the supervisor takes it up.
+says `Closes #<n>`. Matriarch reads the labeled issues every 5 minutes (500 at most, oldest
+first; the board says when there are more). With no supervisor running, **Needs you** says the
+issue waits for one; in dry run the board says it would hand it over. **Comment on the issue**
+posts one short comment when the supervisor takes it up.
 
-Only people who can label issues can hand work over this way: on GitHub, people with triage
-access or more; on GitLab, project members from Reporter up. The issue's text goes to the
-supervisor as written, marked as the issue's and not yours, so label only issues you would give
-an agent to do.
+An issue goes over only when both hold:
+
+- **the label was last added by someone allowed to triage issues**: on GitHub, a collaborator
+  whose role is triage, write, maintain or admin (a bot or app never counts); on GitLab, a project
+  member from Reporter up, counting group membership;
+- **neither its title nor its text changed after that**: on GitHub, no title change and no body
+  edit after the label was added; on GitLab, no edit of the title or description after it.
+
+So a label an issue template adds counts only if the issue's author has that access, and an
+issue its author edits after you labeled it waits. Such an issue stays on the board with the
+reason, until someone with access adds the label again (remove it, then add it). The issue's
+title and text go to the supervisor as written, inside a fence and marked as the issue's, not
+yours, so label only issues you would give an agent to do. Labels named `any` or `none` are
+refused: GitLab reads them as filters.
 
 Settings are saved in the project's `.orca/matriarch.json`, so you can commit them to share with
 your team. Nobody has to edit that file: every setting Matriarch uses is in **Settings**, and
@@ -187,11 +198,15 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - **Reviews at once** (default 2) limits how many review crews run together.
 - **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
   supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
-  The supervisor's brief states them, and a running supervisor is told when you change them.
-  Matriarch refuses a Claude Code supervisor's `worker-start` over a limit, with what to do
-  instead (wait for a worker to finish, for tomorrow, or for space). Orca lets a plugin stop only
-  Claude Code's tool calls, so a supervisor on another agent can go over; **Needs you** then says
-  so. Limits hold in dry run too: they guard your disk and accounts, not the PRs.
+  The supervisor's brief states them, and a running supervisor is told when you change them. A
+  start over a limit is refused, with what to do instead (wait for a worker to finish, for
+  tomorrow, or for space), when it comes from the supervisor's own terminal or one of its
+  workers' and that agent is Claude Code. Orca stops only Claude Code's tool calls, and reports
+  none for a session in a chat (the supervisor opens as one), so a supervisor in a chat or on
+  another agent can go over; **Needs you** then says so. A command that starts workers in a loop
+  is refused while a count limit is set, since how many it starts cannot be known. Limits hold in
+  dry run too: they guard your disk and accounts, not the PRs. Your own sessions are never
+  refused.
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback
 model you choose; otherwise it shows the reviewer as **Needs you**.
@@ -220,9 +235,10 @@ start agents and read their state. It asks Orca for these capabilities:
   one, in Orca's encrypted secrets.
 
 It also adds two **hooks**. They change nothing for agents outside a review worktree (a review
-round's, or the advisor's), except that a Claude Code agent's `orca orchestration worker-start`
-in one of your projects is refused when it would go over that project's worker limits (see
-[What it costs](#what-it-costs)):
+round's, or the advisor's), except that a worker start (`orca orchestration worker-start` or
+`dispatch`, `orca agent launch`) from the supervisor's own terminal or one of its workers' is
+refused when it would go over the project's worker limits (see [What it costs](#what-it-costs)).
+Your own sessions are never judged:
 
 - **Before an agent launches** (`agent.launch.before`), a reviewer's command is rewritten so it
   starts read-only, whatever permission mode you chose in Orca:
@@ -265,7 +281,8 @@ are not changed.
 | `gh api repos/<repo>/pulls/<n>/reviews` | autopilot, when **Where reviews go** includes the PR: one comment review per round |
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
 | `gh pr edit <n> --base <branch>` | autopilot: move a stacked PR to where its parent merged, when GitHub left it on the parent's branch |
-| `gh api repos/<repo>/issues?state=open&labels=<label>` | with **Issues** on, every 5 minutes: the open issues with the label |
+| `gh api repos/<repo>/issues?state=open&labels=<label>&page=<n>` | with **Issues** on, every 5 minutes: the open issues with the label |
+| `gh api graphql` (an issue's label and title events and last edit), `gh api repos/<repo>/collaborators/<login>/permission` | with **Issues** on, once per new or changed labeled issue: who added the label, and whether it changed since |
 | `gh api -X POST repos/<repo>/issues/<n>/comments` | autopilot, with **Comment on the issue**: one comment when the supervisor takes an issue up |
 | `gh api repos/<repo>/compare/<sha>...<branch>` | once when a stacked PR's parent merged: whether the base kept the commit the PR was built on |
 | `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
@@ -277,7 +294,8 @@ are not changed.
 | `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n> -f target_branch=<branch>` | GitLab, autopilot: move a stacked merge request to where its parent merged |
-| `glab api --hostname <host> projects/<project>/issues?state=opened&labels=<label>` | GitLab, with **Issues** on, every 5 minutes: the open issues with the label |
+| `glab api --hostname <host> projects/<project>/issues?state=opened&labels=<label>&page=<n>` | GitLab, with **Issues** on, every 5 minutes: the open issues with the label |
+| `glab api --hostname <host> …/issues/<n>/resource_label_events`, `…/members/all/<id>`, `graphql` (its last edit) | GitLab, with **Issues** on, once per new or changed labeled issue: who added the label, and whether it changed since |
 | `glab api --hostname <host> -X POST …/issues/<n>/notes` | GitLab, autopilot, with **Comment on the issue**: one note when the supervisor takes an issue up |
 | `glab api --hostname <host> …/repository/merge_base?refs[]=<sha>&refs[]=<branch>` | GitLab, once when a stacked merge request's parent merged: whether the base kept the commit it was built on |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | GitLab, autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |

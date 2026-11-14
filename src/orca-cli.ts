@@ -62,6 +62,13 @@ export interface WorkerRow {
   state: string | null
   /** False once its agent has exited (a failed or finished attempt); unknown counts as live. */
   live?: boolean
+  /**
+   * Orca's liveness verdict as given: `live`, `exited`, or `unverifiable` (just started, restored
+   * after a restart, a stale status); null when the list did not say.
+   */
+  liveness?: string | null
+  /** The terminal handle its agent runs in, when Orca names it. */
+  terminal?: string | null
 }
 
 /**
@@ -94,7 +101,9 @@ export function parseWorkerList(result: unknown): WorkerRow[] {
       agent: str(provider.id) ?? str(effective.agent) ?? str(launch.agent) ?? (combined && cut > 0 ? combined.slice(0, cut) : combined),
       model: str(provider.model) ?? str(w.model) ?? str(effective.model) ?? str(requested.model) ?? (combined && cut > 0 ? combined.slice(cut + 1) : null),
       state: str(w.workerState) ?? str(w.state) ?? str(w.status),
-      live: liveness === null ? true : liveness === 'live'
+      live: liveness === null ? true : liveness === 'live',
+      liveness,
+      terminal: str(w.agentTerminalHandle) ?? str(obj(w.terminal).handle)
     })
   }
   return rows

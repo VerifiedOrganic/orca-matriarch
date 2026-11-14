@@ -284,22 +284,48 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
 - **Limits** (`src/limits.ts`). The supervisor starts workers itself, so Matriarch holds it to
   `limits.maxWorkers`, `maxWorkerStartsPerDay` and `minFreeDiskGB` two ways. The brief states
   them, and saving new ones in Settings tells a running supervisor. The `agent.tool.before` hook
-  refuses a `orca orchestration worker-start` Bash call from one of the project's checkouts over a
-  limit, with what to do instead. The hook gets 2 s and may not await, so each tick hands it the
-  counts (running workers of the supervisor's Run, workers first seen today, free disk) and it adds
-  the starts it let through since. Orca waits on that hook only for Claude Code
-  (`agent-tool-plugin-hooks.ts`: other agents' calls are only reported), so a supervisor on
+  refuses a Bash call over a limit, with what to do instead, only from the supervisor's terminal
+  or one of its Run's workers' (the event's `terminalId` is Orca's terminal handle,
+  `getTerminalHandleForPaneKey`; worker-list rows carry `agentTerminalHandle`), so the person's own
+  sessions are never judged. Reading the command it fails closed: quotes, escapes and line
+  continuations are dropped, and every `orchestration` followed (past flags and their values) by
+  `worker-start`, `dispatch` or a word the shell would expand counts as a start, whatever the
+  command word (`orca`, `orca-ide`, `$ORCA_CLI_COMMAND`, a path), as does every `agent launch`.
+  A call with several starts counts each; one with a loop (`for`, `while`, `xargs`, a function)
+  is refused while a count limit is set. The hook gets 2 s and may not await, so each tick hands
+  it the counts (running workers of the supervisor's Run, workers first seen today, free disk,
+  and when the worker list was asked for) and it adds the starts it let through since; a start
+  stops counting once a list asked for 30 s after it would show its worker. The counts are kept in
+  plugin storage and survive a restart or a failed tick. Running means not settled and not seen
+  exited: a worker Orca cannot vouch for (`unverifiable`: just started, restored, stale) counts.
+  Orca waits on that hook only for Claude Code (`agent-tool-plugin-hooks.ts`: other agents' calls
+  are only reported), and a chat-mode session has no hook stream, so a supervisor in a chat or on
   another agent can go over; Needs you says so. A worker counts as started when Matriarch first
-  sees it; the workers already there when it first looks are not counted.
+  sees it in its Run's list; the workers already there when it first looks at a Run are not
+  counted. `agent.launch.before` cannot stand in for every agent: Orca 1.4.257 gives it the
+  agent, workspace, a pre-allocated terminal handle and the command, with `env: {}` and no
+  dispatch or task id, so a worker's launch looks like any other.
 - **Issues as objectives** (`src/issues.ts`). With `issues.enabled`, Matriarch reads the open
-  issues carrying `issues.label` every 5 minutes, over REST (GitHub's REST budget is separate from
-  the GraphQL one the PR reads spend; GitLab's `projects/:id/issues`). Under autopilot each new one
-  goes to the running supervisor once, as plain mail titled "New objective:", with the link, the
-  title, and the body in a fence and marked as the issue's text; the brief says the label is the
-  user's go-ahead and asks for `Closes #<n>` in the PR. Handed issues are kept in plugin storage,
-  saved before the optional comment, so a failed comment never hands one over twice. With no
-  supervisor running, Needs you says they wait; in dry run the board says it would hand them over.
-  The trust boundary is the label: triage access on GitHub, Reporter and up on GitLab.
+  issues carrying `issues.label` every 5 minutes, over REST, in pages of 100 up to 500, oldest
+  first (GitHub's PRs take places on its pages and are dropped after; the board says when more
+  carry the label). A new label reads at once. Each new or changed issue not handed yet is
+  checked: on GitHub, one GraphQL read of its newest `LabeledEvent`s and `RenamedTitleEvent`s
+  and its `lastEditedAt`, then `collaborators/<actor>/permission` (role triage, write, maintain
+  or admin, or permission write or admin; a Bot actor never passes); on GitLab,
+  `resource_label_events` (the newest `add`), the member's `members/all/<id>` access level (20,
+  Reporter, and up) and GraphQL `lastEditedAt` (title and description edits). It passes only
+  when the latest label was added by such a person and nothing was edited after it; otherwise it
+  waits on the board with the reason until the label is added again. Checks are kept by the
+  issue's `updated_at`; one that could not be made is asked again next read. Under autopilot each
+  passing issue goes to the running supervisor once, as plain mail titled "New objective:
+  <repo>#<n>" and a cleaned, short title; the title and body go in a fence, marked as the issue's
+  text, and the brief says the label is the user's go-ahead and asks for `Closes #<n>`. Only
+  numbers and short reasons are stored, never an issue's text (bodies are cut to 6000 characters
+  as they are read). Each handoff is recorded in its own key (`issue:<repo>#<n>`) before the
+  message is sent, and an issue with that record is never sent again, so a failed save cannot
+  hand one over twice; a storage failure only leaves an issue waiting, and never stops the tick.
+  With no supervisor running, Needs you says they wait; in dry run the board says it would hand
+  them over. Labels named `any` or `none` are refused: GitLab reads them as filters.
 - **Not yet run live.** Its workers push branches and open PRs, so the first run should be on a
   task you choose.
 

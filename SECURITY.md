@@ -11,14 +11,17 @@ meant to do. Please report anything that lets it do more than that, for example:
   not allow;
 - a crafted PR, review comment, CI log or agent output that makes Matriarch run a command or
   send something it should not;
-- an issue that reaches the supervisor without the label, or whose text Matriarch passes on as
-  its own words or the user's.
+- an issue that reaches the supervisor when the rule below says it should not, or whose title or
+  text Matriarch passes on as its own words or the user's.
 
 With **Issues** on, an open issue with the project's label is handed to the supervisor as an
-objective, and its text goes to the supervisor as written (fenced, and marked as the issue's).
-Who can add that label is your forge's access control: on GitHub, people with triage access or
-more; on GitLab, project members from Reporter up. What a labeled issue asks the pod to do is up
-to the people you let label issues, and is not a vulnerability in Matriarch.
+objective only when the label was last added by someone allowed to triage issues (on GitHub, a
+collaborator whose role is triage, write, maintain or admin, and not a bot or app; on GitLab, a
+project member from Reporter up), and its title and text did not change after that (on GitHub, no
+title change and no body edit after the label event; on GitLab, no edit of the title or
+description after it). Its title and text go to the supervisor as written, fenced and marked as
+the issue's. What a labeled issue asks the pod to do is up to the people you let label issues,
+and is not a vulnerability in Matriarch.
 
 ## Reporting a vulnerability
 

@@ -9,7 +9,7 @@
 // pipeline status moved, or every few minutes (QUIET_REFRESH_MS) for what the list cannot show.
 // Merge requests are read into the same PrSnapshot as GitHub's PRs, so the planner reads both.
 import type { Exec, ExecOptions, ExecResult } from './exec.ts'
-import { projectPath, repoKey, tailLog, type Forge, type ForgeReview, type IssueInfo, type Outcome, type RepoRef } from './forge.ts'
+import { ISSUE_PAGES, issueText, projectPath, repoKey, tailLog, type Forge, type ForgeReview, type IssueInfo, type LabelCheck, type Outcome, type RepoRef } from './forge.ts'
 import {
   ciStateOf,
   OUR_MARKER,
@@ -265,22 +265,30 @@ export function normalizeMr(raw: unknown, repo: string, host: string, viewer: st
   }
 }
 
-/** GitLab's REST issue list: `iid` is the number people see, `description` its text. */
-export function parseIssues(stdout: string): IssueInfo[] {
+/** GitLab's Reporter role: the lowest that may add labels to issues. */
+const REPORTER = 20
+
+export const ISSUE_EDIT_QUERY = `query($path: ID!, $iid: String!) {
+  project(fullPath: $path) { issue(iid: $iid) { lastEditedAt } }
+}`
+
+/** One page of GitLab's REST issue list: `iid` is the number people see, `description` its text. */
+export function parseIssues(stdout: string): { issues: IssueInfo[]; rows: number } {
   let raw: unknown
   try {
     raw = JSON.parse(stdout)
   } catch {
     throw new GitLabError('glab api issues returned non-JSON output', false)
   }
+  const rows = Array.isArray(raw) ? raw.map(obj) : []
   const issues: IssueInfo[] = []
-  for (const item of Array.isArray(raw) ? raw.map(obj) : []) {
+  for (const item of rows) {
     const number = num(item.iid)
     const url = str(item.web_url)
     if (number === null || url === null) continue
-    issues.push({ number, title: str(item.title) ?? '', body: str(item.description) ?? '', url, author: str(obj(item.author).username) })
+    issues.push({ number, ...issueText(str(item.title) ?? '', str(item.description) ?? ''), url, author: str(obj(item.author).username), updatedAt: str(item.updated_at) ?? '' })
   }
-  return issues
+  return { issues, rows: rows.length }
 }
 
 export class GitLabError extends Error {
@@ -417,6 +425,17 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     return { list: { viewer, prs, rate, base, ...(truncated ? { truncated } : {}) }, rootRef }
   }
 
+  /** A REST read under the project; throws with GitLab's words when it fails. */
+  async function restGet(repo: RepoRef, what: string, path: string): Promise<string> {
+    const res = await glab(repo, [rest(projectPath(repo), path)])
+    if (res.code === 127) throw new GitLabError('glab is not installed, or not on the PATH Orca gives plugins', false)
+    if (res.code !== 0) {
+      const text = `${res.stderr}${res.stdout}`.trim()
+      throw new GitLabError(`glab api ${what}: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
+    }
+    return res.stdout
+  }
+
   async function act(repo: RepoRef, what: string, args: string[]): Promise<Outcome> {
     const res = await glab(repo, args, { timeoutMs: 120_000 })
     return res.code === 0 ? { ok: true } : { ok: false, error: `glab api ${what}: ${(res.stderr || res.stdout).trim().slice(0, 400)}` }
@@ -512,14 +531,42 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     publishReview: (repo, pr, _sha, review) =>
       act(repo, 'notes', ['-X', 'POST', rest(projectPath(repo), `merge_requests/${pr.number}/notes`), '-f', `body=${reviewNote(review)}`]),
     async labeledIssues(repo, label) {
-      const path = rest(projectPath(repo), `issues?state=opened&labels=${encodeURIComponent(label)}&order_by=created_at&sort=asc&per_page=50`)
-      const res = await glab(repo, [path])
-      if (res.code === 127) throw new GitLabError('glab is not installed, or not on the PATH Orca gives plugins', false)
+      const issues: IssueInfo[] = []
+      for (let page = 1; page <= ISSUE_PAGES; page++) {
+        const read = parseIssues(await restGet(repo, 'issues', `issues?state=opened&labels=${encodeURIComponent(label)}&order_by=created_at&sort=asc&per_page=100&page=${page}`))
+        issues.push(...read.issues)
+        if (read.rows < 100) return { issues, truncated: false }
+      }
+      return { issues, truncated: true }
+    },
+    // GitLab keeps label events with who made them; the member's access counts groups' too
+    // (members/all); lastEditedAt moves with an edit of the title or the description.
+    async labelCheck(repo, issue, label): Promise<LabelCheck> {
+      const events: Obj[] = []
+      for (let page = 1; page <= ISSUE_PAGES; page++) {
+        const raw = JSON.parse(await restGet(repo, 'label events', `issues/${issue.number}/resource_label_events?per_page=100&page=${page}`)) as unknown
+        const rows = Array.isArray(raw) ? raw.map(obj) : []
+        events.push(...rows)
+        if (rows.length < 100) break
+      }
+      const want = label.toLowerCase()
+      const added = events.filter((e) => e.action === 'add' && lower(obj(e.label).name) === want).at(-1)
+      const at = added ? str(added.created_at) : null
+      const user = obj(added?.user)
+      const by = str(user.username)
+      const id = num(user.id)
+      if (!added || !at || !by || id === null) return { ok: false, why: `Matriarch cannot tell who added ${label}` }
+      const { data } = await graphql(repo, ISSUE_EDIT_QUERY, { path: projectPath(repo), iid: String(issue.number) })
+      const edited = str(obj(obj(data.project).issue).lastEditedAt)
+      if (edited && Date.parse(edited) > Date.parse(at)) return { ok: false, why: `it was edited after ${by} added ${label}` }
+      const res = await glab(repo, [rest(projectPath(repo), `members/all/${id}`)])
       if (res.code !== 0) {
         const text = `${res.stderr}${res.stdout}`.trim()
-        throw new GitLabError(`glab api issues: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
+        if (/\b404\b|Not Found/i.test(text)) return { ok: false, why: `${label} was added by ${by}, who is not a member of the project` }
+        throw new GitLabError(`glab api members: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
       }
-      return parseIssues(res.stdout)
+      const level = num(obj(JSON.parse(res.stdout)).access_level)
+      return level !== null && level >= REPORTER ? { ok: true, by, at } : { ok: false, why: `${label} was added by ${by}, whose role in the project is below Reporter` }
     },
     commentIssue: (repo, number, body) => act(repo, 'issue notes', ['-X', 'POST', rest(projectPath(repo), `issues/${number}/notes`), '-f', `body=${body}`]),
     async failedLogs(repo, checks) {

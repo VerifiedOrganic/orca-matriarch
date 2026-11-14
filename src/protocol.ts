@@ -198,10 +198,14 @@ export interface IssuesView {
   label: string
   /** Handed to the supervisor. */
   taken: number[]
-  /** Not handed over yet. */
+  /** Not handed over yet, and not refused. */
   waiting: number[]
+  /** Not handed over until someone with access adds the label again, and why. */
+  refused?: { number: number; why: string }[]
   /** In dry run, what Matriarch would do with them. */
   next: string[]
+  /** More issues carry the label than Matriarch reads. */
+  truncated?: boolean
 }
 
 /** An agent the settings form offers for a role. */
