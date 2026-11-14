@@ -1,4 +1,5 @@
-// Minimal path globs for `merge.requireHuman`: `**` crosses folders, `*` and `?` stay in one.
+// Minimal path globs for `merge.requireHuman` and `review.light`: `**` crosses folders, `*` and
+// `?` stay in one.
 
 const cache = new Map<string, RegExp>()
 
@@ -34,4 +35,11 @@ export function matchingGlobs(globs: readonly string[], paths: readonly string[]
     const re = globToRegExp(g)
     return paths.some((p) => re.test(p))
   })
+}
+
+/** True when there are paths and each matches at least one of the globs. */
+export function everyPathMatches(globs: readonly string[], paths: readonly string[]): boolean {
+  if (globs.length === 0 || paths.length === 0) return false
+  const res = globs.map(globToRegExp)
+  return paths.every((p) => res.some((re) => re.test(p)))
 }

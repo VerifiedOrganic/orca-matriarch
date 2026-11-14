@@ -57,6 +57,17 @@ describe('config', () => {
     assert.deepEqual(r.config.reviewers.map((x) => x.readOnly), [undefined, false, undefined])
   })
 
+  test('review.light: docs and text by default; paths may be emptied, and a bad crew falls back', () => {
+    assert.deepEqual(validateConfig({}).config.review.light, { paths: ['**/*.md', '**/*.mdx', '**/*.txt', 'docs/**'], crew: 'one' })
+    const off = validateConfig({ review: { light: { paths: [], crew: 'none' } } })
+    assert.deepEqual(off.errors, [])
+    assert.deepEqual(off.config.review.light, { paths: [], crew: 'none' })
+    const bad = validateConfig({ review: { light: { crew: 'two', extra: 1 } } })
+    assert.equal(bad.config.review.light.crew, 'one')
+    assert.ok(bad.errors.some((e) => e.startsWith('review.light.crew')))
+    assert.ok(bad.warnings.some((w) => w.includes('review.light.extra')))
+  })
+
   test('effort needs a model, reviewers need unique names, JSON must parse', () => {
     const r = validateConfig({ supervisor: { agent: 'claude', effort: 'high' }, reviewers: [{ name: 'a', agent: 'claude' }, { name: 'a', agent: 'codex' }] })
     assert.ok(r.errors.some((e) => e.startsWith('supervisor.effort')))

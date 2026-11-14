@@ -295,7 +295,10 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
   // The rules.
   const review = group('review', 'Review', () => !d.review.enabled
     ? 'Off: PRs are not reviewed'
-    : [TRIGGER_SHORT[d.review.trigger], PASS_SHORT[d.review.pass], plural(d.review.maxRounds, 'round'), d.review.publish === 'github' ? 'posted on the PR' : null].filter(Boolean).join(' · '),
+    : [
+        TRIGGER_SHORT[d.review.trigger], PASS_SHORT[d.review.pass], plural(d.review.maxRounds, 'round'), d.review.publish === 'github' ? 'posted on the PR' : null,
+        d.review.light.paths.length ? (d.review.light.crew === 'none' ? 'light changes not reviewed' : 'light changes: one reviewer') : null
+      ].filter(Boolean).join(' · '),
     row('Review every PR', 'With the reviewers above.', toggle(d.review.enabled, (on) => (d.review.enabled = on))),
     dependent(
       choice('Start a review', null, d.review.trigger, [['ci-green', 'after CI passes'], ['pr-open', 'as soon as the PR opens']], (v) => (d.review.trigger = v)),
@@ -309,6 +312,9 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       choice('Later rounds', null, d.review.followUp, [['focused', 'check the fixes and what changed (cheaper)'], ['full', 'review the whole PR again']], (v) => (d.review.followUp = v)),
       row('Reviews at once', 'In this project; more wait their turn.', number(d.limits.maxConcurrentReviews, (n) => (d.limits.maxConcurrentReviews = n), 1, 20)),
       row("Skip the author's agent", 'Reviewers on the same agent that wrote the PR sit it out.', toggle(d.review.differentProviderThanAuthor, (on) => (d.review.differentProviderThanAuthor = on))),
+      row('Light changes', 'A PR that changes only files like these gets a lighter review. Leave it empty to review every PR in full.',
+        textInput(d.review.light.paths.join(', '), (v) => (d.review.light.paths = globList(v)), { placeholder: 'e.g. **/*.md, docs/**' }), { stack: true }),
+      choice('A light change gets', null, d.review.light.crew, [['one', 'one reviewer (the first that must approve)'], ['none', 'no AI review']], (v) => (d.review.light.crew = v)),
       choice('Where reviews go', null, d.review.publish, [['orca-only', 'stay in Orca'], ['github', 'also posted on the PR (a comment review on GitHub, a note on GitLab)']], (v) => (d.review.publish = v))))
 
   const fixes = group('fixes', 'Fixes and escalation', () => {

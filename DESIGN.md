@@ -65,7 +65,10 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
   ],
   "arbiter": null,
   "review": { "enabled": true, "trigger": "ci-green", "pass": "all-blocking-approve", "blockAt": "major",
-              "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github" }, // "github": on the PR, GitLab too
+              "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github", // "github": on the PR, GitLab too
+              "followUp": "focused", "fallback": null,
+              // A PR changing only these files gets "one" reviewer (the first must-approve one) or "none".
+              "light": { "paths": ["**/*.md", "**/*.mdx", "**/*.txt", "docs/**"], "crew": "one" } },
   "fix": { "ci": { "enabled": true, "maxRounds": 3 }, "comments": { "enabled": true, "maxRounds": 3 },
            "conflicts": { "enabled": true, "maxRounds": 2 } },
   "merge": { "mode": "manual", "method": "squash", "requireHuman": [], "updateBranch": "rebase",

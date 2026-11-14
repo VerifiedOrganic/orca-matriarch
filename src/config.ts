@@ -88,6 +88,11 @@ export interface MatriarchConfig {
     followUp: 'focused' | 'full'
     /** When a reviewer's account hits its usage limit, it is started again on this instead. */
     fallback: RoleSpec | null
+    /**
+     * A PR that changes only files matching `paths` (docs, text) gets a lighter review: `one`
+     * reviewer, or `none` at all. An empty list turns it off.
+     */
+    light: { paths: string[]; crew: 'one' | 'none' }
   }
   fix: { ci: FixPolicy; comments: FixPolicy; conflicts: FixPolicy }
   merge: {
@@ -133,7 +138,8 @@ export function defaultConfig(): MatriarchConfig {
       maxRounds: 3,
       publish: 'github',
       followUp: 'focused',
-      fallback: null
+      fallback: null,
+      light: { paths: ['**/*.md', '**/*.mdx', '**/*.txt', 'docs/**'], crew: 'one' }
     },
     fix: {
       ci: { enabled: true, maxRounds: 3 },
@@ -393,7 +399,15 @@ export function validateConfig(raw: unknown): ConfigResult {
     maxRounds: r.int(rv, 'maxRounds', d.review.maxRounds, 'review', 1, 10),
     publish: r.oneOf(rv, 'publish', ['github', 'orca-only'] as const, d.review.publish, 'review'),
     followUp: r.oneOf(rv, 'followUp', ['focused', 'full'] as const, d.review.followUp, 'review'),
-    fallback: rv?.fallback === undefined || rv?.fallback === null ? null : r.role(rv.fallback, 'review.fallback', null)
+    fallback: rv?.fallback === undefined || rv?.fallback === null ? null : r.role(rv.fallback, 'review.fallback', null),
+    light: (() => {
+      const o = rv ? r.section(rv, 'light', 'review') : undefined
+      if (o) r.unknownKeys(o, ['paths', 'crew'], 'review.light')
+      return {
+        paths: r.strings(o, 'paths', d.review.light.paths, 'review.light'),
+        crew: r.oneOf(o, 'crew', ['one', 'none'] as const, d.review.light.crew, 'review.light')
+      }
+    })()
   }
   if (review.enabled && reviewers.length === 0) r.warnings.push('review.enabled: no reviewers configured, so no AI review will run')
   if (review.fallback && !LOCKABLE_AGENTS.includes(review.fallback.agent)) {

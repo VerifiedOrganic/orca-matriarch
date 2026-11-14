@@ -115,6 +115,8 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - **Review rounds per PR** (default 3) caps the rounds before it asks someone instead;
 - later rounds check only what changed (**Later rounds: check the fixes**);
 - reviewers on the same agent as the PR's author are skipped (you can turn that off);
+- a PR that changes only docs and text files (**Light changes**: `**/*.md`, `**/*.mdx`,
+  `**/*.txt`, `docs/**` by default) gets one reviewer, or none if you choose;
 - **Reviews at once** (default 2) limits how many review crews run together.
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback

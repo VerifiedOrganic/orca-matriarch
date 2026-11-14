@@ -6,7 +6,7 @@
 import type { MatriarchConfig, ReviewerSpec } from './config.ts'
 import { forgeTerms } from './forge.ts'
 import { actionableThreads, type CheckInfo, type PrSnapshot, type ThreadInfo } from './github.ts'
-import { matchingGlobs } from './glob.ts'
+import { everyPathMatches, matchingGlobs } from './glob.ts'
 import { roundsUsed, type PrLedger } from './ledger.ts'
 
 export type Lane =
@@ -103,6 +103,16 @@ export function selectReviewers(config: MatriarchConfig, authorAgent: string | n
   }
   const dropped = all.length - others.length
   return { reviewers: others, note: dropped ? `skipped ${dropped} reviewer(s) on ${authorAgent}, the author's agent` : null }
+}
+
+/**
+ * Whether the PR is a light change (`review.light`): every changed file matches its paths, and the
+ * forge listed them all. Answers the globs that matched, to say why, or null.
+ */
+export function lightChange(config: MatriarchConfig, pr: PrSnapshot): string[] | null {
+  const { paths } = config.review.light
+  if (pr.filesTruncated || !everyPathMatches(paths, pr.files)) return null
+  return matchingGlobs(paths, pr.files)
 }
 
 /** Worker → supervisor → human. Each step happens once per problem key. */
@@ -308,17 +318,22 @@ export function plan(input: PlanInput): Plan {
   const review = reviewStep(input)
   if (review.plan) return review.plan
   const gate = mergeGate(input)
-  return review.pre.length > 0 ? { ...gate, actions: [...review.pre, ...gate.actions] } : gate
+  const withNote = review.note ? { ...gate, reason: `${gate.reason}; ${review.note}` } : gate
+  return review.pre.length > 0 ? { ...withNote, actions: [...review.pre, ...withNote.actions] } : withNote
 }
 
 /**
  * Step 5: the crew's part. A plan when the review decides the lane (start, running, failed,
- * changes requested); otherwise null and any actions to run before the merge gate.
+ * changes requested); otherwise null, any actions to run before the merge gate, and a note when
+ * the review was skipped as a light change.
  */
-function reviewStep(input: PlanInput): { plan: Plan | null; pre: Action[] } {
+function reviewStep(input: PlanInput): { plan: Plan | null; pre: Action[]; note?: string } {
   const { pr, owner, ledger, config } = input
   const sha = pr.headSha
   if (!config.review.enabled || config.reviewers.length === 0) return { plan: null, pre: [] }
+  // A light change (only docs, say) gets one reviewer, or none: then it passes the review as is.
+  const light = lightChange(config, pr)
+  if (light && config.review.light.crew === 'none') return { plan: null, pre: [], note: `AI review skipped: a light change (only ${light.join(', ')})` }
   const rec = ledger.reviews[sha]
   if (!rec) {
     const used = roundsUsed(ledger, 'reviews')
@@ -327,7 +342,10 @@ function reviewStep(input: PlanInput): { plan: Plan | null; pre: Action[] } {
       return { plan: { lane: e.toHuman ? 'needs-you' : 'fixing-review', reason: `${used}/${config.review.maxRounds} review rounds used`, actions: e.actions }, pre: [] }
     }
     if (!input.reviewSlotFree) return { plan: { lane: 'ai-review', reason: 'waiting for a free review slot', actions: [] }, pre: [] }
-    const { reviewers, note } = selectReviewers(config, owner?.agent ?? null)
+    const selected = selectReviewers(config, owner?.agent ?? null)
+    // One reviewer for a light change: the first that must approve, else the first.
+    const reviewers = light ? [selected.reviewers.find((r) => r.blocking) ?? selected.reviewers[0]] : selected.reviewers
+    const note = [selected.note, light ? `a light change (only ${light.join(', ')}): one reviewer` : null].filter(Boolean).join('; ')
     const names = reviewers.map((r) => r.name).join(', ')
     return {
       plan: {

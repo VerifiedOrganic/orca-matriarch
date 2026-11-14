@@ -298,3 +298,43 @@ describe('a repository with no CI', () => {
     assert.equal(gap.lane, 'awaiting-ci')
   })
 })
+
+describe('a light change', () => {
+  const docs = pr({ files: ['README.md', 'docs/guide.md'] })
+  const startOf = (p: ReturnType<typeof plan>) => p.actions.find((a) => a.kind === 'start-review')
+
+  test('gets one reviewer, the first that must approve', () => {
+    const c = config((x) => (x.reviewers = [
+      { name: 'style', agent: 'claude', blocking: false },
+      { name: 'correctness', agent: 'claude', blocking: true },
+      { name: 'security', agent: 'claude', blocking: true }
+    ]))
+    const p = plan(input({ pr: docs, config: c, owner: owner({ agent: 'codex' }) }))
+    const start = startOf(p)
+    assert.ok(start?.kind === 'start-review')
+    assert.deepEqual(start.reviewers.map((r) => r.name), ['correctness'])
+    assert.ok(p.reason.includes('a light change (only **/*.md, docs/**): one reviewer'), p.reason)
+  })
+
+  test('with crew "none" skips the AI review and says so at the merge gate', () => {
+    const c = config((x) => (x.review.light.crew = 'none'))
+    const p = plan(input({ pr: docs, config: c }))
+    assert.equal(p.lane, 'ready')
+    assert.ok(!startOf(p))
+    assert.equal(p.reason, 'ready to merge; AI review skipped: a light change (only **/*.md, docs/**)')
+  })
+
+  test('is not one when any file falls outside the paths, the list is truncated, or the paths are empty', () => {
+    const none = config((x) => (x.review.light.crew = 'none'))
+    const full = (p: ReturnType<typeof plan>) => (startOf(p) as Extract<Action, { kind: 'start-review' }> | undefined)?.reviewers.length
+    // An author on neither reviewer's agent, so the whole crew of two would run.
+    const author = owner({ agent: 'opencode' })
+    assert.equal(full(plan(input({ pr: pr({ files: ['README.md', 'src/a.ts'] }), config: none, owner: author }))), 2)
+    assert.equal(full(plan(input({ pr: pr({ files: ['README.md'], filesTruncated: true }), config: none, owner: author }))), 2)
+    assert.equal(full(plan(input({ pr: pr({ files: [] }), config: none, owner: author }))), 2)
+    const off = config((x) => {
+      x.review.light = { paths: [], crew: 'none' }
+    })
+    assert.equal(full(plan(input({ pr: docs, config: off, owner: author }))), 2)
+  })
+})
