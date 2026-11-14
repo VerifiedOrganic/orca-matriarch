@@ -18,6 +18,7 @@
 // starts it let through since. Reading the command it fails closed: any `orchestration` followed
 // by `worker-start` or `dispatch` (or by a word it cannot read), and any `agent launch`, counts
 // as a start, wherever it appears. A wrong guess costs only a refusal when a limit is reached.
+import { gb } from './values.ts'
 import type { MatriarchConfig } from './config.ts'
 import type { WorkerRow } from './orca-cli.ts'
 
@@ -87,7 +88,6 @@ export interface LimitState {
 }
 
 const GB = 1024 ** 3
-const gb = (bytes: number): string => `${(bytes / GB).toFixed(1)} GB`
 
 /** Orca's orchestration subcommands (1.4.257): a known one that is not a start is not counted. */
 const SUBCOMMANDS = new Set([
@@ -149,9 +149,6 @@ export function startsIn(command: string): { count: number; repeats: boolean } {
   const repeats = count > 0 && (ws.some((w) => REPEATS.has(w)) || /\b[\w-]+\s*\(\s*\)\s*\{/.test(command))
   return { count, repeats }
 }
-
-/** Kept for callers that only ask yes or no. */
-export const isWorkerStart = (command: string): boolean => startsIn(command).count > 0
 
 /**
  * Why these starts may not happen now, in words the supervisor can act on, or null when they may.
@@ -324,11 +321,13 @@ export function createLimitsGuard(options: { now?: () => number; save?: (snapsho
   const save = () => options.save?.({ states: Object.fromEntries(states), passed: Object.fromEntries(passed) })
   return {
     update(state) {
+      // Saved only when what the hook decides by changed: when the list was read moves every tick.
+      const before = JSON.stringify([{ ...states.get(state.repo), listedAt: 0 }, passed.get(state.repo) ?? []])
       states.set(state.repo, state)
       const kept = (passed.get(state.repo) ?? []).filter((at) => at >= state.listedAt - PASSED_GRACE_MS)
       if (kept.length) passed.set(state.repo, kept)
       else passed.delete(state.repo)
-      save()
+      if (JSON.stringify([{ ...state, listedAt: 0 }, passed.get(state.repo) ?? []]) !== before) save()
     },
     keep(repos) {
       let changed = false

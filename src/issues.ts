@@ -15,6 +15,7 @@
 // for the same event, whatever else failed. Adding the label again is a new go-ahead. A handoff
 // cut off before Matriarch knew it was sent is shown as unsure, never sent again by itself.
 // Storage failures never break the tick; at worst an issue waits.
+import { errorMessage, isObj } from './values.ts'
 import type { JsonValue } from 'orca/host'
 import type { MatriarchConfig } from './config.ts'
 import { forgeKind, forgeTerms, type ForgeReader, type IssueInfo, type LabelCheck, type Outcome, type RepoRef } from './forge.ts'
@@ -63,7 +64,6 @@ export interface IssuesRecord {
   left: Record<string, number>
 }
 
-const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 
 export function loadIssues(raw: unknown): IssuesRecord {
   const r = isObj(raw) ? (raw as Partial<IssuesRecord>) : {}
@@ -162,7 +162,6 @@ export interface IssuesResult {
   errors: string[]
 }
 
-const message = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
 /**
  * Reads the labeled issues when they are due, checks who labeled them, hands the ones that pass
@@ -173,7 +172,7 @@ export async function followIssues(input: IssuesInput): Promise<IssuesResult> {
     return await follow(input)
   } catch (error) {
     const label = input.config.issues.label
-    return { view: { label, taken: [], waiting: [], refused: [], unsure: [], next: [] }, attention: [], warnings: [`Issues labeled ${label}: ${message(error)}`], errors: [] }
+    return { view: { label, taken: [], waiting: [], refused: [], unsure: [], next: [] }, attention: [], warnings: [`Issues labeled ${label}: ${errorMessage(error)}`], errors: [] }
   }
 }
 
@@ -187,7 +186,7 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
     try {
       return { value: await store.get(k) }
     } catch (error) {
-      return { error: message(error) }
+      return { error: errorMessage(error) }
     }
   }
   const set = async (k: string, value: JsonValue): Promise<string | null> => {
@@ -195,7 +194,7 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
       await store.set(k, value)
       return null
     } catch (error) {
-      return message(error)
+      return errorMessage(error)
     }
   }
 
@@ -230,7 +229,7 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
         for (const n of Object.keys(rec.handed)) if (!open.has(Number(n)) && left[n] === undefined) left[n] = now
         rec = { ...rec, open: [...open], truncated: list.truncated, handed: keep(rec.handed), checks: keep(rec.checks), left }
       } catch (error) {
-        warnings.push(`Could not read the issues labeled ${label}: ${message(error)}`)
+        warnings.push(`Could not read the issues labeled ${label}: ${errorMessage(error)}`)
       }
     }
     // A failed read waits its turn too, rather than spend the forge's budget every tick.
@@ -246,7 +245,7 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
       check = await input.forge!.labelCheck!(input.ref, issue, label)
     } catch (error) {
       // Not kept: it is asked again on the next read.
-      warnings.push(`Could not check who labeled #${issue.number}: ${message(error)}`)
+      warnings.push(`Could not check who labeled #${issue.number}: ${errorMessage(error)}`)
       const { [issue.number]: _dropped, ...rest } = rec.checks
       rec = { ...rec, checks: rest }
       continue
@@ -285,7 +284,7 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
       try {
         await input.tellSupervisor!(repo, input.root, input.supervisor!, issueMessage(repo, input.ref, issue, label))
       } catch (error) {
-        errors.push(`Could not hand #${issue.number} to the supervisor: ${message(error)}`)
+        errors.push(`Could not hand #${issue.number} to the supervisor: ${errorMessage(error)}`)
         // Cleared, so it is tried again; if even that fails, it shows as unsure rather than go twice.
         await set(k, prior ? (prior as JsonValue) : null)
         break
@@ -294,12 +293,13 @@ async function follow(input: IssuesInput): Promise<IssuesResult> {
       rec = { ...rec, handed: { ...rec.handed, [issue.number]: { labelAt: check.labelAt, sure: true } } }
       await set(k, { at: now, labelAt: check.labelAt, state: 'sent' })
       if (config.issues.comment && input.commentIssue) {
-        const posted = await input.commentIssue(input.ref, issue.number, issueComment(issue)).catch((error: unknown) => ({ ok: false, error: message(error) }))
+        const posted = await input.commentIssue(input.ref, issue.number, issueComment(issue)).catch((error: unknown) => ({ ok: false, error: errorMessage(error) }))
         if (!posted.ok) warnings.push(`Handed #${issue.number} to the supervisor, but could not comment on it: ${posted.error ?? 'failed'}`)
       }
     }
   }
-  const saved = await set(key, rec as unknown as JsonValue)
+  // Written only when it changed: most ticks between reads change nothing.
+  const saved = JSON.stringify(rec) === JSON.stringify(loadIssues('value' in loaded ? loaded.value : null)) ? null : await set(key, rec as unknown as JsonValue)
   if (saved) warnings.push(`Could not save the issues labeled ${label} (${saved}); none is handed over twice.`)
   if (rec.truncated) warnings.push(`More open issues carry ${label} than Matriarch reads (${rec.open.length}, oldest first): close or unlabel some to reach the rest.`)
 

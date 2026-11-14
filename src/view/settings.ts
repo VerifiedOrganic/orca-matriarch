@@ -194,7 +194,7 @@ function reviewerItem(s: SettingsState, r: ReviewerSpec, index: number, act: Set
   )
 }
 
-/** Under the advisor's controls: read-only, or the opt-out for an agent Matriarch cannot lock down. */
+/** Under a reviewer's or the advisor's controls: read-only, or the opt-out for an agent Matriarch cannot lock down. */
 function readOnlyNote(s: SettingsState, role: AdvisorSpec, what: string): HTMLElement {
   return option(s, role.agent)?.lockable ?? false
     ? el('span', { class: 'item-note' }, '🔒 Starts read-only')

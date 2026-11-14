@@ -5,6 +5,7 @@
 // full detail of a PR only when its head, checks, base or update time changed (or it went stale).
 // It is one of Matriarch's two forges (forge.ts): it also merges, updates branches, posts reviews
 // and reads failed job logs, all with `gh`.
+import { obj, type Obj } from './values.ts'
 import type { Exec } from './exec.ts'
 import { ISSUE_PAGES, issueText, repoKey, tailLog, type Forge, type ForgeKind, type ForgeReader, type IssueInfo, type LabelCheck, type Outcome, type RepoRef } from './forge.ts'
 
@@ -136,8 +137,7 @@ export const DETAIL_QUERY = `query($owner: String!, $name: String!, $number: Int
   }
 }`
 
-type Obj = Record<string, unknown>
-const obj = (v: unknown): Obj => (typeof v === 'object' && v !== null ? (v as Obj) : {})
+/** A string field, kept even when empty (a forge's empty title or body is still one), or null. */
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null)
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const nodes = (conn: unknown): Obj[] => {
@@ -549,7 +549,9 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
       ]),
     retarget: (repo, pr, base) => run(['pr', 'edit', String(pr.number), '--repo', repoArg(repo), '--base', base]),
     // One job runs again alone. GitHub refuses a second job of a run while the first runs again,
-    // so several jobs of one workflow run go together: that run's failed jobs run again.
+    // so several jobs of one workflow run go together (`rerun-failed-jobs`): that re-runs every
+    // failed job of the run, a real failure among them too, which then fails again and goes to
+    // the worker as usual.
     rerun: (repo, checks) => {
       const job = checks[0]
       if (!job || job.jobId === null) return Promise.resolve({ ok: false, error: `${job?.name ?? 'the check'} is not a GitHub Actions job, so Matriarch cannot re-run it` })

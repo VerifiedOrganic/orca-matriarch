@@ -8,6 +8,7 @@
 // mergeability, approvals) is read again, in one more query, only when its head, update time or
 // pipeline status moved, or every few minutes (QUIET_REFRESH_MS) for what the list cannot show.
 // Merge requests are read into the same PrSnapshot as GitHub's PRs, so the planner reads both.
+import { obj, type Obj } from './values.ts'
 import type { Exec, ExecOptions, ExecResult } from './exec.ts'
 import { ISSUE_PAGES, issueText, projectPath, repoKey, tailLog, type Forge, type ForgeReview, type IssueInfo, type LabelCheck, type Outcome, type RepoRef, type FileMoves } from './forge.ts'
 import {
@@ -54,8 +55,7 @@ export const DETAIL_QUERY = `query($path: ID!, $iid: String!) {
   }
 }`
 
-type Obj = Record<string, unknown>
-const obj = (v: unknown): Obj => (typeof v === 'object' && v !== null ? (v as Obj) : {})
+/** A string field, kept even when empty (a forge's empty title or body is still one), or null. */
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null)
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 const nodes = (conn: unknown): Obj[] => {

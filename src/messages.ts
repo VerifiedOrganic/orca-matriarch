@@ -1,5 +1,6 @@
 // What Matriarch tells workers and the supervisor. One message per round, written as
 // instructions an agent can follow without asking. Commands come from the PR's forge.
+import { shortSha } from './values.ts'
 import { forgeTerms } from './forge.ts'
 import type { CheckInfo, PrSnapshot, ThreadInfo } from './github.ts'
 
@@ -8,7 +9,6 @@ export interface Message {
   body: string
 }
 
-const short = (sha: string): string => sha.slice(0, 7)
 const clip = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max)}\n…(truncated)` : text)
 
 function closing(round: number, max: number): string {
@@ -24,9 +24,9 @@ export function ciFailureMessage(pr: PrSnapshot, checks: readonly CheckInfo[], l
     return log ? `${head}\n  Last lines of its log:\n\`\`\`\n${clip(log, 4000)}\n\`\`\`` : head
   })
   return {
-    subject: `CI failed on #${pr.number} (${short(pr.headSha)}), round ${round}/${max}`,
+    subject: `CI failed on #${pr.number} (${shortSha(pr.headSha)}), round ${round}/${max}`,
     body: [
-      `CI failed on PR #${pr.number} "${pr.title}" at ${short(pr.headSha)} (branch ${pr.headRef}).`,
+      `CI failed on PR #${pr.number} "${pr.title}" at ${shortSha(pr.headSha)} (branch ${pr.headRef}).`,
       '',
       'Failing checks:',
       ...parts,
@@ -54,14 +54,19 @@ export function rebaseMessage(pr: PrSnapshot, round: number, max: number): Messa
  * A PR stacked on another that merged: its branch still has that PR's commits under its own, and
  * after a squash or rebase merge they look new to the base. Only this branch's own commits go on.
  */
+/** What the owner of a stacked PR runs once its parent merged: its own commits onto the new base. */
+export function restackCommand(base: string, parentSha: string): string {
+  return `git fetch origin && git rebase --onto origin/${base} ${parentSha} && git push --force-with-lease`
+}
+
 export function restackMessage(pr: PrSnapshot, parent: number, parentSha: string, base: string): Message {
   return {
     subject: `#${parent} merged: rebase #${pr.number} onto ${base}`,
     body: [
       `PR #${pr.number} "${pr.title}" (branch ${pr.headRef}) was stacked on #${parent}, which merged into ${base}. The PR now merges into ${base}, but the branch still carries the commits of #${parent}.`,
       '',
-      `Rebase only this branch's own commits onto ${base}, leaving out those of #${parent} (its last commit was ${short(parentSha)}):`,
-      `  git fetch origin && git rebase --onto origin/${base} ${parentSha} && git push --force-with-lease`,
+      `Rebase only this branch's own commits onto ${base}, leaving out those of #${parent} (its last commit was ${shortSha(parentSha)}):`,
+      `  ${restackCommand(base, parentSha)}`,
       'Resolve any conflict keeping the intent of this branch, and run the checks before you push. Do not open a new PR.'
     ].join('\n')
   }
@@ -112,7 +117,7 @@ export function commentsMessage(pr: PrSnapshot, threads: readonly ThreadInfo[], 
 export function draftMessage(pr: PrSnapshot, reason: string): Message {
   return {
     subject: `${pr.repo} #${pr.number} is still a draft`,
-    body: [`PR #${pr.number} "${pr.title}" (branch ${pr.headRef}, ${short(pr.headSha)}): ${reason}`, pr.url].join('\n')
+    body: [`PR #${pr.number} "${pr.title}" (branch ${pr.headRef}, ${shortSha(pr.headSha)}): ${reason}`, pr.url].join('\n')
   }
 }
 
@@ -120,7 +125,7 @@ export function escalationMessage(pr: PrSnapshot, reason: string): Message {
   return {
     subject: `Matriarch needs a decision on ${pr.repo} #${pr.number}`,
     body: [
-      `PR #${pr.number} "${pr.title}" (branch ${pr.headRef}, ${short(pr.headSha)}) is stuck: ${reason}.`,
+      `PR #${pr.number} "${pr.title}" (branch ${pr.headRef}, ${shortSha(pr.headSha)}) is stuck: ${reason}.`,
       pr.url,
       '',
       'Decide the next step: send the worker new instructions, start a fixer on a stronger tier, resolve it yourself in a fresh worktree, split the PR, or close it.',

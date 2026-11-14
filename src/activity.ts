@@ -1,10 +1,10 @@
 // The activity log's lines: what Matriarch did on a track, said the way a person would say it.
 // Only actions it carried out (or tried and failed) are logged, never what dry run would do.
+import { shortSha } from './values.ts'
 import { forgeTerms, type ForgeKind, type Outcome } from './forge.ts'
 import type { Action } from './plan.ts'
 import type { LogEntry, Mark } from './protocol.ts'
 
-const short = (sha: string): string => sha.slice(0, 7)
 const plural = (n: number, word: string): string => `${n} ${word}${n === 1 ? '' : 's'}`
 const WHO = { worker: 'the worker', supervisor: 'the supervisor', you: 'you' } as const
 
@@ -26,7 +26,7 @@ function done(action: Action, who: string, forge: ForgeKind): string {
     case 'publish-review':
       return forge === 'gitlab' ? 'Posted the AI review on the merge request as a note' : 'Posted the AI review on the PR as a comment review'
     case 'merge':
-      return `Asked ${forgeTerms(forge).name} to merge ${short(action.sha)} (${action.method})`
+      return `Asked ${forgeTerms(forge).name} to merge ${shortSha(action.sha)} (${action.method})`
     case 'escalate':
       if (action.to === 'human') return `Told you: ${action.reason}`
       return action.key.startsWith('draft:') ? `Asked ${who} whether the draft is ready: ${action.reason}` : `Escalated to ${who}: ${action.reason}`
@@ -38,9 +38,6 @@ function done(action: Action, who: string, forge: ForgeKind): string {
       return `Asked ${who} to rebase off #${action.parent}'s commits onto ${action.base}, now that #${action.parent} merged`
     case 'rerun-check':
       return `Re-ran ${action.checks.map((c) => c.name).join(', ')} once: ${action.why}`
-    default:
-      // A kind this log has no words for yet still shows up, by its name.
-      return (action as { kind: string }).kind
   }
 }
 

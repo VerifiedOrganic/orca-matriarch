@@ -9,6 +9,7 @@
 // ask, that it was turned off) goes whatever autopilot says, as the person's own Settings change
 // does. Only a supervisor Matriarch can recognise as the sender is told about it or answered.
 // Everything lives in plugin storage, so a restart picks a question up where it was.
+import { clip, obj, str, type Obj } from './values.ts'
 import type { JsonValue } from 'orca/host'
 import { advisorUsable, type AdvisorSpec, type MatriarchConfig } from './config.ts'
 import {
@@ -39,10 +40,6 @@ const stateKey = (repo: string): string => `advice:${repo}`
 /** Projects with a question being answered, so the read-only guard comes back after a restart. */
 const ACTIVE = 'advice:active'
 
-type Obj = Record<string, unknown>
-const obj = (v: unknown): Obj => (typeof v === 'object' && v !== null ? (v as Obj) : {})
-const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null)
-const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
 
 /** One message in Matriarch's mailbox. */
 export interface MailItem {

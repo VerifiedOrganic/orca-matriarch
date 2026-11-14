@@ -744,8 +744,9 @@ disk, a supervisor over its limits, labeled issues waiting for a supervisor, a h
 not have arrived) is marked `alert`, and the tick tells the person of it once while it stands,
 in Orca and by webhook (`attention:alerted` records each, and an item may alert again only after
 it was gone for 15 minutes, so one failed read does not ring twice). The engine's alerts go only
-while it acts (autopilot on); in dry run only a reviewer stuck on a prompt in a review the person
-started is sent, as Orca notifies them of it.
+while it acts (autopilot on); a reviewer or the advisor stuck on a prompt is sent whenever it
+happens (a review the person started by hand, an advisor still at work after autopilot went off),
+as Orca notifies them of it.
 The settings are per machine: the URL in Orca's secrets, the rest in plugin storage, none of it in
 a project's config.
 

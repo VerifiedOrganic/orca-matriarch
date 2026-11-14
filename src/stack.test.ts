@@ -8,9 +8,9 @@ import { createExecutor, type Executor } from './executor.ts'
 import { createGitHub, normalizePr, type GitHub, type PrSnapshot } from './github.ts'
 import { createGitLab, normalizeMr } from './gitlab.ts'
 import { emptyLedger, ledgerKey, loadLedger, record, recordRefusedRetarget, type PrLedger, type StackParent } from './ledger.ts'
-import { restackMessage } from './messages.ts'
+import { restackCommand, restackMessage } from './messages.ts'
 import { createOrcaCli } from './orca-cli.ts'
-import { plan, RESTACK_STALL_MS, RETARGET_TRIES, restackCommand, retargetBackoff, type Action } from './plan.ts'
+import { plan, RESTACK_STALL_MS, RETARGET_TRIES, retargetBackoff, type Action } from './plan.ts'
 import { config, input, owner, pr, SHA } from './testing/fixtures.ts'
 import { detailData, fakeGlab, HOST, KEY, REPO } from './testing/gitlab.ts'
 
@@ -346,11 +346,15 @@ describe('an engine tick over stacked PRs', () => {
     const login = pr({ number: 12, headRef: 'feature/login', baseRef: 'feature/auth' })
     const prs = [auth, login]
     const h = harness(prs)
-    await tick(h.deps, { autopilot: false })
+    const first = await tick(h.deps, { autopilot: false })
+    // Stacked first, so the second tick is what un-stacks it.
+    assert.equal(ledgerOf(h, 12).stack?.number, 11)
+    assert.equal(first.tracks.find((t) => t.pr?.number === 12)?.pr?.stackedOn, 11)
     prs[1] = { ...login, baseRef: 'main', updatedAt: '2026-11-10T11:00:00Z' }
     h.advance(60_000)
-    await tick(h.deps, { autopilot: false })
+    const moved = await tick(h.deps, { autopilot: false })
     assert.equal(ledgerOf(h, 12).stack, undefined)
+    assert.equal(moved.tracks.find((t) => t.pr?.number === 12)?.pr?.stackedOn, undefined)
   })
 
   test('with a cut-short PR list, a PR into a branch with a worktree here waits rather than merging blind', async () => {

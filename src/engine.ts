@@ -2,6 +2,7 @@
 // each one's forge (GitHub or GitLab), plan each one, act when autopilot is on, record history,
 // and answer the board. Every dependency is injected, so a tick runs in tests without Orca, git,
 // GitHub or GitLab.
+import { gb, shortSha } from './values.ts'
 import type { JsonValue } from 'orca/host'
 import { logEntry, markEntry } from './activity.ts'
 import type { Advisor } from './advisor.ts'
@@ -99,7 +100,7 @@ export interface EngineDeps {
   onLimits?: (state: LimitState) => void
   /** The opted-in projects a tick saw, once it could read Orca's workspaces (not called otherwise). */
   onProjects?: (repos: string[]) => void
-  /** Sends the supervisor's Run a message from Matriarch's mailbox (a labeled issue). */
+  /** Sends the supervisor's Run a message from Matriarch's mailbox: a labeled issue, workers stopped over a limit. */
   tellSupervisor?: (repo: string, root: string, to: string, message: { subject: string; body: string }) => Promise<void>
   /** Stops a worker that started over a limit (`orchestration worker-stop`); its worktree is kept. */
   stopWorker?: (dispatchId: string) => Promise<Outcome>
@@ -111,7 +112,6 @@ export interface EngineDeps {
   notifyPerson?: (alert: Alert) => Promise<void>
 }
 
-const gb = (bytes: number): string => `${(bytes / 1024 ** 3).toFixed(1)} GB`
 
 interface PendingCleanup {
   path: string
@@ -174,7 +174,6 @@ const LANE_ORDER: Lane[] = [
   'closed'
 ]
 
-const short = (sha: string): string => sha.slice(0, 7)
 
 /**
  * Why Matriarch does not act for a project this tick, in words for the board, or null when it
@@ -192,6 +191,9 @@ export function notActing(autopilot: boolean, deps: Pick<EngineDeps, 'executor'>
 function readerFor(deps: EngineDeps, ref: RepoRef): ForgeReader | null {
   return forgeKind(ref) === 'gitlab' ? (deps.gitlab ?? null) : deps.github
 }
+
+/** An agent is busy in a workspace: working, or waiting on input or a prompt. Its worktree is not removed then. */
+const agentBusy = (act: ActivityInfo | null): boolean => act !== null && ['working', 'waiting', 'blocked'].includes(act.activity)
 
 /** A prompt in an agent's tab counts as needing you only once nobody answered it this long. */
 export const PROMPT_GRACE_MS = 3 * 60_000
@@ -217,7 +219,7 @@ export function describe(action: Action, forge: ForgeKind = 'github'): string {
     case 'publish-review':
       return forge === 'gitlab' ? 'post the AI review on the merge request as a note' : 'post the AI review to GitHub as a comment review'
     case 'merge':
-      return `merge ${short(action.sha)} (${action.method})`
+      return `merge ${shortSha(action.sha)} (${action.method})`
     case 'escalate':
       return `escalate to ${action.to === 'human' ? 'you' : 'the supervisor'}: ${action.reason}`
     case 'notify':
@@ -248,7 +250,7 @@ function markFor(action: Action, at: number, forge: ForgeKind = 'github'): Mark 
     case 'publish-review':
       return { at, kind: 'notify', label: `AI review posted to ${forgeTerms(forge).name}` }
     case 'merge':
-      return { at, kind: 'merge', label: `merge requested at ${short(action.sha)}` }
+      return { at, kind: 'merge', label: `merge requested at ${shortSha(action.sha)}` }
     case 'escalate':
       return { at, kind: action.to === 'human' ? 'escalate-human' : 'escalate-supervisor', label: action.reason }
     case 'notify':
@@ -376,8 +378,8 @@ async function followStack(
   if (final.state !== 'MERGED') return next
   // A merge commit or a fast-forward keeps the commits this PR was built on: then it only needs
   // to catch up with the base, not to be rebased off them. Asked once, as the merge is first seen.
-  const kept2 = reader?.isAncestor ? await reader.isAncestor(repo.ref, st.forkSha ?? st.headSha, next.baseRef).catch(() => null) : null
-  return { ...next, headAtMerge: snap.headSha, ...(kept2 === true ? { forkInBase: true } : {}) }
+  const forkInBase = reader?.isAncestor ? await reader.isAncestor(repo.ref, st.forkSha ?? st.headSha, next.baseRef).catch(() => null) : null
+  return { ...next, headAtMerge: snap.headSha, ...(forkInBase === true ? { forkInBase: true } : {}) }
 }
 
 /** Where a PR's failed-job log tails are kept, read when its failures were judged (one commit's). */
@@ -737,7 +739,13 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         if (starts && today > 0) starts = { ...starts, count: Math.max(0, starts.count - today) }
       }
     } else if (toStop.length > 0) {
-      view.warnings.push(...toStop.map((o) => `Dry run: with autopilot on, Matriarch would stop worker dispatch:${o.dispatchId}: ${o.reason}`))
+      view.warnings.push(
+        ...toStop.map((o) =>
+          acting
+            ? `Worker dispatch:${o.dispatchId} started over a limit, and Matriarch cannot stop workers here: ${o.reason}`
+            : `Dry run: with autopilot on, Matriarch would stop worker dispatch:${o.dispatchId}: ${o.reason}`
+        )
+      )
     }
     // A stopped worker's worktree is kept for its task, as the supervisor was told, until a newer
     // worker runs there, the worktree is gone, or a week passed.
@@ -775,7 +783,9 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         repo: repoKey,
         alert: true,
         message: acting
-          ? `${repoKey}: ${overNow}. Matriarch stops a worker that starts over a limit, but these were running before it looked or before the limit was lowered: ask the supervisor to let some finish, or raise the limit in Settings.`
+          ? unstopped.length > 0
+            ? `${repoKey}: ${overNow}. Matriarch could not stop ${unstopped.length === 1 ? 'the worker that started' : `the ${unstopped.length} workers that started`} over it (the board says why), and tries again for a few minutes: stop ${unstopped.length === 1 ? 'it' : 'them'} yourself if that fails.`
+            : `${repoKey}: ${overNow}. Matriarch stops a worker that starts over a limit, but these were running before it looked or before the limit was lowered: ask the supervisor to let some finish, or raise the limit in Settings.`
           : `${repoKey}: ${overNow}. In dry run Matriarch only tells you; with autopilot on it stops a worker that starts over a limit. Ask the supervisor to let some finish, or raise the limit in Settings.`,
         terminal: view.supervisor.terminal ?? undefined
       })
@@ -1023,7 +1033,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         if (!ws || ws.path === info.root || now - c.at > CLEANUP_GIVE_UP_MS) continue
         const owner = byWorktree.get(ws)
         const act = deps.activity(ws.id, ws.path)
-        if ((owner && owner.live !== false) || (act && ['working', 'waiting', 'blocked'].includes(act.activity))) {
+        if ((owner && owner.live !== false) || agentBusy(act)) {
           still.push({ ...c, kept: 'an agent is still running there' })
           continue
         }
@@ -1059,7 +1069,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         const row = byWorktree.get(ws)
         if (!row?.runId || `run:${row.runId}` !== supervisor || row.live !== false) continue
         const act = deps.activity(ws.id, ws.path)
-        if (act && ['working', 'waiting', 'blocked'].includes(act.activity)) continue
+        if (agentBusy(act)) continue
         const since = seen[ws.path] ?? now
         if (now - since < FINISHED_GRACE_MS) {
           still[ws.path] = since
@@ -1232,7 +1242,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       let history = loadHistory(await deps.store.get(historyKey(trackKey)))
       if (history.lastSha !== snap.headSha) {
         if (history.lastSha) {
-          const push: Mark = { at: now, kind: 'push', label: `pushed ${short(snap.headSha)}` }
+          const push: Mark = { at: now, kind: 'push', label: `pushed ${shortSha(snap.headSha)}` }
           history = addLog(addMark(history, push), markEntry(push))
         }
         history = { ...history, lastSha: snap.headSha }

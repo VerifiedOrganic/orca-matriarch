@@ -43,7 +43,7 @@ export interface Mark {
  */
 export interface LogEntry {
   at: number
-  /** The action's kind (send-ci-failure, merge, ...), or `lane`, `push`, `review-done`, `cleanup`. */
+  /** The action's kind (send-ci-failure, merge, ...), or `lane`, `push`, `review-done`, `cleanup`, `stop-worker`. */
   kind: string
   /** What happened, as a sentence. */
   text: string

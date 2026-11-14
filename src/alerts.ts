@@ -2,7 +2,10 @@
 // ntfy, or any URL that takes JSON), for when you are away from the desk. Off until you set a URL.
 // "Needs you" and "ready to merge" go in addition to Orca's notification, never instead. "Merged"
 // goes to the webhook only: Orca shows no notification for a merge. Like everything Matriarch
-// sends, the engine's alerts go only while it acts (autopilot on).
+// sends, the engine's alerts go only while it acts (autopilot on). A reviewer or the advisor stuck
+// on a prompt is told whenever it happens, as Orca's own notification of it is: a review the
+// person started by hand runs in dry run, and an advisor at work keeps working when autopilot is
+// turned off mid-question.
 //
 // The URL is a secret: anyone who has a Slack or Discord webhook URL can post to that channel. It
 // lives in Orca's encrypted secrets (the OS key store), never in plugin storage or a project's
@@ -12,6 +15,7 @@
 // that is down costs one failed post per alert, and the last failure shows in the alert settings.
 // A burst (autopilot turned on with many PRs ready) is queued: four posts at a time, twenty more
 // waiting, and anything past that folded into one "and N more" post.
+import { clip } from './values.ts'
 import type { JsonValue } from 'orca/host'
 
 export type AlertFormat = 'slack' | 'discord' | 'ntfy' | 'json'
@@ -66,7 +70,6 @@ const MAX_TEXT = 1500
 
 export const DEFAULT_ALERTS: AlertSettings = { format: 'auto', events: { 'needs-you': true, ready: true, merged: false } }
 
-export const FORMAT_LABEL: Record<AlertFormat, string> = { slack: 'Slack', discord: 'Discord', ntfy: 'ntfy', json: 'JSON' }
 
 /** The format a webhook URL takes, from its host; anything unknown gets plain JSON. */
 export function detectFormat(url: string): AlertFormat {
@@ -104,7 +107,8 @@ export function hostOf(url: string): string {
   }
 }
 
-const clip = (s: string, n = MAX_TEXT): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
+/** Alert text cut to what a webhook takes. */
+const cut = (s: string, n = MAX_TEXT): string => clip(s, n)
 /** Slack's mrkdwn: only these three are special. */
 const slackEscape = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 /** A header value as ntfy reads one: printable ASCII as is, anything else (a line break too) RFC 2047-encoded. */
@@ -115,8 +119,8 @@ const linkText = (a: Alert): string => (a.number !== undefined ? `Open #${a.numb
 
 /** The request for one alert in one format. */
 export function payload(format: AlertFormat, a: Alert): { headers: Record<string, string>; body: string } {
-  const title = clip(a.title, 200)
-  const body = clip(a.body)
+  const title = cut(a.title, 200)
+  const body = cut(a.body)
   switch (format) {
     case 'slack':
       return {
@@ -127,7 +131,7 @@ export function payload(format: AlertFormat, a: Alert): { headers: Record<string
       // No mentions: a PR title that says @everyone must not ping the channel.
       return {
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ content: clip([`**${title}**`, body, a.url ?? ''].filter(Boolean).join('\n'), 2000), allowed_mentions: { parse: [] } })
+        body: JSON.stringify({ content: cut([`**${title}**`, body, a.url ?? ''].filter(Boolean).join('\n'), 2000), allowed_mentions: { parse: [] } })
       }
     case 'ntfy':
       return {

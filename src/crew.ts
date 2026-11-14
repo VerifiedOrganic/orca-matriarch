@@ -2,6 +2,7 @@
 // starts there on its own agent, model and effort, and writes a JSON verdict. When all of them
 // settle, the crew's outcome is stored and the worktree is removed. Runs live in plugin
 // storage, so a worker restart picks them up where they were.
+import { obj, str, type Obj } from './values.ts'
 import type { JsonValue } from 'orca/host'
 import { modelFlags, type MatriarchConfig, type ReviewerSpec, type RoleSpec, type Severity } from './config.ts'
 import type { Exec } from './exec.ts'
@@ -168,9 +169,6 @@ const ACTIVE = 'crew:active'
 /** Failed rounds whose worktree is kept a while, for late verdicts and to inspect. */
 const KEPT = 'crew:kept'
 
-type Obj = Record<string, unknown>
-const obj = (v: unknown): Obj => (typeof v === 'object' && v !== null ? (v as Obj) : {})
-const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null)
 
 /** The worktree path in an `orca worktree create` receipt. */
 export function createdPath(result: unknown): string | null {

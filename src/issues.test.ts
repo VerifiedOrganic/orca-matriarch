@@ -284,6 +284,17 @@ describe('handing labeled issues to the supervisor', () => {
     assert.deepEqual(res.attention, [])
   })
 
+  test('a tick between reads that changes nothing writes nothing', async () => {
+    const s = setup()
+    await followIssues(s.input(T0))
+    let writes = 0
+    const input = s.input(T0 + 60_000)
+    const set = input.store.set
+    input.store.set = async (k, v) => (k === 'issues:acme/app' && writes++, set(k, v))
+    await followIssues(input)
+    assert.equal(writes, 0)
+  })
+
   test('changing the label reads the new one at once', async () => {
     const s = setup()
     await followIssues(s.input(T0))

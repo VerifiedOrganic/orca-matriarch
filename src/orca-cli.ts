@@ -1,6 +1,7 @@
 // The one place that speaks the `orca` CLI. Every call adds --json and reads Orca's envelope:
 // `{"ok":true,"result":…}` or `{"ok":false,"error":{"code":…}}`. A runtime that cannot be reached
 // is OrcaUnavailable (wait and retry); anything Orca refused is OrcaRefusal with its code.
+import { obj, str, type Obj } from './values.ts'
 import type { Exec } from './exec.ts'
 
 export class OrcaUnavailable extends Error {
@@ -26,9 +27,6 @@ export interface OrcaCli {
   run(args: readonly string[], options?: { input?: string; timeoutMs?: number }): Promise<unknown>
 }
 
-type Obj = Record<string, unknown>
-const obj = (v: unknown): Obj => (typeof v === 'object' && v !== null ? (v as Obj) : {})
-const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null)
 
 export function createOrcaCli(exec: Exec, bin = 'orca'): OrcaCli {
   return {

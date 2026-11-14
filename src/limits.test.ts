@@ -159,6 +159,17 @@ describe('the hook', () => {
     restarted.keep(new Set())
     assert.equal(restarted.decide(bash(start)), null, 'a project a good tick did not see is forgotten')
   })
+
+  test('saves only when what it decides by changed, not on every tick', () => {
+    const saved: LimitsSnapshot[] = []
+    const guard = createLimitsGuard({ now: () => T0, save: (s) => saved.push(structuredClone(s)) })
+    guard.update(state({ live: 2, listedAt: T0 }))
+    guard.update(state({ live: 2, listedAt: T0 + 45_000 }))
+    guard.update(state({ live: 2, listedAt: T0 + 90_000 }))
+    assert.equal(saved.length, 1, 'the same counts, a later list')
+    guard.update(state({ live: 3, listedAt: T0 + 135_000 }))
+    assert.equal(saved.length, 2)
+  })
 })
 
 describe('a worker Orca cannot vouch for', () => {

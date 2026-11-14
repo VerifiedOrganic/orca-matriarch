@@ -23,7 +23,8 @@ anything that lets it do more than that, for example:
 Not vulnerabilities in Matriarch:
 
 - what a labeled issue asks the pod to do, when the label rule held: that is up to the people you
-  let label issues;
+  let label issues, and to any automation that labels issues with one of their tokens, which
+  counts as them;
 - a supervisor going over its worker limits: they keep cost and disk in hand and are not a
   security boundary (the refusal before a start works only for Claude Code in a terminal);
 - what the advisor advises: it only reads, and the supervisor weighs its answer;

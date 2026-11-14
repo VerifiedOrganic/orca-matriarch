@@ -20,9 +20,10 @@ export interface ToolEvent {
 const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
 const VERDICT_DIR = '.matriarch/review/'
-const DENY_WRITE = 'Matriarch reviewers are read-only: write only your verdict file, .matriarch/review/<sha>/<your name>.json.'
-const DENY_SHELL = 'Matriarch reviewers are read-only: only read-only commands (git diff/log/show, grep, cat, ls, gh pr view/diff, glab mr view/diff) are allowed here.'
-const DENY_OUTSIDE = 'Matriarch reviewers read only this worktree: use paths relative to it (no absolute paths, ~, $HOME or .. out of it).'
+// Read by a reviewer or the advisor, whichever runs in the worktree: each was told its own file.
+const DENY_WRITE = 'This worktree is read-only (a Matriarch reviewer or advisor): write only the JSON file your brief names, under .matriarch/review/.'
+const DENY_SHELL = 'This worktree is read-only (a Matriarch reviewer or advisor): only read-only commands (git diff/log/show, grep, cat, ls, gh pr view/diff, glab mr view/diff) are allowed here.'
+const DENY_OUTSIDE = 'This worktree is read-only (a Matriarch reviewer or advisor), and only it may be read: use paths relative to it (no absolute paths, ~, $HOME or .. out of it).'
 
 /** Is `file` (absolute or relative to `root`) a verdict file inside the review worktree `root`? */
 export function isVerdictFile(root: string, file: string): boolean {

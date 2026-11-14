@@ -3,11 +3,13 @@
 // Every tick re-plans from current facts, so a message held back while a worker was busy goes
 // out once it is free, and nothing is sent twice for the same commit. It reads GitHub and GitLab
 // alike; only the words and commands in its reasons come from the PR's forge.
+import { shortSha } from './values.ts'
 import { ALWAYS_FULL_REVIEW, type MatriarchConfig, type ReviewerSpec } from './config.ts'
 import { forgeTerms } from './forge.ts'
 import { actionableThreads, type CheckInfo, type PrSnapshot, type ThreadInfo } from './github.ts'
 import { everyPathMatches, matchingGlobs } from './glob.ts'
 import { checkKey, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
+import { restackCommand } from './messages.ts'
 
 export type Lane =
   | 'building' // a worktree whose agent is working, no PR yet
@@ -94,7 +96,6 @@ export interface Plan {
   actions: Action[]
 }
 
-const short = (sha: string): string => sha.slice(0, 7)
 
 /** A new commit's checks take a moment to register; until then "no checks" is not "green". */
 export const CI_GRACE_MS = 3 * 60_000
@@ -187,7 +188,7 @@ function fixStep(
   const policy = config.fix[kind]
   const lane = FIX_LANE[kind]
   const used = roundsUsed(ledger, kind)
-  const pr7 = `#${pr.number} (${short(pr.headSha)})`
+  const pr7 = `#${pr.number} (${shortSha(pr.headSha)})`
   if (!policy.enabled) {
     return {
       lane: 'needs-you',
@@ -339,7 +340,7 @@ export function plan(input: PlanInput): Plan {
     // A check re-run a moment ago still shows the attempt that failed: it is starting again.
     const failing = pr.checks.filter((c) => c.state === 'failure' && !restarting(input, c))
     const names = failing.map((c) => c.name).join(', ')
-    if (failing.length === 0) return { lane: 'awaiting-ci', reason: rerunning ?? `${pending} check(s) running on ${short(sha)}`, actions: [] }
+    if (failing.length === 0) return { lane: 'awaiting-ci', reason: rerunning ?? `${pending} check(s) running on ${shortSha(sha)}`, actions: [] }
     if (pending > 0 || rerunning) return { lane: 'awaiting-ci', reason: `failing: ${names}; ${rerunning ?? `${pending} check(s) still running`}`, actions: [] }
     // A check that failed on the infrastructure (a lost runner, a registry out of reach) runs once
     // more before a worker spends a round on it; whatever still fails then goes to the worker.
@@ -367,7 +368,7 @@ export function plan(input: PlanInput): Plan {
     return fixStep(
       input,
       'ci',
-      `CI failing on ${short(sha)}: ${names}`,
+      `CI failing on ${shortSha(sha)}: ${names}`,
       { sentOnThisCommit: sent?.signature === signature, newRound: !sent },
       (to, round) => ({ kind: 'send-ci-failure', to, sha, round, checks: failing, signature })
     )
@@ -402,14 +403,14 @@ export function plan(input: PlanInput): Plan {
   const fresh = input.now - (ledger.heads[sha] ?? input.now) < CI_GRACE_MS
   // A repository with no CI (no checks on its base, none ever on this PR) has nothing to wait for.
   const noCi = input.baseHasChecks === false && !ledger.ciSeen
-  if (pr.ci === 'none' && fresh && !noCi) return { lane: 'awaiting-ci', reason: `waiting for checks to start on ${short(sha)}`, actions: [] }
+  if (pr.ci === 'none' && fresh && !noCi) return { lane: 'awaiting-ci', reason: `waiting for checks to start on ${shortSha(sha)}`, actions: [] }
   if (pr.ci === 'pending' || pr.ci === 'cancelled') {
     if (config.review.trigger === 'pr-open') {
       const early = reviewStep(input)
       if (early.plan) return early.plan
     }
     return pr.ci === 'pending'
-      ? { lane: 'awaiting-ci', reason: rerunning ?? `${pending} check(s) running on ${short(sha)}`, actions: [] }
+      ? { lane: 'awaiting-ci', reason: rerunning ?? `${pending} check(s) running on ${shortSha(sha)}`, actions: [] }
       : { lane: 'awaiting-ci', reason: 'a check was cancelled; re-run it', actions: [] }
   }
 
@@ -435,11 +436,6 @@ function rerunNote(input: PlanInput): string | null {
   const { pr, ledger } = input
   const again = pr.checks.filter((c) => (c.state === 'pending' && ledger.reruns?.[checkKey(pr.headSha, c.name)] && !ledger.reruns[checkKey(pr.headSha, c.name)].error) || (c.state === 'failure' && restarting(input, c)))
   return again.length ? `re-running ${again.map((c) => `${c.name} (${ledger.reruns![checkKey(pr.headSha, c.name)].why})`).join(', ')} once` : null
-}
-
-/** What the owner of a stacked PR runs once its parent merged: its own commits onto the new base. */
-export function restackCommand(base: string, parentSha: string): string {
-  return `git fetch origin && git rebase --onto origin/${base} ${parentSha} && git push --force-with-lease`
 }
 
 /**
@@ -512,7 +508,7 @@ function reviewStep(input: PlanInput): { plan: Plan | null; pre: Action[]; note?
   }
   if (rec.status === 'running') return { plan: { lane: 'ai-review', reason: `review round ${rec.round} running`, actions: [] }, pre: [] }
   if (rec.status === 'failed') {
-    const e = escalate(input, `review-failed:${sha}`, `the review crew failed on ${short(sha)}`)
+    const e = escalate(input, `review-failed:${sha}`, `the review crew failed on ${shortSha(sha)}`)
     return { plan: { lane: e.toHuman ? 'needs-you' : 'ai-review', reason: 'the review crew failed', actions: e.actions }, pre: [] }
   }
   const publish: Action[] = config.review.publish === 'github' && !rec.published ? [{ kind: 'publish-review', sha, round: rec.round }] : []

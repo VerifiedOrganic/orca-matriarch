@@ -68,9 +68,26 @@ describe('log lines', () => {
     assert.equal(e.text, 'Asked the worker to merge its base in (GitLab cannot)')
   })
 
-  test('an action it has no words for shows up by its kind', () => {
-    const unknown = { kind: 'teleport', base: 'main' } as unknown as Action
-    assert.equal(logEntry(unknown, { ok: true }, 5, 'github', 'teleport').text, 'teleport')
+  test('every kind of action has its own words (the switch is exhaustive, so a new kind cannot be left out)', () => {
+    const samples: Action[] = [
+      { kind: 'send-ci-failure', to: 'dispatch:d1', sha: SHA, round: 1, checks: [check('test', 'failure')], signature: 'test' },
+      { kind: 'send-rebase', to: 'dispatch:d1', sha: SHA, round: 1, base: 'main' },
+      { kind: 'send-comments', to: 'dispatch:d1', sha: SHA, round: 1, threads: [] },
+      { kind: 'update-branch', sha: SHA, method: 'rebase' },
+      { kind: 'start-review', sha: SHA, round: 1, reviewers: [] },
+      { kind: 'send-findings', to: 'dispatch:d1', sha: SHA, round: 1 },
+      { kind: 'publish-review', sha: SHA, round: 1 },
+      { kind: 'merge', sha: SHA, method: 'squash' },
+      { kind: 'escalate', to: 'human', key: 'k', reason: 'r', address: null },
+      { kind: 'notify', key: 'k', title: 't', body: 'b' },
+      { kind: 'retarget', sha: SHA, parent: 11, from: 'feat/a', base: 'main' },
+      { kind: 'send-restack', to: 'dispatch:d1', sha: SHA, parent: 11, parentSha: SHA, base: 'main' },
+      { kind: 'rerun-check', sha: SHA, checks: [check('test', 'failure')], why: 'w' }
+    ]
+    for (const a of samples) {
+      const text = logEntry(a, { ok: true }, 5, 'github', plannedAs(a)).text
+      assert.ok(text.length > 0 && text !== a.kind, a.kind)
+    }
   })
 
   test('a stacked PR moved and rebased, and a flaky check run again, say what happened and why', () => {

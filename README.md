@@ -171,7 +171,10 @@ running supervisor as a new objective, and the PR that does it says `Closes #<n>
   that access, and an issue its author edits after you labeled it waits; an edit after the
   handoff changes nothing. An issue that fails this stays on the board with the reason until
   someone with access adds the label again. The issue's title and text go to the supervisor as
-  written, fenced and marked as the issue's, not yours.
+  written, fenced and marked as the issue's, not yours. A label a GitHub workflow or script adds
+  with a person's own token (a personal access token, not the workflow's `GITHUB_TOKEN`) counts
+  as that person's: an automation that labels issues on someone's token hands them over as if
+  that person had.
 - **Timing:** the labeled issues are read every 5 minutes, so a newly labeled issue goes over
   within about that; at most 5 are handed over per poll, and Matriarch reads up to 500, oldest
   first (the board says when there are more). With no supervisor running, **Needs you** says the
@@ -256,8 +259,10 @@ and **Send a test**. It applies to every project, on this machine; **Remove** tu
   Orca's own notification. A board item goes once while it stands, and again only after it was
   gone for 15 minutes. **Merged** (a PR Matriarch follows merged, by it or by anyone) is off by
   default and goes to the webhook only: Orca has no notification for it.
-- **When:** while autopilot is on, like everything else Matriarch sends. In dry run only a
-  reviewer stuck on a prompt (in a review you started) is sent, as Orca notifies you of it too.
+- **When:** while autopilot is on, like everything else Matriarch sends. A reviewer or the
+  advisor stuck on a prompt is sent whenever it happens, as Orca notifies you of it too: a review
+  you started by hand runs in dry run, and an advisor at work goes on if you turn autopilot off
+  mid-question.
 - **How:** each alert is posted once, with a 10-second limit, and never retried or redirected.
   Four go at a time and twenty more wait their turn; past that, the rest go as one "and N more"
   post. A post that fails shows on the Alerts page, without blocking anything else.
@@ -321,7 +326,8 @@ a poll.
   merge request's file moves, and the labeled issues with who labeled them;
 - shows on each card what it would do next;
 - runs an AI review when you click **Run AI review now**, and notifies you (in Orca and by
-  webhook) of a reviewer stuck on a prompt in it;
+  webhook) of a reviewer stuck on a prompt in it, or of the advisor stuck on one when it was
+  still at work as autopilot went off;
 - refuses a worker start over a limit, from a supervisor or worker that is Claude Code in a
   terminal;
 - tells a running supervisor what you changed in Settings: the worker settings, the limits, the
