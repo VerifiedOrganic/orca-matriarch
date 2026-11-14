@@ -305,7 +305,9 @@ export function createWorker(options: WorkerOptions = {}) {
         workspaceIdFor,
         mailbox: (repo, root) => mailboxFor(repo, root),
         alert: async (repo, message) => {
-          await orca.host.call('notifications.show', { title: `Matriarch: ${repo} needs you`, body: message }).catch(() => {})
+          const title = `Matriarch: ${repo} needs you`
+          await orca.host.call('notifications.show', { title, body: message }).catch(() => {})
+          alerter.send({ kind: 'needs-you', title, body: message, repo })
           void runTick()
         }
       })

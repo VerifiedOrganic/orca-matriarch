@@ -32,6 +32,12 @@ function done(action: Action, who: string, forge: ForgeKind): string {
       return action.key.startsWith('draft:') ? `Asked ${who} whether the draft is ready: ${action.reason}` : `Escalated to ${who}: ${action.reason}`
     case 'notify':
       return `Told you: ${action.title}`
+    case 'retarget':
+      return `Moved the ${forge === 'gitlab' ? 'merge request' : 'PR'} from ${action.from} onto ${action.base}: #${action.parent}, which it was stacked on, merged`
+    case 'send-restack':
+      return `Asked ${who} to rebase off #${action.parent}'s commits onto ${action.base}, now that #${action.parent} merged`
+    case 'rerun-check':
+      return `Re-ran ${action.check.name} once: ${action.why}`
     default:
       // A kind this log has no words for yet still shows up, by its name.
       return (action as { kind: string }).kind
