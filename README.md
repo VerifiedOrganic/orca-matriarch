@@ -86,14 +86,25 @@ is not signed in to yet, pick it under **Forge** in Settings.
 Turn on **Hand labeled issues to the supervisor** under **Settings → Issues**. Then label an open
 issue `matriarch` (or the label you pick there). With autopilot on, Matriarch hands it to the
 running supervisor once, as a new objective: the label is the go-ahead, and the PR that does it
-says `Closes #<n>`. Matriarch reads the labeled issues every 5 minutes. With no supervisor
-running, **Needs you** says the issue waits for one; in dry run the board says it would hand it
-over. **Comment on the issue** posts one short comment when the supervisor takes it up.
+says `Closes #<n>`. Matriarch reads the labeled issues every 5 minutes (500 at most, oldest
+first; the board says when there are more). With no supervisor running, **Needs you** says the
+issue waits for one; in dry run the board says it would hand it over. **Comment on the issue**
+posts one short comment when the supervisor takes it up.
 
-Only people who can label issues can hand work over this way: on GitHub, people with triage
-access or more; on GitLab, project members from Reporter up. The issue's text goes to the
-supervisor as written, marked as the issue's and not yours, so label only issues you would give
-an agent to do.
+An issue goes over only when both hold:
+
+- **the label was last added by someone allowed to triage issues**: on GitHub, a collaborator
+  whose role is triage, write, maintain or admin (a bot or app never counts); on GitLab, a project
+  member from Reporter up, counting group membership;
+- **neither its title nor its text changed after that**: on GitHub, no title change and no body
+  edit after the label was added; on GitLab, no edit of the title or description after it.
+
+So a label an issue template adds counts only if the issue's author has that access, and an
+issue its author edits after you labeled it waits. Such an issue stays on the board with the
+reason, until someone with access adds the label again (remove it, then add it). The issue's
+title and text go to the supervisor as written, inside a fence and marked as the issue's, not
+yours, so label only issues you would give an agent to do. Labels named `any` or `none` are
+refused: GitLab reads them as filters.
 
 Settings are saved in the project's `.orca/matriarch.json`, so you can commit them to share with
 your team. Nobody has to edit that file: every setting Matriarch uses is in **Settings**, and
@@ -205,7 +216,8 @@ Supervisor and worker launches are not changed.
 | `orca terminal close` | a reviewer that started without its lockdown is stopped |
 | `gh api repos/<repo>/pulls/<n>/reviews` | autopilot, when **Where reviews go** includes the PR: one comment review per round |
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
-| `gh api repos/<repo>/issues?state=open&labels=<label>` | with **Issues** on, every 5 minutes: the open issues with the label |
+| `gh api repos/<repo>/issues?state=open&labels=<label>&page=<n>` | with **Issues** on, every 5 minutes: the open issues with the label |
+| `gh api graphql` (an issue's label and title events and last edit), `gh api repos/<repo>/collaborators/<login>/permission` | with **Issues** on, once per new or changed labeled issue: who added the label, and whether it changed since |
 | `gh api -X POST repos/<repo>/issues/<n>/comments` | autopilot, with **Comment on the issue**: one comment when the supervisor takes an issue up |
 | `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `glab api --hostname <host> graphql` | GitLab: each check, the open merge requests with their pipeline status and the default branch's; a merge request's jobs, threads, files and approvals when it changed |
@@ -213,7 +225,8 @@ Supervisor and worker launches are not changed.
 | `glab api --hostname <host> projects/<project>/jobs/<id>/trace` | GitLab, autopilot: the tail of a failed job's log, for the worker |
 | `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
-| `glab api --hostname <host> projects/<project>/issues?state=opened&labels=<label>` | GitLab, with **Issues** on, every 5 minutes: the open issues with the label |
+| `glab api --hostname <host> projects/<project>/issues?state=opened&labels=<label>&page=<n>` | GitLab, with **Issues** on, every 5 minutes: the open issues with the label |
+| `glab api --hostname <host> …/issues/<n>/resource_label_events`, `…/members/all/<id>`, `graphql` (its last edit) | GitLab, with **Issues** on, once per new or changed labeled issue: who added the label, and whether it changed since |
 | `glab api --hostname <host> -X POST …/issues/<n>/notes` | GitLab, autopilot, with **Comment on the issue**: one note when the supervisor takes an issue up |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | GitLab, autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `git -C <worktree> status --porcelain`, `orca worktree rm --delete-branch` | autopilot: remove a merged PR's worktree when nothing runs there and nothing is uncommitted |

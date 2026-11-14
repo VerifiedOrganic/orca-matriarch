@@ -531,13 +531,15 @@ export function workerCount(s: RepoView['supervisor']): string {
 /** Its labeled issues in one line: taken, waiting, and in dry run what would happen. */
 export function issuesLine(r: RepoView): string | null {
   const i = r.issues
-  if (!i || (i.taken.length === 0 && i.waiting.length === 0)) return null
+  const refused = i?.refused ?? []
+  if (!i || (i.taken.length === 0 && i.waiting.length === 0 && refused.length === 0)) return null
   const list = (ns: number[]) => ns.map((n) => `#${n}`).join(', ')
   return [
     `Issues labeled ${i.label}:`,
     i.taken.length ? `${i.taken.length} taken (${list(i.taken)})` : null,
     i.waiting.length ? `${i.waiting.length} waiting (${list(i.waiting)})` : null,
-    i.next.length ? `would ${i.next.length === 1 ? i.next[0] : `hand ${list(i.waiting)} to the supervisor`}` : null
+    i.next.length ? `would ${i.next.length === 1 ? i.next[0] : `hand ${i.next.map((n) => n.replace(/^hand | to the supervisor$/g, '')).join(', ')} to the supervisor`}` : null,
+    refused.length ? `${refused.length} need the label added again by someone with access (${refused.map((x) => `#${x.number}: ${x.why}`).join('; ')})` : null
   ].filter(Boolean).join(' · ')
 }
 

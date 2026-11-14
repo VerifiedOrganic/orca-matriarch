@@ -366,7 +366,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
 
   const issues = group('issues', 'Issues', () =>
     d.issues.enabled ? `Labeled ${d.issues.label || '…'} goes to the supervisor${d.issues.comment ? ' · comments on it' : ''}` : 'Off: you give the supervisor its objectives',
-    intro("Label an open issue and, with autopilot on, Matriarch hands it to the running supervisor as a new objective, once. The label is the go-ahead, and the issue's text goes to the supervisor as written: only people who can label issues (triage access on GitHub, Reporter and up on GitLab) can hand work over."),
+    intro("Label an open issue and, with autopilot on, Matriarch hands it to the running supervisor as a new objective, once. The label is the go-ahead, so it counts only when someone allowed to triage issues (triage access or more on GitHub, Reporter and up on GitLab) added it last, and the issue was not edited after. The issue's text goes to the supervisor as written."),
     row('Hand labeled issues to the supervisor', null, toggle(d.issues.enabled, (on) => (d.issues.enabled = on))),
     dependent(
       row('Label', 'The label that hands an issue over.', textInput(d.issues.label, (v) => (d.issues.label = v.trim()), { placeholder: 'matriarch' })),

@@ -6,7 +6,7 @@
 // It is one of Matriarch's two forges (forge.ts): it also merges, updates branches, posts reviews
 // and reads failed job logs, all with `gh`.
 import type { Exec } from './exec.ts'
-import { repoKey, tailLog, type Forge, type ForgeKind, type ForgeReader, type IssueInfo, type Outcome, type RepoRef } from './forge.ts'
+import { ISSUE_PAGES, issueText, repoKey, tailLog, type Forge, type ForgeKind, type ForgeReader, type IssueInfo, type LabelCheck, type Outcome, type RepoRef } from './forge.ts'
 
 export { repoKey, type RepoRef }
 
@@ -519,15 +519,56 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
       }
       return logs
     },
-    // Over REST, which has its own budget: GraphQL's is the one the PR reads spend.
+    // Over REST, which has its own budget: GraphQL's is the one the PR reads spend. GitHub lists
+    // PRs among issues; they take a place on the page and are dropped after.
     async labeledIssues(repo, label) {
-      const path = `repos/${repoArg(repo)}/issues?state=open&labels=${encodeURIComponent(label)}&sort=created&direction=asc&per_page=50`
-      const res = await exec(bin, ['api', path], { timeoutMs: 30_000 })
+      const issues: IssueInfo[] = []
+      for (let page = 1; page <= ISSUE_PAGES; page++) {
+        const path = `repos/${repoArg(repo)}/issues?state=open&labels=${encodeURIComponent(label)}&sort=created&direction=asc&per_page=100&page=${page}`
+        const res = await exec(bin, ['api', path], { timeoutMs: 30_000 })
+        if (res.code !== 0) {
+          const text = `${res.stderr}${res.stdout}`.trim()
+          throw new GitHubError(`gh api issues: ${text.slice(0, 300)}`, /rate limit|secondary rate|abuse/i.test(text))
+        }
+        const read = parseIssues(res.stdout)
+        issues.push(...read.issues)
+        if (read.rows < 100) return { issues, truncated: false }
+      }
+      return { issues, truncated: true }
+    },
+    // The newest label and title events and the body's last edit in one GraphQL read, then the
+    // permission of whoever added the label (role_name: triage and up, or write and up).
+    async labelCheck(repo, issue, label): Promise<LabelCheck> {
+      const data = await graphql(LABEL_QUERY, { owner: repo.owner, name: repo.name, number: issue.number })
+      const node = obj(data.repository).issue
+      if (!node) return { ok: false, why: 'GitHub does not find it' }
+      const items = nodes(obj(node).timelineItems)
+      const want = label.toLowerCase()
+      const added = items.filter((n) => n.__typename === 'LabeledEvent' && (str(obj(n.label).name) ?? '').toLowerCase() === want).at(-1)
+      const at = added ? str(added.createdAt) : null
+      if (!added || !at) return { ok: false, why: `Matriarch cannot tell who added ${label}` }
+      const actor = obj(added.actor)
+      const by = str(actor.login)
+      if (!by) return { ok: false, why: `${label} was added by an account GitHub no longer names` }
+      if (actor.__typename !== 'User') return { ok: false, why: `${label} was added by ${by}, an app or bot, not a person with triage access` }
+      const later = (t: string | null) => t !== null && Date.parse(t) > Date.parse(at)
+      if (items.some((n) => n.__typename === 'RenamedTitleEvent' && later(str(n.createdAt)))) return { ok: false, why: `its title changed after ${by} added ${label}` }
+      if (later(str(obj(node).lastEditedAt))) return { ok: false, why: `it was edited after ${by} added ${label}` }
+      const res = await exec(bin, ['api', `repos/${repoArg(repo)}/collaborators/${encodeURIComponent(by)}/permission`], { timeoutMs: 30_000 })
       if (res.code !== 0) {
         const text = `${res.stderr}${res.stdout}`.trim()
-        throw new GitHubError(`gh api issues: ${text.slice(0, 300)}`, /rate limit|secondary rate|abuse/i.test(text))
+        if (/\b404\b|Not Found/i.test(text)) return { ok: false, why: `${label} was added by ${by}, who is not a collaborator here` }
+        throw new GitHubError(`gh api permission: ${text.slice(0, 300)}`, /rate limit|secondary rate|abuse/i.test(text))
       }
-      return parseIssues(res.stdout)
+      let p: Obj = {}
+      try {
+        p = obj(JSON.parse(res.stdout))
+      } catch {
+        throw new GitHubError('gh api permission returned non-JSON output', false)
+      }
+      const role = str(p.role_name)
+      if ((role && TRIAGE_ROLES.has(role)) || ['admin', 'write'].includes(str(p.permission) ?? '')) return { ok: true, by, at }
+      return { ok: false, why: `${label} was added by ${by}, who has ${role ?? str(p.permission) ?? 'no'} access, not triage` }
     },
     commentIssue: (repo, number, body) => run(['api', '-X', 'POST', `repos/${repoArg(repo)}/issues/${number}/comments`, '-f', `body=${body}`]),
     async publishReview(repo, pr, sha, review) {
@@ -544,22 +585,39 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
   }
 }
 
-/** GitHub's REST issue list, without the pull requests it also lists. */
-export function parseIssues(stdout: string): IssueInfo[] {
+/** Repository roles that may add labels to issues. */
+const TRIAGE_ROLES = new Set(['admin', 'maintain', 'write', 'triage'])
+
+export const LABEL_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      lastEditedAt
+      timelineItems(last: 100, itemTypes: [LABELED_EVENT, RENAMED_TITLE_EVENT]) {
+        nodes { __typename
+          ... on LabeledEvent { createdAt actor { __typename login } label { name } }
+          ... on RenamedTitleEvent { createdAt } }
+      }
+    }
+  }
+}`
+
+/** One page of GitHub's REST issue list, without the pull requests it also lists; `rows` counts both. */
+export function parseIssues(stdout: string): { issues: IssueInfo[]; rows: number } {
   let raw: unknown
   try {
     raw = JSON.parse(stdout)
   } catch {
     throw new GitHubError('gh api issues returned non-JSON output', false)
   }
+  const rows = Array.isArray(raw) ? raw.map(obj) : []
   const issues: IssueInfo[] = []
-  for (const item of Array.isArray(raw) ? raw.map(obj) : []) {
+  for (const item of rows) {
     const number = num(item.number)
     const url = str(item.html_url)
     if (number === null || url === null || item.pull_request !== undefined) continue
-    issues.push({ number, title: str(item.title) ?? '', body: str(item.body) ?? '', url, author: str(obj(item.user).login) })
+    issues.push({ number, ...issueText(str(item.title) ?? '', str(item.body) ?? ''), url, author: str(obj(item.user).login), updatedAt: str(item.updated_at) ?? '' })
   }
-  return issues
+  return { issues, rows: rows.length }
 }
 
 /** `https://github.com/acme/app.git`, `git@github.com:acme/app.git` and `ssh://...` forms. */

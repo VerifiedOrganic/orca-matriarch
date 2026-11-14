@@ -252,14 +252,26 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   agent, workspace, a pre-allocated terminal handle and the command, with `env: {}` and no
   dispatch or task id, so a worker's launch looks like any other.
 - **Issues as objectives** (`src/issues.ts`). With `issues.enabled`, Matriarch reads the open
-  issues carrying `issues.label` every 5 minutes, over REST (GitHub's REST budget is separate from
-  the GraphQL one the PR reads spend; GitLab's `projects/:id/issues`). Under autopilot each new one
-  goes to the running supervisor once, as plain mail titled "New objective:", with the link, the
-  title, and the body in a fence and marked as the issue's text; the brief says the label is the
-  user's go-ahead and asks for `Closes #<n>` in the PR. Handed issues are kept in plugin storage,
-  saved before the optional comment, so a failed comment never hands one over twice. With no
-  supervisor running, Needs you says they wait; in dry run the board says it would hand them over.
-  The trust boundary is the label: triage access on GitHub, Reporter and up on GitLab.
+  issues carrying `issues.label` every 5 minutes, over REST, in pages of 100 up to 500, oldest
+  first (GitHub's PRs take places on its pages and are dropped after; the board says when more
+  carry the label). A new label reads at once. Each new or changed issue not handed yet is
+  checked: on GitHub, one GraphQL read of its newest `LabeledEvent`s and `RenamedTitleEvent`s
+  and its `lastEditedAt`, then `collaborators/<actor>/permission` (role triage, write, maintain
+  or admin, or permission write or admin; a Bot actor never passes); on GitLab,
+  `resource_label_events` (the newest `add`), the member's `members/all/<id>` access level (20,
+  Reporter, and up) and GraphQL `lastEditedAt` (title and description edits). It passes only
+  when the latest label was added by such a person and nothing was edited after it; otherwise it
+  waits on the board with the reason until the label is added again. Checks are kept by the
+  issue's `updated_at`; one that could not be made is asked again next read. Under autopilot each
+  passing issue goes to the running supervisor once, as plain mail titled "New objective:
+  <repo>#<n>" and a cleaned, short title; the title and body go in a fence, marked as the issue's
+  text, and the brief says the label is the user's go-ahead and asks for `Closes #<n>`. Only
+  numbers and short reasons are stored, never an issue's text (bodies are cut to 6000 characters
+  as they are read). Each handoff is recorded in its own key (`issue:<repo>#<n>`) before the
+  message is sent, and an issue with that record is never sent again, so a failed save cannot
+  hand one over twice; a storage failure only leaves an issue waiting, and never stops the tick.
+  With no supervisor running, Needs you says they wait; in dry run the board says it would hand
+  them over. Labels named `any` or `none` are refused: GitLab reads them as filters.
 - **Not yet run live.** Its workers push branches and open PRs, so the first run should be on a
   task you choose.
 

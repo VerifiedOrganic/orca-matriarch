@@ -474,6 +474,8 @@ export function validateConfig(raw: unknown): ConfigResult {
     // Both forges take a comma-separated list of labels, so a comma would split this one.
     const v = typeof is.label === 'string' ? is.label.trim() : ''
     if (!v || v.length > 100 || v.includes(',')) r.errors.push('issues.label: expected a label name without commas, up to 100 characters')
+    // GitLab reads these names as filters (any label, no label), not as a label.
+    else if (/^(any|none|no[ +]label)$/i.test(v)) r.errors.push(`issues.label: "${v}" is a filter on GitLab, not a label; pick another name`)
     else label = v
   }
   const issues: MatriarchConfig['issues'] = {

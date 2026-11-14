@@ -47,19 +47,47 @@ export interface Outcome {
 /** An open issue, as handed to the supervisor. */
 export interface IssueInfo {
   number: number
+  /** Cut to ISSUE_TITLE_MAX. */
   title: string
-  /** As written on the forge: the issue's text, not the user's instructions. */
+  /** As written on the forge, cut to ISSUE_BODY_MAX: the issue's text, not the user's instructions. */
   body: string
   url: string
   author: string | null
+  /** When the forge last saw any change to it, to know when a check is out of date. */
+  updatedAt: string
 }
+
+export const ISSUE_TITLE_MAX = 300
+export const ISSUE_BODY_MAX = 6000
+/** Pages of 100 read at most: past this many open labeled issues, the board says it read only some. */
+export const ISSUE_PAGES = 5
+
+/** The open issues with a label, oldest first; `truncated` when there were more than ISSUE_PAGES. */
+export interface IssueList {
+  issues: IssueInfo[]
+  truncated: boolean
+}
+
+/**
+ * Whether an issue may be handed over: the label was last added by someone allowed to triage
+ * issues, and neither its title nor its body changed after that.
+ */
+export type LabelCheck = { ok: true; by: string; at: string } | { ok: false; why: string }
+
+/** A title and body as the forge gave them, cut to size before anything keeps them. */
+export const issueText = (title: string, body: string): { title: string; body: string } => ({
+  title: title.slice(0, ISSUE_TITLE_MAX),
+  body: body.length > ISSUE_BODY_MAX ? `${body.slice(0, ISSUE_BODY_MAX)}\n…(truncated; read the rest on the issue)` : body
+})
 
 /** Reads a forge's open PRs cheaply, and one PR in full. */
 export interface ForgeReader {
   listOpen(repo: RepoRef, options?: ListOptions): Promise<OpenList>
   detail(repo: RepoRef, number: number): Promise<{ pr: PrSnapshot | null; rate: RateInfo | null }>
-  /** Open issues with this label, oldest first (up to 50); absent where a forge cannot say. */
-  labeledIssues?(repo: RepoRef, label: string): Promise<IssueInfo[]>
+  /** Open issues with this label, oldest first, up to ISSUE_PAGES pages; absent where a forge cannot say. */
+  labeledIssues?(repo: RepoRef, label: string): Promise<IssueList>
+  /** Who last added the label, whether they may triage issues, and whether it was edited since. Throws when it cannot tell. */
+  labelCheck?(repo: RepoRef, issue: IssueInfo, label: string): Promise<LabelCheck>
 }
 
 /** One AI review as it goes on the PR: a summary, and the findings anchored to lines. */
