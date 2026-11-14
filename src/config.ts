@@ -26,6 +26,17 @@ export function modelFlags(role: RoleSpec): string[] {
   return ['--model', model, ...(effort ? ['--effort', effort] : [])]
 }
 
+/**
+ * Files that always get the full review crew, even when they match `review.light.paths`: agents'
+ * instructions and settings, which steer the supervisor and the workers once merged, and anything
+ * under a tool's config folder (.github holds CI and Copilot's instructions).
+ */
+export const ALWAYS_FULL_REVIEW: readonly string[] = [
+  '**/AGENTS.md', '**/CLAUDE.md', '**/GEMINI.md', '**/SKILL.md', '**/*.prompt.md', '**/copilot-instructions.md',
+  '**/.cursorrules', '**/.windsurfrules',
+  '**/.claude/**', '**/.cursor/**', '**/.github/**', '**/.agents/**', '**/.codex/**', '**/.omp/**', '**/.opencode/**'
+]
+
 export type Severity = 'blocker' | 'major' | 'minor' | 'nit'
 export const SEVERITIES: readonly Severity[] = ['blocker', 'major', 'minor', 'nit']
 
@@ -113,8 +124,9 @@ export interface MatriarchConfig {
     /** When a reviewer's account hits its usage limit, it is started again on this instead. */
     fallback: RoleSpec | null
     /**
-     * A PR that changes only files matching `paths` (docs, text) gets a lighter review: `one`
-     * reviewer, or `none` at all. An empty list turns it off.
+     * A PR that changes only files matching `paths` (docs) gets a lighter review: `one` reviewer,
+     * or `none` at all. Files in ALWAYS_FULL_REVIEW, and renamed or copied files, always get the
+     * full crew. An empty list turns it off.
      */
     light: { paths: string[]; crew: 'one' | 'none' }
   }
@@ -185,7 +197,7 @@ export function defaultConfig(): MatriarchConfig {
       publish: 'github',
       followUp: 'focused',
       fallback: null,
-      light: { paths: ['**/*.md', '**/*.mdx', '**/*.txt', 'docs/**'], crew: 'one' }
+      light: { paths: ['**/*.md', '**/*.rst', '**/*.adoc'], crew: 'one' }
     },
     fix: {
       ci: { enabled: true, maxRounds: 3, rerunFlaky: true },

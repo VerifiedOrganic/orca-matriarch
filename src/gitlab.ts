@@ -259,7 +259,10 @@ export function normalizeMr(raw: unknown, repo: string, host: string, viewer: st
     threads,
     threadsTruncated: hasNext(mr.discussions),
     files,
-    filesTruncated: fileCount !== null && fileCount > files.length,
+    // No count means no way to tell the list is whole: it is taken as cut short.
+    filesTruncated: fileCount === null || fileCount > files.length,
+    // GitLab's diff stats name each file's path, not whether it was renamed: unknown.
+    renamed: null,
     updatedAt: str(mr.updatedAt) ?? '',
     fetchedAt
   }

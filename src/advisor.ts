@@ -9,7 +9,7 @@
 import type { JsonValue } from 'orca/host'
 import { advisorUsable, type AdvisorSpec, type MatriarchConfig } from './config.ts'
 import {
-  AGENT_QUIT, BLOCKED_MAX_MS, blockingReason, createdId, createdPath, hashText, launchLocked,
+  AGENT_QUIT, blockingReason, createdId, createdPath, hashText, launchLocked,
   REVIEW_BRANCH_PREFIX, REVIEWER_TIMEOUT_MS, unlockedResume, type CrewDeps
 } from './crew.ts'
 import { forgeTerms, type ForgeKind } from './forge.ts'
@@ -19,7 +19,7 @@ import { OrcaRefusal, sendMessage } from './orca-cli.ts'
 import type { AdvisorView } from './protocol.ts'
 import { advisorMessage, advisorName } from './supervisor.ts'
 
-/** The longest one question may take while the advisor is not waiting on a person. */
+/** The longest one question may take, waiting on a person or not: then its slot is freed. */
 export const ADVICE_MAX_MS = 2 * 3600_000
 /** Questions that may wait behind the one being answered; more are turned away. */
 export const MAX_QUEUED = 10
@@ -36,6 +36,9 @@ const stateKey = (repo: string): string => `advice:${repo}`
 /** Projects with a question being answered, so the read-only guard comes back after a restart. */
 const ACTIVE = 'advice:active'
 
+/** Orca's answer for a terminal that is gone: a mailbox like that is made again. */
+export const GONE_TERMINAL = new Set(['terminal_handle_stale', 'terminal_not_found'])
+
 type Obj = Record<string, unknown>
 const obj = (v: unknown): Obj => (typeof v === 'object' && v !== null ? (v as Obj) : {})
 const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null)
@@ -47,6 +50,8 @@ export interface MailItem {
   from: string | null
   subject: string
   body: string
+  /** The record carried its subject or body: what it asks was read. */
+  complete: boolean
 }
 
 /** The messages in `orca orchestration check --json`: the concise view, or the full record. */
@@ -58,7 +63,13 @@ export function parseMail(result: unknown): MailItem[] {
     const o = obj(m)
     const id = str(o.id)
     if (!id) continue
-    items.push({ id, from: str(o.from) ?? str(o.from_handle), subject: typeof o.subject === 'string' ? o.subject : '', body: typeof o.body === 'string' ? o.body : '' })
+    items.push({
+      id,
+      from: str(o.from) ?? str(o.from_handle),
+      subject: typeof o.subject === 'string' ? o.subject : '',
+      body: typeof o.body === 'string' ? o.body : '',
+      complete: typeof o.subject === 'string' || typeof o.body === 'string'
+    })
   }
   return items
 }
@@ -72,7 +83,8 @@ export interface AdviceQuestion {
   at: number
 }
 
-const ADVICE = /^\s*advice\s*:\s*/i
+/** "Advice: …", also as a reply ("Re: Advice: …"). */
+const ADVICE = /^\s*(?:re\s*:\s*)*advice\s*:\s*/i
 
 /** The questions among a batch of mail: messages whose subject starts "Advice:". */
 export function adviceQuestions(items: readonly MailItem[], at: number): AdviceQuestion[] {
@@ -125,23 +137,48 @@ export function advisorBrief({ repo, base, question, id, forge }: AdvisorBriefIn
   ].join('\n')
 }
 
+/** A terminal line as text to compare: frames, prompt marks and runs of spaces taken out. */
+const plain = (s: string): string => s.replace(/[\s│┃║|╭╮╰╯─━>❯›»•·*]+/g, ' ').trim().toLowerCase()
+
+/**
+ * The terminal's lines that are the agent's own output, not its prompt echoed back. The brief
+ * carries the supervisor's question and context, which may say anything ("codex resume", "Do you
+ * want to proceed?"): a line found in it is dropped before the terminal is read for prompts, an
+ * unlocked resume or a quit agent. Agents wrap long lines, so any piece of the brief counts.
+ */
+export function outputLines(tail: readonly string[], brief: string): string[] {
+  const text = plain(brief)
+  return tail.filter((line) => {
+    const p = plain(line)
+    return p.length < 3 || !text.includes(p)
+  })
+}
+
 export interface AdviceRun extends AdviceQuestion {
   /** Names the worktree and the answer file. */
   runId: string
+  /**
+   * `starting` until its agent was launched: a restart that finds one starting cannot know
+   * whether an agent runs, so it ends the question and removes the worktree.
+   */
+  phase: 'starting' | 'running'
   startedAt: number
   agent: string
   model: string | null
   effort: string | null
   base: string
+  repo: string
+  forge?: ForgeKind
   worktree: { path: string; workspaceId: string | null } | null
   terminal: string | null
   lock: LockMode | null
-  /** When its terminal last changed, to tell a thinking advisor from a stalled one. */
+  /** When a terminal in its worktree last changed, to tell a thinking advisor from a stalled one. */
   lastOutputAt: number
-  signature: string | null
-  cursor: number | null
-  /** Why it waits on a person (a prompt in its terminal), and since when. */
+  signatures: Record<string, string>
+  cursors: Record<string, number>
+  /** Why it waits on a person (a prompt in its terminal), where, and since when. */
   blocked: string | null
+  blockedTerminal: string | null
   blockedSince: number | null
 }
 
@@ -167,10 +204,11 @@ export function emptyAdviceState(): AdviceState {
 function loadState(raw: unknown): AdviceState {
   const r = obj(raw)
   const list = <T>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : [])
+  const running = r.running && typeof r.running === 'object' ? (r.running as AdviceRun) : null
   return {
     v: 1,
     queue: list<AdviceQuestion>(r.queue),
-    running: r.running && typeof r.running === 'object' ? (r.running as AdviceRun) : null,
+    running: running ? { ...running, signatures: running.signatures ?? {}, cursors: running.cursors ?? {}, phase: running.phase ?? 'running' } : null,
     seen: list<string>(r.seen).filter((s) => typeof s === 'string'),
     outbox: list<{ subject: string; body: string }>(r.outbox),
     told: r.told && typeof r.told === 'object' ? (r.told as AdviceState['told']) : null,
@@ -203,6 +241,14 @@ export function noAnswerMessage(q: AdviceQuestion, why: string): { subject: stri
   }
 }
 
+/** Questions that waited their turn when the advisor stopped, in one message. */
+export function droppedMessage(questions: readonly AdviceQuestion[], why: string): { subject: string; body: string } {
+  return {
+    subject: `Advice: ${questions.length} waiting question${questions.length === 1 ? '' : 's'} dropped`,
+    body: [`${why}, so the advisor will not answer these questions you asked. Go on with your own judgment:`, ...questions.map((q) => `- ${q.question}`)].join('\n')
+  }
+}
+
 export interface AdviceStepInput {
   repo: string
   /** The project's main checkout. */
@@ -220,6 +266,8 @@ export interface AdviceStepInput {
 export interface AdvisorDeps extends Pick<CrewDeps, 'orca' | 'exec' | 'now' | 'log' | 'store' | 'readFile' | 'workspaceIdFor' | 'lockdown' | 'lockConfirmMs'> {
   /** Matriarch's mailbox in the project: where questions arrive, and the sender of its mail. */
   mailbox(repo: string, root: string): Promise<string | null>
+  /** Orca says this mailbox is gone: the next one asked for is made anew. */
+  mailboxGone?: (repo: string, handle: string) => void
   /** Called once each time the advisor starts waiting on a person. */
   alert?: (repo: string, message: string) => Promise<void>
 }
@@ -231,6 +279,12 @@ export interface Advisor {
    * what the board shows, or null when there is no advisor and nothing in flight.
    */
   step(input: AdviceStepInput): Promise<AdvisorView | null>
+  /**
+   * Matriarch no longer follows the project (its settings are gone): the question being answered
+   * is stopped and its worktree removed, the waiting ones dropped, the supervisor told, and the
+   * project's advisor state cleared. Nothing to do costs one storage read.
+   */
+  stop(input: { repo: string; root: string; supervisor: () => Promise<string | null>; acting: boolean }): Promise<void>
   /** Records what a supervisor's brief said about the advisor, when its chat starts. */
   briefed(repo: string, advisor: { role: AdvisorSpec; address: string } | null): Promise<void>
   /** Workspaces and paths of advisors at work, for the read-only hooks (no await there). */
@@ -268,6 +322,11 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     if (next.length !== list.length) await deps.store.set(ACTIVE, next)
   }
 
+  /** A refusal that says Matriarch's mailbox is gone: the next tick makes a new one. */
+  const noteGone = (repo: string, handle: string | null, error: unknown) => {
+    if (handle && error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)) deps.mailboxGone?.(repo, handle)
+  }
+
   /** Removes a finished question's worktree; only once it is gone does the read-only guard let go. */
   async function removeWorktree(path: string): Promise<boolean> {
     try {
@@ -302,7 +361,9 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
   /** Reads the mailbox: new questions are saved before the batch is marked read. */
   async function intake(state: AdviceState, repo: string, address: string, save: () => Promise<void>): Promise<void> {
     const take = (items: MailItem[]) => {
-      const fresh = items.filter((m) => !state.seen.includes(m.id))
+      // A message is read once: its subject and body taken as Orca gave them.
+      const fresh = items.filter((m) => m.complete && !state.seen.includes(m.id))
+      for (const m of items) if (!m.complete) deps.log(`${repo}: a message in Matriarch's mailbox came without its subject or body (${m.id})`)
       if (fresh.length === 0) return false
       state.seen = [...state.seen, ...fresh.map((m) => m.id)].slice(-MAX_SEEN)
       for (const q of adviceQuestions(fresh, deps.now())) {
@@ -316,71 +377,126 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     try {
       peeked = parseMail(await deps.orca.run(['orchestration', 'check', '--terminal', address, '--peek']))
     } catch (error) {
+      noteGone(repo, address, error)
       deps.log(`${repo}: could not read Matriarch's mailbox: ${(error as Error).message}`)
       return
     }
     if (peeked.length === 0) return
     if (take(peeked)) await save()
-    // Only Matriarch reads its own mailbox: marking the batch read keeps the next look short.
+    // Only Matriarch reads its own mailbox: marking the batch read keeps the next look short. Mail
+    // that arrived since the peek comes in this batch, with its subject and body.
     const consumed = await deps.orca.run(['orchestration', 'check', '--terminal', address]).catch(() => null)
     if (consumed && take(parseMail(consumed))) await save()
   }
 
-  /** Watches the question being answered: its answer file, its terminal, and its time. */
+  /**
+   * Every terminal in the advisor's worktree: what each shows (without the brief echoed back), and
+   * whether any changed since the last look. Answers null when its own terminal is gone.
+   */
+  async function observe(run: AdviceRun, now: number): Promise<Map<string, string[]> | null> {
+    const path = run.worktree!.path
+    const listed = obj(await deps.orca.run(['terminal', 'list', '--worktree', `path:${path}`]).catch(() => null))
+    const handles = (Array.isArray(listed.terminals) ? listed.terminals : []).map((t) => str(obj(t).handle)).filter((h): h is string => h !== null)
+    if (run.terminal && !handles.includes(run.terminal)) handles.push(run.terminal)
+    const brief = advisorBrief({ repo: run.repo, base: run.base, question: run, id: run.runId, forge: run.forge })
+    const tails = new Map<string, string[]>()
+    const signatures: Record<string, string> = {}
+    const cursors: Record<string, number> = {}
+    let advanced = false
+    for (const h of handles) {
+      let t: Obj
+      try {
+        t = obj(obj(await deps.orca.run(['terminal', 'read', '--terminal', h])).terminal)
+      } catch (error) {
+        if (h === run.terminal && error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)) return null
+        continue
+      }
+      const tail = outputLines(Array.isArray(t.tail) ? t.tail.map(String) : [], brief)
+      tails.set(h, tail)
+      signatures[h] = hashText(tail.slice(-12).join('\n'))
+      if (run.signatures[h] !== undefined && run.signatures[h] !== signatures[h]) advanced = true
+      if (typeof t.latestCursor === 'number') {
+        cursors[h] = t.latestCursor
+        if (run.cursors[h] !== undefined && t.latestCursor > run.cursors[h]) advanced = true
+      }
+    }
+    run.signatures = signatures
+    run.cursors = cursors
+    if (advanced) run.lastOutputAt = now
+    return tails
+  }
+
+  /** Watches the question being answered: its answer file, the terminals in its worktree, its time. */
   async function advance(state: AdviceState, repo: string): Promise<void> {
     const run = state.running!
     const now = deps.now()
-    const text = run.worktree ? await deps.readFile(`${run.worktree.path}/${answerPath(run.runId)}`).catch(() => null) : null
+    // Interrupted while starting (a reload, a failed save): whether an agent runs is not known.
+    if (run.phase !== 'running' || !run.worktree) return finish(state, { failed: 'Matriarch was interrupted while starting it' })
+    if (!run.worktree.workspaceId) {
+      // Orca may list a new worktree a little later; the read-only guard takes its id too.
+      run.worktree.workspaceId = await deps.workspaceIdFor(run.worktree.path).catch(() => null)
+      remember(run.worktree)
+    }
+    const text = await deps.readFile(`${run.worktree.path}/${answerPath(run.runId)}`).catch(() => null)
     const answer = text ? parseAnswer(text) : null
     if (answer) return finish(state, { answer })
-    if (run.terminal) {
-      let tail: string[]
-      let cursor: number | null
-      try {
-        const t = obj(obj(await deps.orca.run(['terminal', 'read', '--terminal', run.terminal])).terminal)
-        tail = Array.isArray(t.tail) ? t.tail.map(String) : []
-        cursor = typeof t.latestCursor === 'number' ? t.latestCursor : null
-      } catch (error) {
-        if (error instanceof OrcaRefusal && ['terminal_handle_stale', 'terminal_not_found'].includes(error.code)) return finish(state, { failed: 'its terminal was closed before it answered' })
-        tail = []
-        cursor = run.cursor
-      }
-      // Orca restores sessions without the launch hook: an advisor resumed unlocked is closed.
-      if (unlockedResume(tail.slice(-60))) return finish(state, { failed: "Orca resumed it without Matriarch's read-only lockdown, so Matriarch closed it" })
-      if (AGENT_QUIT.test(tail.slice(-15).join('\n'))) return finish(state, { failed: 'its agent quit' })
-      const signature = hashText(tail.slice(-12).join('\n'))
-      if ((run.signature !== null && signature !== run.signature) || (cursor !== null && run.cursor !== null && cursor > run.cursor)) run.lastOutputAt = now
-      run.signature = signature
-      run.cursor = cursor
-      const blocked = blockingReason(tail)
-      if (blocked && !run.blocked) {
-        run.blockedSince = now
-        await deps.alert?.(repo, `The advisor (${run.agent}) needs you: ${blocked}`).catch((error: Error) => deps.log(`alert failed: ${error.message}`))
-      }
-      // Time spent waiting on a person does not count as quiet.
-      if (!blocked && run.blocked) run.lastOutputAt = now
-      run.blocked = blocked
-      if (!blocked) run.blockedSince = null
+    const tails = await observe(run, now)
+    if (!tails) return finish(state, { failed: 'its terminal was closed before it answered' })
+    // Orca restores sessions without the launch hook: an agent resumed unlocked, in any terminal
+    // of the worktree, is closed, and the question ends.
+    for (const [handle, tail] of tails) {
+      const agent = unlockedResume(tail.slice(-60))
+      if (!agent) continue
+      await deps.orca.run(['terminal', 'close', '--terminal', handle]).catch(() => {})
+      deps.log(`${repo}: closed ${handle}, where ${agent} was resumed in the advisor's worktree without Matriarch's read-only lockdown`)
+      return finish(state, { failed: `Orca resumed ${agent} there without Matriarch's read-only lockdown, so Matriarch closed it` })
     }
-    if (run.blocked) {
-      if (now - (run.blockedSince ?? now) > BLOCKED_MAX_MS) return finish(state, { failed: `it waited ${Math.round(BLOCKED_MAX_MS / 3600_000)} h for a person: ${run.blocked}` })
-      return
+    const own = run.terminal ? (tails.get(run.terminal) ?? []) : []
+    if (AGENT_QUIT.test(own.slice(-15).join('\n'))) return finish(state, { failed: 'its agent quit' })
+    // A prompt that waits on a person: its own terminal first, then any other in the worktree.
+    let blocked: string | null = null
+    let where: string | null = null
+    for (const h of [...(run.terminal ? [run.terminal] : []), ...tails.keys()]) {
+      blocked = blockingReason(tails.get(h) ?? [])
+      if (blocked) {
+        where = h
+        break
+      }
     }
+    if (blocked && !run.blocked) {
+      run.blockedSince = now
+      await deps.alert?.(repo, `The advisor (${run.agent}) needs you: ${blocked}`).catch((error: Error) => deps.log(`alert failed: ${error.message}`))
+    }
+    // Time spent waiting on a person does not count as quiet.
+    if (!blocked && run.blocked) run.lastOutputAt = now
+    run.blocked = blocked
+    run.blockedTerminal = blocked ? where : null
+    if (!blocked) run.blockedSince = null
+    // The limit holds whatever it waits on, so a stuck advisor never keeps the slot for long.
+    if (now - run.startedAt > ADVICE_MAX_MS) {
+      return finish(state, { failed: run.blocked ? `it waited on a person past the ${Math.round(ADVICE_MAX_MS / 3600_000)}-hour limit: ${run.blocked}` : `it took over ${Math.round(ADVICE_MAX_MS / 3600_000)} hours` })
+    }
+    if (run.blocked) return
     if (now - Math.max(run.startedAt, run.lastOutputAt) > REVIEWER_TIMEOUT_MS) {
       return finish(state, { failed: text ? 'its answer file is not JSON in the asked shape' : `it was quiet for ${Math.round(REVIEWER_TIMEOUT_MS / 60_000)} min without answering` })
     }
-    if (now - run.startedAt > ADVICE_MAX_MS) return finish(state, { failed: `it took over ${Math.round(ADVICE_MAX_MS / 3600_000)} hours` })
   }
 
-  /** Starts the advisor on the next question: a worktree at the default branch, then the agent. */
-  async function start(state: AdviceState, input: AdviceStepInput, role: AdvisorSpec, base: string): Promise<void> {
+  /**
+   * Starts the advisor on the next question: a worktree at the default branch, then the agent.
+   * The question is saved as starting before anything is made, and again with its worktree before
+   * the agent launches, so a reload in between never starts a second one or loses the worktree.
+   */
+  async function start(state: AdviceState, input: AdviceStepInput, role: AdvisorSpec, base: string, save: () => Promise<void>): Promise<void> {
     const q = state.queue.shift()!
     const now = deps.now()
     const runId = `${hashText(q.id).slice(0, 6)}${now.toString(36).slice(-4)}`
     state.running = {
-      ...q, runId, startedAt: now, agent: role.agent, model: role.model ?? null, effort: role.effort ?? null, base,
-      worktree: null, terminal: null, lock: null, lastOutputAt: now, signature: null, cursor: null, blocked: null, blockedSince: null
+      ...q, runId, phase: 'starting', startedAt: now, agent: role.agent, model: role.model ?? null, effort: role.effort ?? null, base,
+      repo: input.repo, ...(input.forge ? { forge: input.forge } : {}),
+      worktree: null, terminal: null, lock: null, lastOutputAt: now, signatures: {}, cursors: {}, blocked: null, blockedTerminal: null, blockedSince: null
     }
+    await save()
     const fetched = await deps.exec('git', ['-C', input.root, 'fetch', '--quiet', 'origin', base], { timeoutMs: 120_000 })
     if (fetched.code !== 0) return finish(state, { failed: `git fetch failed: ${fetched.stderr.trim().slice(0, 200)}` })
     let path: string | null
@@ -399,9 +515,16 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     if (!path) return finish(state, { failed: 'worktree create gave no path' })
     const worktree = { path, workspaceId: workspaceId ?? (await deps.workspaceIdFor(path).catch(() => null)) }
     state.running.worktree = worktree
-    // The read-only hooks know the worktree before the advisor starts in it.
+    // The read-only hooks know the worktree before the advisor starts in it, and so does storage.
     remember(worktree)
-    await setActive(input.repo, true)
+    try {
+      await setActive(input.repo, true)
+      await save()
+    } catch (error) {
+      // Not saved: nothing may start in a worktree a reload would not know, so it goes now.
+      await removeWorktree(path)
+      throw error
+    }
     await deps.orca
       .run(['worktree', 'set', '--worktree', `path:${path}`, '--display-name', `Matriarch advisor · ${clip(q.question, 40)}`, '--comment', `Matriarch's advisor, read-only, answering the supervisor: ${clip(q.question, 200)}. Removed when it answers.`])
       .catch((error: Error) => deps.log(`could not label ${path}: ${error.message}`))
@@ -415,7 +538,32 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     state.running.terminal = started.terminal
     state.running.lock = started.lock ?? null
     if (started.error) return finish(state, { failed: started.error })
+    state.running.phase = 'running'
     deps.log(`${input.repo}: the advisor (${advisorName(role)}) is answering "${q.question}"`)
+  }
+
+  /** Sends what waits in the outbox, in order; what fails stays for the next tick. */
+  async function flush(state: AdviceState, repo: string, root: string, supervisor: string): Promise<void> {
+    if (state.outbox.length === 0) return
+    const from = await deps.mailbox(repo, root).catch(() => null)
+    while (state.outbox.length > 0) {
+      const m = state.outbox[0]
+      try {
+        await sendMessage(deps.orca, { to: supervisor, subject: m.subject, body: m.body, from })
+        state.outbox.shift()
+      } catch (error) {
+        noteGone(repo, from, error)
+        deps.log(`${repo}: could not send the advisor's mail to the supervisor: ${(error as Error).message}`)
+        break
+      }
+    }
+  }
+
+  /** Stops what is in flight: the question being answered, and the ones waiting, told as dropped. */
+  async function stopAll(state: AdviceState, why: string): Promise<void> {
+    if (state.running) await finish(state, { failed: why })
+    if (state.queue.length > 0) state.outbox.push(droppedMessage(state.queue, why))
+    state.queue = []
   }
 
   return {
@@ -435,6 +583,26 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       const state = loadState(await deps.store.get(stateKey(repo)))
       state.told = { run: null, address: advisor?.address ?? null, advisor: advisorKey(advisor?.role ?? null) }
       await deps.store.set(stateKey(repo), state as unknown as JsonValue)
+    },
+
+    async stop({ repo, root, supervisor: supervisorOf, acting }) {
+      const key = stateKey(repo)
+      const raw = await deps.store.get(key)
+      if (raw === null || raw === undefined) return
+      const state = loadState(raw)
+      const supervisor = await supervisorOf().catch(() => null)
+      await stopAll(state, 'Matriarch was turned off for this project')
+      if (state.told?.advisor && supervisor) state.outbox.unshift(advisorMessage(null))
+      if (acting && supervisor) await flush(state, repo, root, supervisor)
+      const still: string[] = []
+      for (const p of state.leftovers) if (!(await removeWorktree(p))) still.push(p)
+      if (still.length > 0) {
+        // Kept only to finish removing its worktrees; nothing more is sent.
+        await deps.store.set(key, { ...emptyAdviceState(), leftovers: still } as unknown as JsonValue)
+        return
+      }
+      await deps.store.set(key, null)
+      await setActive(repo, false)
     },
 
     async step(input) {
@@ -460,14 +628,15 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       if (!role) {
         // Turned off (or no longer one Matriarch can start): stop what is in flight, and tell a
         // supervisor that knew about it.
-        if (state.running) await finish(state, { failed: 'the advisor was turned off' })
-        state.queue = []
+        await stopAll(state, 'the advisor was turned off')
         if (state.told?.advisor && canSend) {
           const m = advisorMessage(null)
+          const from = await deps.mailbox(input.repo, input.root).catch(() => null)
           try {
-            await sendMessage(deps.orca, { to: input.supervisor!, subject: m.subject, body: m.body, from: await deps.mailbox(input.repo, input.root).catch(() => null) })
+            await sendMessage(deps.orca, { to: input.supervisor!, subject: m.subject, body: m.body, from })
             state.told = { run: input.supervisor, address: state.told.address, advisor: null }
           } catch (error) {
+            noteGone(input.repo, from, error)
             deps.log(`${input.repo}: could not tell the supervisor the advisor is off: ${(error as Error).message}`)
           }
         }
@@ -489,6 +658,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
                 await sendMessage(deps.orca, { to: input.supervisor, subject: m.subject, body: m.body, from: address })
                 state.told = { run: input.supervisor, ...want }
               } catch (error) {
+                noteGone(input.repo, address, error)
                 deps.log(`${input.repo}: could not tell the supervisor about the advisor: ${(error as Error).message}`)
               }
             }
@@ -496,23 +666,11 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
         }
         if (address) await intake(state, input.repo, address, save)
         if (state.running) await advance(state, input.repo)
-        if (!state.running && state.queue.length > 0 && input.acting && input.supervisor && input.base) await start(state, input, role, input.base)
+        if (!state.running && state.queue.length > 0 && input.acting && input.supervisor && input.base) await start(state, input, role, input.base, save)
       }
 
       // Answers and refusals go out once Matriarch may send mail.
-      if (canSend && state.outbox.length > 0) {
-        const from = await deps.mailbox(input.repo, input.root).catch(() => null)
-        while (state.outbox.length > 0) {
-          const m = state.outbox[0]
-          try {
-            await sendMessage(deps.orca, { to: input.supervisor!, subject: m.subject, body: m.body, from })
-            state.outbox.shift()
-          } catch (error) {
-            deps.log(`${input.repo}: could not send the advisor's answer to the supervisor: ${(error as Error).message}`)
-            break
-          }
-        }
-      }
+      if (canSend) await flush(state, input.repo, input.root, input.supervisor!)
       state.outbox = state.outbox.slice(-MAX_OUTBOX)
       if (!state.running) await setActive(input.repo, state.leftovers.length > 0)
       if (JSON.stringify(state) !== before) await save()
@@ -530,7 +688,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
               question: run.question,
               since: run.startedAt,
               blocked: run.blocked,
-              terminal: run.blocked ? run.terminal : null,
+              terminal: run.blocked ? run.blockedTerminal : null,
               workspaceId: run.worktree?.workspaceId ?? null,
               lock: run.lock ? LOCK_LABEL[run.lock] : null
             }

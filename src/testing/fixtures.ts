@@ -37,6 +37,7 @@ export function pr(over: Partial<PrSnapshot> = {}): PrSnapshot {
     threadsTruncated: false,
     files: ['src/a.ts'],
     filesTruncated: false,
+    renamed: [],
     updatedAt: '2026-11-10T10:00:00Z',
     fetchedAt: 0,
     ...over

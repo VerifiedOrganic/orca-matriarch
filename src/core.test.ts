@@ -57,8 +57,8 @@ describe('config', () => {
     assert.deepEqual(r.config.reviewers.map((x) => x.readOnly), [undefined, false, undefined])
   })
 
-  test('review.light: docs and text by default; paths may be emptied, and a bad crew falls back', () => {
-    assert.deepEqual(validateConfig({}).config.review.light, { paths: ['**/*.md', '**/*.mdx', '**/*.txt', 'docs/**'], crew: 'one' })
+  test('review.light: docs by default; paths may be emptied, and a bad crew falls back', () => {
+    assert.deepEqual(validateConfig({}).config.review.light, { paths: ['**/*.md', '**/*.rst', '**/*.adoc'], crew: 'one' })
     const off = validateConfig({ review: { light: { paths: [], crew: 'none' } } })
     assert.deepEqual(off.errors, [])
     assert.deepEqual(off.config.review.light, { paths: [], crew: 'none' })
@@ -128,6 +128,18 @@ describe('github', () => {
     assert.equal(p.threads.find((t) => t.id === 'T2')?.ours, true)
     assert.equal(p.threads.find((t) => t.id === 'T3')?.bot, true)
     assert.deepEqual(actionableThreads(p).map((t) => t.id), ['T1', 'review:R1'])
+  })
+
+  test('renamed and copied files are named; a file list without change types cannot say', () => {
+    const moved = normalizePr({ ...raw, files: { pageInfo: { hasNextPage: false }, nodes: [
+      { path: 'docs/session.md', changeType: 'RENAMED' }, { path: 'docs/copy.md', changeType: 'COPIED' }, { path: 'README.md', changeType: 'MODIFIED' }, { path: 'old.md', changeType: 'DELETED' }
+    ] } }, 'acme/app', 5)!
+    assert.deepEqual(moved.renamed, ['docs/session.md', 'docs/copy.md'])
+    assert.deepEqual(moved.files, ['docs/session.md', 'docs/copy.md', 'README.md', 'old.md'])
+    const plain = normalizePr({ ...raw, files: { pageInfo: { hasNextPage: false }, nodes: [{ path: 'README.md', changeType: 'MODIFIED' }] } }, 'acme/app', 5)!
+    assert.deepEqual(plain.renamed, [])
+    const unknown = normalizePr({ ...raw, files: { pageInfo: { hasNextPage: false }, nodes: [{ path: 'README.md' }] } }, 'acme/app', 5)!
+    assert.equal(unknown.renamed, null)
   })
 
   test('CI state needs every check: failure wins, then pending, then cancelled', () => {

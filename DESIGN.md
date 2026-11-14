@@ -70,7 +70,11 @@ simple values, so the role setup lives in the repo and is versioned with it. Def
               "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github", // "github": on the PR, GitLab too
               "followUp": "focused", "fallback": null,
               // A PR changing only these files gets "one" reviewer (the first must-approve one) or "none".
-              "light": { "paths": ["**/*.md", "**/*.mdx", "**/*.txt", "docs/**"], "crew": "one" } },
+              // Never for agents' instructions and tools' config (ALWAYS_FULL_REVIEW in config.ts:
+              // AGENTS.md, CLAUDE.md, SKILL.md, .github/**, .claude/** …), renamed or copied files,
+              // a cut-short file list, or GitLab, whose file list does not say what was renamed. A
+              // round already on the commit (running, or asking for changes) still decides.
+              "light": { "paths": ["**/*.md", "**/*.rst", "**/*.adoc"], "crew": "one" } },
   "fix": { "ci": { "enabled": true, "maxRounds": 3, "rerunFlaky": true }, "comments": { "enabled": true, "maxRounds": 3 },
            "conflicts": { "enabled": true, "maxRounds": 2 } },
   "merge": { "mode": "manual", "method": "squash", "requireHuman": [], "updateBranch": "rebase",
@@ -338,21 +342,32 @@ supervisor chooses to ask.
 - **Asking.** With an advisor set, the brief tells the supervisor when to ask (a risky plan, a
   reviewer and a worker disagreeing, being stuck, a step that is hard to undo) and the command:
   `orca orchestration send --to <Matriarch's mailbox> --subject 'Advice: …' --body '<context>'`.
-  The mailbox is Matriarch's own terminal in the project; its handle changes when Orca restarts
-  and recreates it. Matriarch records what each supervisor was told (its Run, the address, the
-  advisor) and mails it again when any of these change, or when the advisor is turned off.
+  The mailbox is Matriarch's own terminal in the project. Once Orca says it is gone (closed, or
+  lost in a restart), Matriarch drops it and makes a new one. It records what each supervisor was
+  told (its Run, the address, the advisor) and mails it again when any of these change, or when
+  the advisor is turned off.
 - **Reading.** Each tick, `orchestration check --terminal <mailbox> --peek` reads new mail;
-  questions are saved, by message id, before a plain `check` marks the batch read, so a crash in
-  between loses nothing and nothing is taken twice. Mail that is not a question is dropped.
+  questions (`Advice: …`, also `Re: Advice: …`) are saved, by message id, before a plain `check`
+  marks the batch read, so a crash in between loses nothing and nothing is taken twice. Mail that
+  came between the two is taken from that batch. A message is marked read only once its subject or
+  body was read. Mail that is not a question is dropped.
 - **Answering.** One question at a time per project, up to 10 waiting: a throwaway worktree of
   the default branch (a `matriarch/review-` branch, so the board skips it), the advisor launched
   there exactly as a reviewer is (same lockdown, same launch confirmation, same tool guard), and
   told to write `{"answer": …}` to `.matriarch/review/advice-<id>/answer.json`, inside the verdict
   folder the lockdown already lets it write. The answer is mailed to `run:<id>`, then the worktree
-  goes. Quiet for 30 minutes, over 2 hours, its terminal closed, its agent quit or resumed
-  without the lockdown: the supervisor hears there is no answer.
+  goes. The question is saved as starting before the worktree is made and again with it before
+  the agent launches; one found still starting after a reload ends, and its worktree goes, so a
+  second advisor never starts. Every terminal in the worktree is read, without the lines of its
+  brief echoed back (the question may say "codex resume" or "Do you want to proceed?"). Quiet for
+  30 minutes, over 2 hours (waiting on a person or not), its terminal closed, its agent quit, or
+  an agent resumed there without the lockdown (closed at once): the supervisor hears there is no
+  answer.
 - **Dry run.** Like automatic reviews it starts only with autopilot on. In dry run questions wait,
   and the board says so; answers and notices to the supervisor wait in an outbox until autopilot.
+- **Turned off.** Turning the advisor off stops the question being answered and drops the waiting
+  ones, and the supervisor is told both. Turning Matriarch off for the project does the same,
+  removes the worktree and clears the project's advisor state.
 - **Board.** The supervisor's card shows the advisor and its question; one stuck on a prompt
   shows under **Needs you** with its terminal.
 

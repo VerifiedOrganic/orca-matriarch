@@ -301,7 +301,11 @@ describe('a repository with no CI', () => {
 
 describe('a light change', () => {
   const docs = pr({ files: ['README.md', 'docs/guide.md'] })
-  const startOf = (p: ReturnType<typeof plan>) => p.actions.find((a) => a.kind === 'start-review')
+  const startOf = (p: ReturnType<typeof plan>) => p.actions.find((a) => a.kind === 'start-review') as Extract<Action, { kind: 'start-review' }> | undefined
+  // An author on neither default reviewer's agent, so the whole crew of two would run.
+  const author = owner({ agent: 'opencode' })
+  const crewOf = (p: ReturnType<typeof plan>) => startOf(p)?.reviewers.map((r) => r.name)
+  const none = config((x) => (x.review.light.crew = 'none'))
 
   test('gets one reviewer, the first that must approve', () => {
     const c = config((x) => (x.reviewers = [
@@ -310,31 +314,58 @@ describe('a light change', () => {
       { name: 'security', agent: 'claude', blocking: true }
     ]))
     const p = plan(input({ pr: docs, config: c, owner: owner({ agent: 'codex' }) }))
-    const start = startOf(p)
-    assert.ok(start?.kind === 'start-review')
-    assert.deepEqual(start.reviewers.map((r) => r.name), ['correctness'])
-    assert.ok(p.reason.includes('a light change (only **/*.md, docs/**): one reviewer'), p.reason)
+    assert.deepEqual(crewOf(p), ['correctness'])
+    assert.ok(p.reason.includes('a light change (only **/*.md): one reviewer'), p.reason)
+  })
+
+  test('with no reviewer that must approve, the first one', () => {
+    const c = config((x) => (x.reviewers = [{ name: 'style', agent: 'claude', blocking: false }, { name: 'docs', agent: 'claude', blocking: false }]))
+    assert.deepEqual(crewOf(plan(input({ pr: docs, config: c, owner: author }))), ['style'])
   })
 
   test('with crew "none" skips the AI review and says so at the merge gate', () => {
-    const c = config((x) => (x.review.light.crew = 'none'))
-    const p = plan(input({ pr: docs, config: c }))
+    const p = plan(input({ pr: docs, config: none }))
     assert.equal(p.lane, 'ready')
     assert.ok(!startOf(p))
-    assert.equal(p.reason, 'ready to merge; AI review skipped: a light change (only **/*.md, docs/**)')
+    assert.equal(p.reason, 'ready to merge; AI review skipped: a light change (only **/*.md)')
   })
 
-  test('is not one when any file falls outside the paths, the list is truncated, or the paths are empty', () => {
-    const none = config((x) => (x.review.light.crew = 'none'))
-    const full = (p: ReturnType<typeof plan>) => (startOf(p) as Extract<Action, { kind: 'start-review' }> | undefined)?.reviewers.length
-    // An author on neither reviewer's agent, so the whole crew of two would run.
-    const author = owner({ agent: 'opencode' })
-    assert.equal(full(plan(input({ pr: pr({ files: ['README.md', 'src/a.ts'] }), config: none, owner: author }))), 2)
-    assert.equal(full(plan(input({ pr: pr({ files: ['README.md'], filesTruncated: true }), config: none, owner: author }))), 2)
-    assert.equal(full(plan(input({ pr: pr({ files: [] }), config: none, owner: author }))), 2)
-    const off = config((x) => {
-      x.review.light = { paths: [], crew: 'none' }
-    })
-    assert.equal(full(plan(input({ pr: docs, config: off, owner: author }))), 2)
+  test('with crew "none", a round already on this commit still decides: running, or asking for changes', () => {
+    const running = plan(input({ pr: docs, config: none, ledger: { ...emptyLedger(), reviews: { [SHA]: { round: 1, status: 'running', startedAt: 1 } } } }))
+    assert.equal(running.lane, 'ai-review')
+    const changes = plan(input({ pr: docs, config: none, ledger: { ...emptyLedger(), reviews: { [SHA]: { round: 1, status: 'done', startedAt: 1, endedAt: 2, verdict: 'changes', findings: 2 } } } }))
+    assert.equal(changes.lane, 'fixing-review')
+    assert.ok(changes.actions.some((a) => a.kind === 'send-findings'))
+    // A failed round does not hold a light change up.
+    const failed = plan(input({ pr: docs, config: none, ledger: { ...emptyLedger(), reviews: { [SHA]: { round: 1, status: 'failed', startedAt: 1, endedAt: 2 } } } }))
+    assert.equal(failed.lane, 'ready')
+  })
+
+  test('is not one when a file falls outside the paths, the list is cut short, empty, or the paths are off', () => {
+    assert.equal(crewOf(plan(input({ pr: pr({ files: ['README.md', 'src/a.ts'] }), config: none, owner: author })))?.length, 2)
+    assert.equal(crewOf(plan(input({ pr: pr({ files: ['README.md'], filesTruncated: true }), config: none, owner: author })))?.length, 2)
+    assert.equal(crewOf(plan(input({ pr: pr({ files: [] }), config: none, owner: author })))?.length, 2)
+    const off = config((x) => (x.review.light = { paths: [], crew: 'none' }))
+    assert.equal(crewOf(plan(input({ pr: docs, config: off, owner: author })))?.length, 2)
+  })
+
+  test('renamed or copied files, or a forge that cannot say, get the full crew', () => {
+    // `git mv src/auth/session.ts docs/session.md` lists only the new path, which looks like docs.
+    assert.equal(crewOf(plan(input({ pr: pr({ files: ['docs/session.md'], renamed: ['docs/session.md'] }), config: none, owner: author })))?.length, 2)
+    assert.equal(crewOf(plan(input({ pr: pr({ files: ['docs/session.md'], renamed: null }), config: none, owner: author })))?.length, 2)
+    assert.equal(crewOf(plan(input({ pr: pr({ files: ['docs/session.md'], renamed: undefined }), config: none, owner: author })))?.length, 2)
+  })
+
+  test("agents' instructions and tools' config always get the full crew, even when they match the paths", () => {
+    const everything = config((x) => (x.review.light = { paths: ['**'], crew: 'none' }))
+    for (const file of ['AGENTS.md', 'pkg/CLAUDE.md', 'GEMINI.md', 'skills/x/SKILL.md', 'a.prompt.md', '.github/copilot-instructions.md', '.cursorrules', '.windsurfrules',
+      '.claude/settings.json', 'sub/.cursor/rules/x.mdc', '.github/workflows/ci.yml', '.agents/x.md', '.codex/config.toml', '.omp/x.md', '.opencode/agent.md']) {
+      assert.equal(crewOf(plan(input({ pr: pr({ files: ['README.md', file] }), config: everything, owner: author })))?.length, 2, file)
+    }
+    // The defaults: docs only, and not text files that build or configure anything.
+    for (const file of ['requirements.txt', 'CMakeLists.txt', 'docs/conf.py', 'docs/page.mdx']) {
+      assert.equal(crewOf(plan(input({ pr: pr({ files: [file] }), config: none, owner: author })))?.length, 2, file)
+    }
+    for (const file of ['README.md', 'docs/guide.rst', 'docs/manual.adoc']) assert.equal(plan(input({ pr: pr({ files: [file] }), config: none })).lane, 'ready', file)
   })
 })

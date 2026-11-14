@@ -193,8 +193,13 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - **Review rounds per PR** (default 3) caps the rounds before it asks someone instead;
 - later rounds check only what changed (**Later rounds: check the fixes**);
 - reviewers on the same agent as the PR's author are skipped (you can turn that off);
-- a PR that changes only docs and text files (**Light changes**: `**/*.md`, `**/*.mdx`,
-  `**/*.txt`, `docs/**` by default) gets one reviewer, or none if you choose;
+- a PR that changes only docs (**Light changes**: `**/*.md`, `**/*.rst`, `**/*.adoc` by default)
+  gets one reviewer, or none if you choose. Agents' instructions and tools' config always get the
+  full crew, even when they match: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`,
+  `*.prompt.md`, `copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, and anything in a
+  `.claude`, `.cursor`, `.github`, `.agents`, `.codex`, `.omp` or `.opencode` folder. So does a PR
+  that renames or copies a file, and on GitLab every merge request, since its file list does not
+  say which files were renamed;
 - **Reviews at once** (default 2) limits how many review crews run together.
 - **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
   supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
