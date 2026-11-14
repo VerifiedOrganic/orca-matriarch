@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import type { JsonValue } from 'orca/host'
 import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
 import { CONFIG_PATH, validateConfig } from './config.ts'
-import { tick, type EngineDeps } from './engine.ts'
+import { FINISHED_GRACE_MS, tick, type EngineDeps } from './engine.ts'
 import type { GitHub } from './github.ts'
 import {
   countStarts,
@@ -25,6 +25,7 @@ import {
 } from './limits.ts'
 import { OrcaRefusal, parseWorkerList, type WorkerRow } from './orca-cli.ts'
 import { supervisorBrief, supervisorTag } from './supervisor.ts'
+import { check, pr } from './testing/fixtures.ts'
 import { createWorker, deactivate } from './worker.ts'
 
 const T0 = new Date(2026, 10, 14, 10, 0).getTime()
@@ -366,7 +367,14 @@ describe('a worker that started over a limit', () => {
     assert.match(m.body, /Its task is not done, and its worktree is kept/)
   })
 
-  function stopping(rowsByTick: WorkerRow[][], opts: { autopilot?: boolean; stop?: (id: string) => Promise<{ ok: boolean; error?: string }> } = {}) {
+  // Orca names a worktree `<repoId>::<path>` in orchestration, and by an identity in its workspace list.
+  const D3_WS = { id: 'identity:wt2:d3', kind: 'worktree' as const, name: 'task d3', path: '/r/wt/d3', branch: 'refs/heads/task-d3', hostId: 'local' }
+  const IN_D3 = 'repo1::/r/wt/d3'
+
+  function stopping(
+    rowsByTick: WorkerRow[][],
+    opts: { autopilot?: boolean; stop?: (id: string) => Promise<{ ok: boolean; error?: string }>; removed?: string[] } = {}
+  ) {
     const store = new Map<string, unknown>()
     const stops: string[] = []
     const told: string[] = []
@@ -375,7 +383,7 @@ describe('a worker that started over a limit', () => {
     const deps: EngineDeps = {
       now: () => now,
       log: () => {},
-      workspaces: async () => [{ id: 'ws-main', kind: 'worktree', name: 'main', path: '/r', branch: 'refs/heads/main', hostId: 'local' }],
+      workspaces: async () => [{ id: 'ws-main', kind: 'worktree', name: 'main', path: '/r', branch: 'refs/heads/main', hostId: 'local' }, D3_WS],
       repoOf: async () => ({ ref: { owner: 'acme', name: 'app' }, key: 'acme/app', root: '/r' }),
       readConfig: async () => validateConfig({ review: { enabled: false }, limits: { maxWorkers: 2, maxWorkerStartsPerDay: 3 } }),
       github: { listOpen: async () => ({ viewer: 'me', prs: [], rate: null }), detail: async () => ({ pr: null, rate: null }) },
@@ -385,7 +393,8 @@ describe('a worker that started over a limit', () => {
       store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) },
       executor: { execute: async () => ({ ok: true }) },
       stopWorker: async (id) => (stops.push(id), opts.stop ? opts.stop(id) : { ok: true }),
-      tellSupervisor: async (_repo, _root, _to, m) => void told.push(m.body)
+      tellSupervisor: async (_repo, _root, _to, m) => void told.push(m.body),
+      removeWorktree: async (path) => (opts.removed?.push(path), { removed: true })
     }
     const run = async () => {
       const board = await tick(deps, { autopilot: opts.autopilot ?? true })
@@ -393,17 +402,22 @@ describe('a worker that started over a limit', () => {
       now += 60_000
       return board
     }
-    return { run, stops, told, store, advance: (ms: number) => (now += ms) }
+    return { run, stops, told, store, deps, advance: (ms: number) => (now += ms) }
   }
 
   test('under autopilot it is stopped, the supervisor is told, and it takes no room or start', async () => {
-    const s = stopping([[w('d1')], [w('d3', { worktreeId: 'ws-d3' }), w('d2'), w('d1')]])
+    const s = stopping([[w('d1')], [w('d3', { worktreeId: IN_D3 }), w('d2'), w('d1')]])
     await s.run()
     const board = await s.run()
     assert.deepEqual(s.stops, ['d3'], 'd2 fits under the limit of 2, d3 does not')
-    const log = (s.store.get('track:ws-d3') as { log: { kind: string; text: string }[] }).log
-    assert.deepEqual(log.map((e) => e.kind), ['stop-worker'], "the stop is in that worktree's log")
-    assert.match(log[0].text, /^Stopped this worktree's worker, which started over a limit: it started while 2 of 2/)
+    // In the log of the worktree's track as the board keys it: by its workspace id, not Orca's
+    // orchestration id, so the panel shows it and pruning keeps it.
+    const track = board.tracks.find((t) => t.workspace.id === D3_WS.id)
+    assert.equal(track?.key, D3_WS.id)
+    const log = (s.store.get(`track:${D3_WS.id}`) as { log: { kind: string; text: string }[] }).log
+    assert.deepEqual(log.filter((e) => e.kind === 'stop-worker').length, 1, "the stop is in that worktree's log")
+    assert.match(log.find((e) => e.kind === 'stop-worker')!.text, /^Stopped this worktree's worker, which started over a limit: it started while 2 of 2/)
+    assert.equal(s.store.get(`track:${IN_D3}`), undefined, 'nothing under the orchestration id')
     assert.match(s.told[0], /dispatch:d3 \(task t-d3\): it started while 2 of 2 workers were running/)
     assert.deepEqual([board.repos[0].supervisor.live, board.repos[0].supervisor.startsToday], [2, 1])
     assert.ok(board.repos[0].warnings.some((x) => x.startsWith('Stopped worker dispatch:d3')))
@@ -421,6 +435,48 @@ describe('a worker that started over a limit', () => {
     const seen = await first.run()
     assert.deepEqual(first.stops, [], 'workers there when Matriarch first looks are never stopped')
     assert.match(seen.attention.find((a) => a.key === 'limits:acme/app')?.message ?? '', /running before it looked or before the limit was lowered/)
+  })
+
+  test("the stopped worker's worktree is kept for its task, until a newer worker ran there and finished", async () => {
+    const removed: string[] = []
+    const stoppedRow = w('d3', { worktreeId: IN_D3, live: false, liveness: 'exited', state: 'stopped' })
+    const s = stopping(
+      [[w('d1')], [w('d3', { worktreeId: IN_D3 }), w('d2'), w('d1')], [stoppedRow, w('d2'), w('d1')]],
+      { removed }
+    )
+    await s.run()
+    await s.run()
+    assert.deepEqual(s.stops, ['d3'])
+    for (let k = 0; k < 3; k++) {
+      s.advance(FINISHED_GRACE_MS)
+      await s.run()
+    }
+    assert.ok(!removed.includes(D3_WS.path), 'its task is not done: the worktree waits for it, as the supervisor was told')
+    // A newer worker took the task up there and finished: an ordinary finished worktree again.
+    const later = stopping(
+      [[w('d1')], [w('d3', { worktreeId: IN_D3 }), w('d2'), w('d1')], [w('d5', { worktreeId: IN_D3, live: false, liveness: 'exited', state: 'succeeded' }), stoppedRow, w('d2'), w('d1')]],
+      { removed }
+    )
+    await later.run()
+    await later.run()
+    await later.run()
+    later.advance(FINISHED_GRACE_MS)
+    await later.run()
+    assert.ok(removed.includes(D3_WS.path), 'removed once the newer worker finished there')
+  })
+
+  test('for the rest of the tick a stopped worker owns nothing: its PR gets nothing sent to it', async () => {
+    const sends: { owner: string | null; ownerLive: boolean | null }[] = []
+    const failing = pr({ number: 7, headRef: 'task-d3', ci: 'failing', checks: [check('test', 'failure')] })
+    const s = stopping([[w('d1')], [w('d3', { worktreeId: IN_D3 }), w('d2'), w('d1')]])
+    const summary = { number: 7, headRef: 'task-d3', headSha: failing.headSha, baseRef: 'main', author: failing.author, updatedAt: failing.updatedAt, rollup: 'FAILURE' }
+    s.deps.github = { listOpen: async () => ({ viewer: 'me', prs: [summary], rate: null }), detail: async () => ({ pr: { ...failing, fetchedAt: T0 }, rate: null }) }
+    s.deps.activity = (id) => (id === D3_WS.id ? { activity: 'done', since: 1, agent: 'codex' } : null)
+    s.deps.executor = { execute: async (a, ctx) => (a.kind === 'send-ci-failure' && sends.push({ owner: ctx.owner ?? null, ownerLive: ctx.ownerLive ?? null }), { ok: true }) }
+    await s.run()
+    await s.run()
+    assert.deepEqual(s.stops, ['d3'])
+    assert.deepEqual(sends.at(-1), { owner: 'dispatch:d3', ownerLive: false }, 'so the executor sends it to the supervisor, not the stopped worker')
   })
 
   test('a stop that fails is tried again while the worker runs, then given up', async () => {

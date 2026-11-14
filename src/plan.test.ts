@@ -368,4 +368,28 @@ describe('a light change', () => {
     }
     for (const file of ['README.md', 'docs/guide.rst', 'docs/manual.adoc']) assert.equal(plan(input({ pr: pr({ files: [file] }), config: none })).lane, 'ready', file)
   })
+
+  test('the full-crew list holds in any case, and covers Orca, Gemini and the other agents\' folders', () => {
+    // On a case-insensitive disk (macOS), claude.md steers an agent as CLAUDE.md does.
+    for (const file of ['claude.md', 'Agents.md', 'docs/Gemini.MD', '.Claude/settings.md', 'pkg/.GITHUB/notes.md', 'skills/x/skill.md', 'conventions.md',
+      '.orca/matriarch.md', '.gemini/styleguide.md', '.windsurf/rules/x.md', '.continue/rules/x.md', '.roo/rules/x.md', '.kiro/steering/x.md',
+      '.junie/guidelines.md', '.clinerules/x.md', '.clinerules', '.aider.conf.md']) {
+      assert.equal(crewOf(plan(input({ pr: pr({ files: ['README.md', file] }), config: none, owner: author })))?.length, 2, file)
+    }
+    // The light paths themselves keep their case: they decide what may get less review.
+    const upper = config((x) => (x.review.light = { paths: ['**/*.md'], crew: 'none' }))
+    assert.equal(crewOf(plan(input({ pr: pr({ files: ['NOTES.MD'] }), config: upper, owner: author })))?.length, 2)
+  })
+})
+
+describe('protected paths', () => {
+  test('match in any case, so a PR cannot slip past them by changing a letter', () => {
+    const c = config((x) => {
+      x.merge.requireHuman = ['src/auth/**']
+      x.review.enabled = false
+    })
+    const p = plan(input({ pr: pr({ files: ['SRC/Auth/session.ts'] }), config: c }))
+    assert.equal(p.lane, 'needs-you')
+    assert.match(p.reason, /touches protected paths \(src\/auth\/\*\*\)/)
+  })
 })

@@ -146,7 +146,7 @@ export function lightChange(config: MatriarchConfig, pr: PrSnapshot): string[] |
  */
 export function lightPaths(config: MatriarchConfig, pr: PrSnapshot): string[] | null {
   const { paths } = config.review.light
-  if (pr.filesTruncated || !everyPathMatches(paths, pr.files) || matchingGlobs(ALWAYS_FULL_REVIEW, pr.files).length > 0) return null
+  if (pr.filesTruncated || !everyPathMatches(paths, pr.files) || matchingGlobs(ALWAYS_FULL_REVIEW, pr.files, { ignoreCase: true }).length > 0) return null
   return matchingGlobs(paths, pr.files)
 }
 
@@ -538,7 +538,7 @@ function mergeGate(input: PlanInput): Plan {
     return { lane: 'ready', reason: `its base ${pr.baseRef} may be another open PR's branch, and ${forgeTerms(pr.forge).name} listed too many open PRs to tell: merge it yourself`, actions: [] }
   }
   if (merge.requireHuman.length > 0) {
-    const hits = matchingGlobs(merge.requireHuman, pr.files)
+    const hits = matchingGlobs(merge.requireHuman, pr.files, { ignoreCase: true })
     if (hits.length > 0 || pr.filesTruncated) {
       const why = hits.length > 0 ? `touches protected paths (${hits.join(', ')})` : `${forgeTerms(pr.forge).name} did not list every changed file, so protected paths cannot be checked`
       return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `protected:${sha}`, `${pr.repo} #${pr.number} needs a human merge`, why) }

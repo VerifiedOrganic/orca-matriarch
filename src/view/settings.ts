@@ -363,7 +363,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       ...(d.merge.onBaseRed === 'fix-forward' ? [['fix-forward', 'pause merges and ask for a fix forward'] as const] : []),
       ['revert', 'pause merges and ask to revert what broke it']
     ], (v) => (d.merge.onBaseRed = v)),
-    row('Paths that always need you', 'A PR that touches one waits for you, even when Matriarch merges.',
+    row('Paths that always need you', 'A PR that touches one (in any case) waits for you, even when Matriarch merges.',
       textInput(d.merge.requireHuman.join(', '), (v) => (d.merge.requireHuman = globList(v)), { placeholder: 'e.g. migrations/**, .github/**' }), { stack: true }),
     el('div', { class: 'group-sub' }, 'Cleanup'),
     row('Delete merged branches', 'On GitHub or GitLab, once the PR merged.', toggle(d.merge.deleteBranch, (on) => (d.merge.deleteBranch = on))),

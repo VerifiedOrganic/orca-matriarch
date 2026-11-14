@@ -123,6 +123,26 @@ const CLEANUP_GIVE_UP_MS = 7 * 24 * 3600_000
 export const SHOW_CLOSED_MS = 6 * 3600_000
 /** How long a worktree that never became a PR stays after its last worker finished. */
 export const FINISHED_GRACE_MS = 60 * 60_000
+/** How long the worktree of a worker stopped over a limit is kept for its task, when no worker returns to it. */
+export const STOPPED_KEEP_MS = 7 * 24 * 3600_000
+
+/** A worktree whose worker Matriarch stopped over a limit: kept for that task until a newer worker runs there. */
+interface StoppedWorktree {
+  dispatchId: string
+  at: number
+}
+
+/**
+ * The workspace a worker row runs in. Orca names one worktree two ways: `<repoId>::<path>` in
+ * orchestration and an identity (`identity:wt2:…`) in its workspace list, so a row is matched by
+ * either, through its path.
+ */
+function workspaceOf(row: WorkerRow, workspaces: readonly Workspace[]): Workspace | undefined {
+  if (!row.worktreeId) return undefined
+  const sep = row.worktreeId.indexOf('::')
+  const path = sep >= 0 ? row.worktreeId.slice(sep + 2) : null
+  return workspaces.find((ws) => ws.id === row.worktreeId || (path !== null && ws.path === path))
+}
 
 export interface TickOptions {
   autopilot: boolean
@@ -457,7 +477,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
   // When the list was asked for: a worker started after this may not be in it yet.
   const workersAt = deps.now()
   try {
-    workers = await deps.workers()
+    // Copies: a worker stopped this tick is marked so for the rest of it.
+    workers = (await deps.workers()).map((w) => ({ ...w }))
   } catch (error) {
     ownersKnown = false
     board.errors.push(`Can't see Orca's workers (${(error as Error).message}); nothing goes to workers until it is back.`)
@@ -606,14 +627,21 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       }
       if (stopped.length > 0) {
         deps.log(`${repoKey}: stopped ${stopped.map((o) => `dispatch:${o.dispatchId}`).join(', ')}, started over a limit`)
-        // Each stop goes in its worktree's log too, where the person looks for why its worker ended.
+        const keptKey = `stopped:${repoKey}`
+        const kept = ((await deps.store.get(keptKey)) as Record<string, StoppedWorktree> | null) ?? {}
         for (const o of stopped) {
-          const worktreeId = mine.find((w) => w.dispatchId === o.dispatchId)?.worktreeId
-          if (!worktreeId) continue
-          const key = historyKey(worktreeId)
+          const row = mine.find((w) => w.dispatchId === o.dispatchId)
+          // Stopped: for the rest of this tick nothing is sent to it, and its PR's worker counts as gone.
+          if (row) Object.assign(row, { live: false, liveness: 'exited', state: 'stopped' })
+          const ws = row ? workspaceOf(row, repoWorkspaces) : undefined
+          if (!ws) continue
+          // Its worktree's log says why its worker ended, and the worktree stays for its task.
+          const key = historyKey(ws.id)
           const entry = { at: now, kind: 'stop-worker', text: `Stopped this worktree's worker, which started over a limit: ${o.reason}` }
           await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
+          kept[ws.path] = { dispatchId: o.dispatchId, at: now }
         }
+        await deps.store.set(keptKey, kept as unknown as JsonValue)
         view.warnings.push(...stopped.map((o) => `Stopped worker dispatch:${o.dispatchId}${o.taskId ? ` (task ${o.taskId})` : ''}: ${o.reason}`))
         if (deps.tellSupervisor && supervisor) {
           await deps.tellSupervisor(repoKey, info.root, supervisor, stoppedMessage(stopped))
@@ -627,6 +655,17 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     } else if (toStop.length > 0) {
       view.warnings.push(...toStop.map((o) => `Dry run: with autopilot on, Matriarch would stop worker dispatch:${o.dispatchId}: ${o.reason}`))
     }
+    // A stopped worker's worktree is kept for its task, as the supervisor was told, until a newer
+    // worker runs there, the worktree is gone, or a week passed.
+    const keptKey = `stopped:${repoKey}`
+    const keptBefore = ((await deps.store.get(keptKey)) as Record<string, StoppedWorktree> | null) ?? {}
+    const stoppedWorktrees: Record<string, StoppedWorktree> = {}
+    for (const [path, k] of Object.entries(keptBefore)) {
+      const ws = repoWorkspaces.find((w) => w.path === path)
+      const row = ws ? byWorktree.get(ws) : undefined
+      if (ws && now - k.at < STOPPED_KEEP_MS && (!row || row.dispatchId === k.dispatchId)) stoppedWorktrees[path] = k
+    }
+    if (JSON.stringify(stoppedWorktrees) !== JSON.stringify(keptBefore)) await deps.store.set(keptKey, stoppedWorktrees as unknown as JsonValue)
     const stillPending = acting ? unstopped : []
     if (JSON.stringify(stillPending) !== JSON.stringify(loadPendingStops(pendingRaw))) await deps.store.set(stopsKey, stillPending as unknown as JsonValue)
     if (JSON.stringify(starts) !== JSON.stringify(prevStarts) && starts) await deps.store.set(`starts:${repoKey}`, starts as unknown as JsonValue)
@@ -917,7 +956,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       const seen = ((await deps.store.get(finishedKey)) as Record<string, number> | null) ?? {}
       const still: Record<string, number> = {}
       for (const ws of repoWorkspaces) {
-        if (ws.path === info.root || merging.has(ws.path) || prBranches.has(branchName(ws.branch) ?? '')) continue
+        if (ws.path === info.root || merging.has(ws.path) || prBranches.has(branchName(ws.branch) ?? '') || stoppedWorktrees[ws.path]) continue
         const row = byWorktree.get(ws)
         if (!row?.runId || `run:${row.runId}` !== supervisor || row.live !== false) continue
         const act = deps.activity(ws.id, ws.path)

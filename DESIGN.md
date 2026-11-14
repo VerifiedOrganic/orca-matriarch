@@ -296,9 +296,10 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
 - **Cross-provider rule.** With `differentProviderThanAuthor`, reviewers on the author's agent
   are skipped, unless that would leave no reviewer.
 - **Light changes** (`review.light`). A PR gets a lighter review when every changed file matches
-  `paths`, none is in `ALWAYS_FULL_REVIEW` (agents' instructions and tools' config: `AGENTS.md`,
-  `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `*.prompt.md`, `.github/**`, `.claude/**` and the like,
-  in `src/config.ts`), no file was renamed or copied, no old path falls outside `paths`, and the
+  `paths`, none is in `ALWAYS_FULL_REVIEW` (what steers an agent once merged: `AGENTS.md`,
+  `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `*.prompt.md`, `.github/**`, `.claude/**`, `.orca/**` and
+  the other agents' folders, in `src/config.ts`; matched without regard to case, since on a
+  case-insensitive disk `claude.md` is `CLAUDE.md`), no file was renamed or copied, no old path falls outside `paths`, and the
   file list is whole. Then `crew: "one"` runs only the first blocking reviewer left after the
   cross-provider rule, and `"none"` skips the AI review (the merge reason says so).
   - GitLab's diff stats do not mark renames, so for a merge request that would be light the
@@ -371,9 +372,11 @@ read](#orca-sources-read)), so the hook never sees a supervisor in a chat, which
 For that and every other agent, the limits hold right after a start instead. Each tick judges the
 workers first seen in the Run's list in the order they started, as the hook would have
 (`overLimitStarts`). Under autopilot it stops each one that had no room (`orchestration
-worker-stop`, which fences the dispatch and keeps the worktree; `stop_unknown` counts as stopped),
-notes it in the worktree's activity log, and tells the supervisor which, why, and when to start it
-again. A stopped worker takes no room, and its start does not count against the day. A stop that
+worker-stop`, which fences the dispatch; `stop_unknown` counts as stopped), notes it in the
+worktree's activity log, and tells the supervisor which, why, and when to start it again. For the
+rest of that tick the stopped worker owns nothing, so a message for its PR goes to the
+supervisor. Its worktree is kept for the task (`stopped:<repo>`): the finished-worktree cleanup
+skips it until a newer worker has run there, or for a week. A stopped worker takes no room, and its start does not count against the day. A stop that
 fails is tried again while the worker runs, for 10 minutes. In dry run the board says what it
 would stop.
 
@@ -491,7 +494,7 @@ the supervisor chooses to ask.
   - not stacked on an open PR (see [Stacked PRs](#stacked-prs)), and its base known not to be
     one when the open list was cut short;
   - the forge reports it can merge;
-  - no file matches `requireHuman`. If the file list was cut short, the gate assumes it does.
+  - no file matches `requireHuman` (in any case). If the file list was cut short, the gate assumes it does.
 - **Manual.** `ready`, plus one notification per commit.
 - **Auto: a merge train per base branch.**
   - Merges one PR at a time, in task order, then by PR number.
@@ -513,7 +516,8 @@ the supervisor chooses to ask.
 - **Cleanup.** The merged PR's worktree is removed once no worker is live there and nothing in it
   is uncommitted (`merge.removeWorktree`); the branch is deleted when `deleteBranch` is set. A
   worktree the supervisor's workers used that never became a PR goes an hour after its last
-  worker finished, when nothing in it is uncommitted or unpushed (`merge.removeFinishedWorktrees`).
+  worker finished, when nothing in it is uncommitted or unpushed (`merge.removeFinishedWorktrees`),
+  except one whose worker Matriarch stopped over a limit (see Worker limits).
 
 ## Forges: GitHub and GitLab
 

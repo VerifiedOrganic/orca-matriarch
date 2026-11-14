@@ -27,14 +27,19 @@ export function modelFlags(role: RoleSpec): string[] {
 }
 
 /**
- * Files that always get the full review crew, even when they match `review.light.paths`: agents'
- * instructions and settings, which steer the supervisor and the workers once merged, and anything
- * under a tool's config folder (.github holds CI and Copilot's instructions).
+ * Files that always get the full review crew, even when they match `review.light.paths`: what
+ * steers an agent once merged. Coding agents read these as instructions or settings, so a change
+ * to one changes what the supervisor, the workers and the reviewers do next, and a light review is
+ * no place for it. Matched without regard to case (glob.ts): on the case-insensitive disks the
+ * agents work on, `claude.md` is `CLAUDE.md`.
  */
 export const ALWAYS_FULL_REVIEW: readonly string[] = [
-  '**/AGENTS.md', '**/CLAUDE.md', '**/GEMINI.md', '**/SKILL.md', '**/*.prompt.md', '**/copilot-instructions.md',
-  '**/.cursorrules', '**/.windsurfrules',
-  '**/.claude/**', '**/.cursor/**', '**/.github/**', '**/.agents/**', '**/.codex/**', '**/.omp/**', '**/.opencode/**'
+  // Instruction files read from the project, at any depth.
+  '**/AGENTS.md', '**/CLAUDE.md', '**/GEMINI.md', '**/SKILL.md', '**/CONVENTIONS.md', '**/*.prompt.md', '**/copilot-instructions.md',
+  '**/.cursorrules', '**/.windsurfrules', '**/.clinerules', '**/.aider*',
+  // Agents' and tools' own folders (.github holds CI and Copilot's instructions; .orca, Orca's and this plugin's).
+  '**/.claude/**', '**/.cursor/**', '**/.github/**', '**/.agents/**', '**/.codex/**', '**/.omp/**', '**/.opencode/**',
+  '**/.orca/**', '**/.gemini/**', '**/.windsurf/**', '**/.continue/**', '**/.roo/**', '**/.kiro/**', '**/.junie/**', '**/.clinerules/**'
 ]
 
 export type Severity = 'blocker' | 'major' | 'minor' | 'nit'

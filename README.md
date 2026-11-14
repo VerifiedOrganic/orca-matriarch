@@ -220,10 +220,12 @@ A PR that changes only docs gets a lighter AI review.
 - **Settings:** **Light changes** under **Review** (default `**/*.md`, `**/*.rst`, `**/*.adoc`)
   and **A light change gets**: one reviewer (the first that must approve), or no AI review.
   Leave **Light changes** empty to review every PR in full.
-- **Always the full crew:** agents' instructions and tools' config, even when they match
-  (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `*.prompt.md`, `copilot-instructions.md`,
-  `.cursorrules`, `.windsurfrules`, and anything in a `.claude`, `.cursor`, `.github`, `.agents`,
-  `.codex`, `.omp` or `.opencode` folder); a PR that renames or copies a file, or whose old paths
+- **Always the full crew:** what steers an agent once merged, even when it matches, in any case
+  (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `CONVENTIONS.md`, `*.prompt.md`,
+  `copilot-instructions.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, `.aider*`, and
+  anything in a `.claude`, `.cursor`, `.github`, `.agents`, `.codex`, `.omp`, `.opencode`,
+  `.orca`, `.gemini`, `.windsurf`, `.continue`, `.roo`, `.kiro`, `.junie` or `.clinerules`
+  folder; `claude.md` counts as `CLAUDE.md`, as it does on a Mac's disk); a PR that renames or copies a file, or whose old paths
   are not light; a file list the forge cut short. GitLab's file list does not say what was
   renamed, so a merge request that looks light is read file by file, once per commit, and gets
   the full crew when that read fails.
@@ -290,9 +292,10 @@ and a running supervisor is told when you change them. They are held two ways:
   for Claude Code, and reports no tool calls at all for an agent in a chat, which is how the
   supervisor opens.
 - **Right after a start,** for every other case: with autopilot on, a worker whose start put the
-  project over a limit is stopped (`orca orchestration worker-stop`, which keeps its worktree) on
-  the next poll, and the supervisor is told to start it again when there is room. In dry run the
-  board says it would.
+  project over a limit is stopped (`orca orchestration worker-stop`) on the next poll, and the
+  supervisor is told to start it again when there is room. Its worktree is kept for that task:
+  the finished-worktree cleanup leaves it until a newer worker has run there, or for a week. In
+  dry run the board says it would.
 
 Only a start is judged. Workers already running when Matriarch first looks, or when you lower a
 limit, are never stopped; **Needs you** says the project is over instead. Your own sessions are
