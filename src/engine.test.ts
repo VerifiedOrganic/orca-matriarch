@@ -339,8 +339,6 @@ describe("a finished worktree that never became a PR", () => {
     h.advance(FINISHED_GRACE_MS)
     await tick(h.deps, { autopilot: true })
     assert.deepEqual(removed, [{ path: '/r/wt/gate', keepBranch: true }], "only the supervisor's own worktree")
-    const log = (h.store.get('track:ws-gate') as { log: { kind: string; text: string }[] }).log
-    assert.match(log.at(-1)?.text ?? '', /^Removed the worktree P1 gate review: its worker finished, it never became a PR/)
   })
 
   test('stays in dry run, while a worker is live there, and when the setting is off', async () => {

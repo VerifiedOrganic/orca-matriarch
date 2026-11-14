@@ -1263,11 +1263,9 @@ async function cleanupFinishedWorktrees(proj: ProjectTick): Promise<void> {
       const res = await deps.removeWorktree(ws.path, { keepBranch: true }).catch((error: Error) => ({ removed: false, reason: error.message }))
       if (res.removed) {
         deps.log(`${repoKey}: removed ${ws.name}, a finished worktree that never became a PR (${ws.path})`)
+        // Not in the worktree's activity log: its row leaves the board with the worktree, so
+        // nothing would show it. A merged PR's card stays, and carries its cleanup line.
         gone.add(ws.path)
-        // In its log too, as for a merged PR's worktree (kept a week, like any worktree's history).
-        const key = historyKey(ws.id)
-        const entry = { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: its worker finished, it never became a PR, and nothing in it was uncommitted or unpushed (its branch is kept)` }
-        await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
       } else still[ws.path] = since
     }
     if (JSON.stringify(still) !== JSON.stringify(seen)) await deps.store.set(finishedKey, still as unknown as JsonValue)
