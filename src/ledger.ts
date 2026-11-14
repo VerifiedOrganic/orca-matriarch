@@ -25,6 +25,22 @@ export interface Escalation {
   reason: string
 }
 
+/**
+ * The PR this one is stacked on: this PR's base was that PR's head branch. As last seen, so it is
+ * still known once the parent closed or the forge moved this PR's base.
+ */
+export interface StackParent {
+  number: number
+  headRef: string
+  /** The parent's head commit: its last one, once it merged. */
+  headSha: string
+  /** Where the parent merges, and so where this PR goes once the parent merged. */
+  baseRef: string
+  state: 'OPEN' | 'MERGED' | 'CLOSED'
+  /** This PR's head when Matriarch first saw the parent merged: until it moves, the branch still carries the parent's commits. */
+  headAtMerge?: string
+}
+
 export interface PrLedger {
   v: 1
   ci: Record<string, { at: number; signature: string }>
@@ -44,6 +60,12 @@ export interface PrLedger {
    * since. Work by another worker, or by this one after that, is a fix.
    */
   builder?: { address: string; done: boolean }
+  /** The PR this one is stacked on, while it is (see StackParent). */
+  stack?: StackParent
+  /** Bases moved after the parent merged, by the parent's number. */
+  retargets?: Record<string, { at: number; base: string }>
+  /** Requests to rebase off a merged parent's commits, by the parent's number, with the head they were sent for. */
+  restacks?: Record<string, { at: number; sha: string }>
 }
 
 export const ledgerKey = (repo: string, number: number): string => `pr:${repo}#${number}`
@@ -72,7 +94,24 @@ export function loadLedger(raw: unknown): PrLedger {
     merge: typeof merge.sha === 'string' ? (merge as unknown as PrLedger['merge']) : base.merge,
     heads: { ...rec(r.heads) },
     ...(r.ciSeen === true ? { ciSeen: true } : {}),
-    ...(typeof rec(r.builder).address === 'string' ? { builder: { address: rec(r.builder).address as string, done: rec(r.builder).done === true } } : {})
+    ...(typeof rec(r.builder).address === 'string' ? { builder: { address: rec(r.builder).address as string, done: rec(r.builder).done === true } } : {}),
+    ...(stackOf(r.stack) ? { stack: stackOf(r.stack)! } : {}),
+    ...(Object.keys(rec(r.retargets)).length ? { retargets: { ...rec(r.retargets) } } : {}),
+    ...(Object.keys(rec(r.restacks)).length ? { restacks: { ...rec(r.restacks) } } : {})
+  }
+}
+
+function stackOf(raw: unknown): StackParent | null {
+  const s = rec(raw) as Record<string, unknown>
+  if (typeof s.number !== 'number' || typeof s.headRef !== 'string' || typeof s.headSha !== 'string') return null
+  const state = s.state === 'MERGED' || s.state === 'CLOSED' ? s.state : 'OPEN'
+  return {
+    number: s.number,
+    headRef: s.headRef,
+    headSha: s.headSha,
+    baseRef: typeof s.baseRef === 'string' ? s.baseRef : '',
+    state,
+    ...(typeof s.headAtMerge === 'string' ? { headAtMerge: s.headAtMerge } : {})
   }
 }
 
@@ -118,6 +157,12 @@ export function record(ledger: PrLedger, action: Action, now: number): PrLedger 
       break
     case 'notify':
       next.notified[action.key] = now
+      break
+    case 'retarget':
+      next.retargets = { ...next.retargets, [action.parent]: { at: now, base: action.base } }
+      break
+    case 'send-restack':
+      next.restacks = { ...next.restacks, [action.parent]: { at: now, sha: action.sha } }
       break
   }
   return next

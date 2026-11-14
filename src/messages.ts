@@ -51,6 +51,23 @@ export function rebaseMessage(pr: PrSnapshot, round: number, max: number): Messa
 }
 
 /**
+ * A PR stacked on another that merged: its branch still has that PR's commits under its own, and
+ * after a squash or rebase merge they look new to the base. Only this branch's own commits go on.
+ */
+export function restackMessage(pr: PrSnapshot, parent: number, parentSha: string, base: string): Message {
+  return {
+    subject: `#${parent} merged: rebase #${pr.number} onto ${base}`,
+    body: [
+      `PR #${pr.number} "${pr.title}" (branch ${pr.headRef}) was stacked on #${parent}, which merged into ${base}. The PR now merges into ${base}, but the branch still carries the commits of #${parent}.`,
+      '',
+      `Rebase only this branch's own commits onto ${base}, leaving out those of #${parent} (its last commit was ${short(parentSha)}):`,
+      `  git fetch origin && git rebase --onto origin/${base} ${parentSha} && git push --force-with-lease`,
+      'Resolve any conflict keeping the intent of this branch, and run the checks before you push. Do not open a new PR.'
+    ].join('\n')
+  }
+}
+
+/**
  * A branch that is only behind its base, when its forge cannot update it the way the project
  * asked (GitLab has no API to merge the base into a branch): the worker brings it up to date.
  */

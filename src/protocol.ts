@@ -90,6 +90,8 @@ export interface TrackView {
     ci: CiState
     failing: string[]
     openThreads: number
+    /** The PR this one is stacked on: its base is that PR's branch, so it merges after it. */
+    stackedOn?: number
   } | null
   owner: { agent: string | null; model: string | null; activity: Activity; supervised: boolean } | null
   lane: Lane

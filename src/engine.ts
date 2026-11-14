@@ -10,7 +10,7 @@ import type { Executor } from './executor.ts'
 import { forgeKind, forgeTerms, type ForgeKind, type ForgeReader } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
-import { ledgerKey, loadLedger, record, roundsUsed, type PrLedger } from './ledger.ts'
+import { ledgerKey, loadLedger, record, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
 import { MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
@@ -165,6 +165,10 @@ export function describe(action: Action, forge: ForgeKind = 'github'): string {
       return `escalate to ${action.to === 'human' ? 'you' : 'the supervisor'}: ${action.reason}`
     case 'notify':
       return `notify: ${action.title}`
+    case 'retarget':
+      return `move the base from ${action.from} to ${action.base}: #${action.parent}, which it was stacked on, merged`
+    case 'send-restack':
+      return `ask the worker to rebase onto ${action.base}, off the commits of #${action.parent}, which merged`
   }
 }
 
@@ -190,6 +194,10 @@ function markFor(action: Action, at: number, forge: ForgeKind = 'github'): Mark 
       return { at, kind: action.to === 'human' ? 'escalate-human' : 'escalate-supervisor', label: action.reason }
     case 'notify':
       return { at, kind: 'notify', label: action.title }
+    case 'retarget':
+      return { at, kind: 'update-branch', label: `base moved to ${action.base} (#${action.parent} merged)` }
+    case 'send-restack':
+      return { at, kind: 'rebase-sent', label: `rebase off #${action.parent} requested` }
   }
 }
 
@@ -243,6 +251,44 @@ async function snapshotFor(
   const { pr } = await reader.detail(repo.ref, summary.number)
   if (pr) await deps.store.set(key, { snap: pr, rollup: summary.rollup, checksTag: summary.checksTag ?? null, baseSha } as unknown as JsonValue)
   return pr
+}
+
+/** A PR as a possible parent of a stacked one: what the head-branch index keeps. */
+interface StackCandidate {
+  number: number
+  headRef: string
+  headSha: string
+  baseRef: string
+}
+
+/**
+ * The PR a PR is stacked on, as its ledger should now remember it: one whose head branch is this
+ * PR's base. A parent that left the open list is looked up once, from the state Matriarch read
+ * when it closed, or from the forge; a PR moved off a parent that is still open is not stacked.
+ */
+async function followStack(
+  deps: EngineDeps,
+  repo: RepoInfo,
+  snap: PrSnapshot,
+  ledger: PrLedger,
+  open: { byHead: Map<string, StackCandidate>; byNumber: Map<number, StackCandidate> },
+  closed: Map<number, PrSnapshot>,
+  defaultBase: string | null
+): Promise<StackParent | undefined> {
+  const st = ledger.stack
+  const parent = open.byHead.get(snap.baseRef)
+  if (parent && parent.number !== snap.number) {
+    return { number: parent.number, headRef: parent.headRef, headSha: parent.headSha, baseRef: parent.baseRef || st?.baseRef || defaultBase || '', state: 'OPEN' }
+  }
+  if (!st) return undefined
+  // Still open, and this PR no longer points at its branch: someone moved it.
+  if (open.byNumber.has(st.number)) return undefined
+  if (st.state !== 'OPEN') return st
+  const kept = closed.get(st.number) ?? ((await deps.store.get(`snap:${repo.key}#${st.number}`)) as { snap?: PrSnapshot } | null)?.snap
+  const reader = readerFor(deps, repo.ref)
+  const final = kept && kept.state !== 'OPEN' ? kept : reader ? (await reader.detail(repo.ref, st.number).catch(() => ({ pr: null }))).pr : null
+  if (!final || final.state === 'OPEN') return st
+  return { ...st, headSha: final.headSha || st.headSha, baseRef: final.baseRef || st.baseRef, state: final.state, ...(final.state === 'MERGED' ? { headAtMerge: snap.headSha } : {}) }
 }
 
 function toNumbers(v: unknown): number[] {
@@ -614,11 +660,30 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
 
     const seenWorkspaces = new Set<string>()
 
+    // Stacked PRs: one whose base is another open PR's head branch merges only after it, and is
+    // moved and rebased once that one merged. Open PRs by head branch, from their detail where
+    // Matriarch follows them, else from the list; closed ones from what was read as they closed.
+    const byHead = new Map<string, StackCandidate>()
+    for (const { snap: s } of items) if (s.state === 'OPEN') byHead.set(s.headRef, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef })
+    for (const s of summaries) if (!byHead.has(s.headRef)) byHead.set(s.headRef, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef ?? '' })
+    const openStack = { byHead, byNumber: new Map([...byHead.values()].map((c) => [c.number, c])) }
+    const closedSnaps = new Map(items.filter((i) => i.snap.state !== 'OPEN').map((i) => [i.snap.number, i.snap]))
+
     for (const item of items) {
       const { snap } = item
       const ws = item.ws
       const worker = ws ? byWorktree.get(ws) : undefined
       const owner = ws ? ownerFor(ws, worker, deps.activity(ws.id, ws.path)) : null
+      if (snap.state === 'OPEN' && listed) {
+        const st = await followStack(deps, info, snap, item.ledger, openStack, closedSnaps, base?.name ?? null)
+        if (JSON.stringify(st ?? null) !== JSON.stringify(item.ledger.stack ?? null)) {
+          const next: PrLedger = { ...item.ledger }
+          if (st) next.stack = st
+          else delete next.stack
+          item.ledger = next
+          await deps.store.set(ledgerKey(repoKey, snap.number), next as unknown as JsonValue)
+        }
+      }
       // Who built the PR: the first worker seen on it, and whether it finished a turn since.
       if (owner?.address) {
         const b = item.ledger.builder
@@ -643,6 +708,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         // Known only for the default branch: GitHub's rollup is null when its head has no checks at all.
         baseHasChecks: base && base.name === snap.baseRef ? base.rollup !== null : undefined,
         ownersKnown,
+        stack: item.ledger.stack ?? null,
         now
       })
 
@@ -741,7 +807,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
           base: snap.baseRef,
           ci: snap.ci,
           failing: snap.checks.filter((c) => c.state === 'failure').map((c) => c.name),
-          openThreads: actionableThreads(snap).length
+          openThreads: actionableThreads(snap).length,
+          ...(ledger.stack && snap.state === 'OPEN' && snap.baseRef === ledger.stack.headRef ? { stackedOn: ledger.stack.number } : {})
         },
         owner: owner ? { agent: owner.agent, model: owner.model, activity: owner.activity, supervised: owner.address !== null } : null,
         lane: p.lane,

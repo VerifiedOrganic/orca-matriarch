@@ -432,6 +432,7 @@ function card(t: TrackView): HTMLElement {
       el('span', { class: 'pill' }, lane.label),
       pr ? el('span', { class: 'pill', title: pr.failing.join(', ') }, `CI ${pr.ci}${pr.failing.length ? ` (${pr.failing.length})` : ''}`) : null,
       pr && pr.openThreads ? el('span', { class: 'pill' }, `${pr.openThreads} comment(s)`) : null,
+      pr?.stackedOn ? el('span', { class: 'pill', title: `Stacked on #${pr.stackedOn}: its base is that PR's branch, so it merges after it` }, `on #${pr.stackedOn}`) : null,
       t.owner ? el('span', { class: 'pill', title: t.owner.supervised ? 'Supervised orchestration worker' : 'Agent without orchestration supervision' },
         `${t.owner.agent ?? 'worker'}${t.owner.model ? ` · ${t.owner.model}` : ''} · ${t.owner.activity}`) : null,
       t.review ? el('span', { class: 'pill' }, `review r${t.review.round} ${t.review.verdict ?? t.review.status}`) : null),

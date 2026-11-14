@@ -28,6 +28,11 @@ It starts in **dry run**: it watches and shows what it would do until you turn o
 5. **Merge.** Matriarch marks the PR ready for you to merge, or merges the reviewed commit itself
    if the project allows it.
 
+A PR **stacked** on another, whose base is that PR's branch, goes through CI and review as usual
+but waits to merge until its parent has. Then it is moved to where its parent merged (when the
+forge left it on the parent's branch) and its worker is asked to rebase it off the parent's
+commits; it merges once that is pushed. If the parent closes without merging, it needs you.
+
 Anything that needs a decision goes to the supervisor first, then to you after a while. The
 supervisor is told to keep the run moving without you, and Matriarch never answers an agent's
 permission prompt for you: those show as **Needs you**.
@@ -175,12 +180,14 @@ Supervisor and worker launches are not changed.
 | `orca terminal close` | a reviewer that started without its lockdown is stopped |
 | `gh api repos/<repo>/pulls/<n>/reviews` | autopilot, when **Where reviews go** includes the PR: one comment review per round |
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
+| `gh pr edit <n> --base <branch>` | autopilot: move a stacked PR to where its parent merged, when GitHub left it on the parent's branch |
 | `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `glab api --hostname <host> graphql` | GitLab: each check, the open merge requests with their pipeline status and the default branch's; a merge request's jobs, threads, files and approvals when it changed |
 | `glab api --hostname <host> projects/<project>/merge_requests/<n>` | GitLab: only while it has not worked out whether a merge request can merge, which this read asks it to |
 | `glab api --hostname <host> projects/<project>/jobs/<id>/trace` | GitLab, autopilot: the tail of a failed job's log, for the worker |
 | `glab api --hostname <host> -X POST …/merge_requests/<n>/notes` | GitLab, autopilot, when **Where reviews go** includes the PR: one note per round |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | GitLab, autopilot: rebase a merge request that is behind its base |
+| `glab api --hostname <host> -X PUT …/merge_requests/<n> -f target_branch=<branch>` | GitLab, autopilot: move a stacked merge request to where its parent merged |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | GitLab, autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
 | `git -C <worktree> status --porcelain`, `orca worktree rm --delete-branch` | autopilot: remove a merged PR's worktree when nothing runs there and nothing is uncommitted |
 | `sqlite3 'file:…?mode=ro'` | read your Orca settings (below), read-only |

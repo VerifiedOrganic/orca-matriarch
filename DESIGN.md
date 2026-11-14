@@ -123,14 +123,24 @@ evaluates in this order:
 
 1. merged / closed / draft
 2. merge already requested for this commit → `merging`
-3. worker active → `working` (never interrupt a turn)
-4. worker waiting for input → `needs-you`, escalated to the supervisor first
-5. CI failing (after every check finished) → `fixing-ci`
-6. merge conflict → `fixing-conflict`
-7. unresolved human or bot review threads, or a human "changes requested" → `fixing-review`
-8. CI pending or cancelled → `awaiting-ci`
-9. AI review on this commit: not started → start; running → `ai-review`; changes requested → `fixing-review`
-10. merge gate → `ready` (manual), or `merging` (auto, one merge at a time per base branch)
+3. stacked on a PR that merged, still pointing at its branch → `retarget` to where it merged
+4. worker active → `working` (never interrupt a turn)
+5. worker waiting for input → `needs-you`, escalated to the supervisor first
+6. stacked on a PR that merged, the branch not pushed since → its owner is asked once to rebase
+   off the parent's commits (`git rebase --onto origin/<base> <parent head>`) → `fixing-conflict`
+7. CI failing (after every check finished) → `fixing-ci`
+8. merge conflict → `fixing-conflict`
+9. unresolved human or bot review threads, or a human "changes requested" → `fixing-review`
+10. CI pending or cancelled → `awaiting-ci`
+11. AI review on this commit: not started → start; running → `ai-review`; changes requested → `fixing-review`
+12. merge gate → `ready` (manual), or `merging` (auto, one merge at a time per base branch). A PR
+    whose base is another open PR's head branch waits there (`ready`, "stacked on #n") until that
+    one merges; one whose parent closed without merging needs you.
+
+A PR is stacked when its base is the head branch of another PR Matriarch sees (open, or closed
+within the last six hours); a PR into a release branch is not. The ledger keeps the parent, so
+the PR stays stacked after the parent leaves the board, and a parent Matriarch never followed is
+read once when it leaves the open list.
 
 ### Fix rounds and escalation
 

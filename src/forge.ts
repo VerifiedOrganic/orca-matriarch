@@ -68,6 +68,8 @@ export interface ForgeActions {
   publishReview(repo: RepoRef, pr: PrSnapshot, sha: string, review: ForgeReview): Promise<Outcome>
   /** The last lines of each failed check's log, by check name, where the forge keeps one. */
   failedLogs(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
+  /** Points a PR at another base branch: a stacked PR, once the PR it was stacked on merged. */
+  retarget(repo: RepoRef, pr: PrSnapshot, base: string): Promise<Outcome>
 }
 
 export interface Forge extends ForgeReader, ForgeActions {

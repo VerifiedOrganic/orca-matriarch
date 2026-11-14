@@ -510,6 +510,7 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
         sha,
         ...(deleteBranch ? ['--delete-branch'] : [])
       ]),
+    retarget: (repo, pr, base) => run(['pr', 'edit', String(pr.number), '--repo', repoArg(repo), '--base', base]),
     async failedLogs(repo, checks) {
       const logs: Record<string, string> = {}
       for (const { name, jobId } of checks.slice(0, 5)) {

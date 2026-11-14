@@ -7,7 +7,7 @@ import type { MatriarchConfig, ReviewerSpec } from './config.ts'
 import { forgeTerms } from './forge.ts'
 import { actionableThreads, type CheckInfo, type PrSnapshot, type ThreadInfo } from './github.ts'
 import { matchingGlobs } from './glob.ts'
-import { roundsUsed, type PrLedger } from './ledger.ts'
+import { roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
 
 export type Lane =
   | 'building' // a worktree whose agent is working, no PR yet
@@ -51,6 +51,10 @@ export type Action =
   | { kind: 'merge'; sha: string; method: 'squash' | 'merge' | 'rebase' }
   | { kind: 'escalate'; to: 'supervisor' | 'human'; key: string; reason: string; address: string | null }
   | { kind: 'notify'; key: string; title: string; body: string }
+  /** Points the PR at its merged parent's base, when the forge left it on the parent's branch. */
+  | { kind: 'retarget'; sha: string; parent: number; from: string; base: string }
+  /** Asks the branch's owner to rebase it off a merged parent's commits. */
+  | { kind: 'send-restack'; to: string; sha: string; parent: number; parentSha: string; base: string }
 
 export interface PlanInput {
   pr: PrSnapshot
@@ -69,6 +73,8 @@ export interface PlanInput {
   ownersKnown?: boolean
   /** Whether the base branch's head has any checks; false means the repository runs no CI there. */
   baseHasChecks?: boolean
+  /** The PR this one is stacked on (its base is, or was, that PR's head branch), from the ledger. */
+  stack?: StackParent | null
   now: number
 }
 
@@ -181,6 +187,8 @@ function workingLane(input: PlanInput): Plan {
   const draft = pr.draft ? 'draft PR; ' : ''
   if (ledger.ci[sha]) return { lane: 'fixing-ci', reason: `${draft}${who} is fixing the failing checks it was sent`, actions: [] }
   if (ledger.conflicts[sha]) return { lane: 'fixing-conflict', reason: `${draft}${who} is resolving the conflicts with ${pr.baseRef}`, actions: [] }
+  const st = input.stack
+  if (st && ledger.restacks?.[st.number]?.sha === sha) return { lane: 'fixing-conflict', reason: `${draft}${who} is rebasing it onto ${pr.baseRef}, off the commits of #${st.number}, which merged`, actions: [] }
   const review = ledger.reviews[sha]
   if ((review?.verdict === 'changes' && (review.delivered || review.published)) || ledger.comments[sha]) {
     return { lane: 'fixing-review', reason: `${draft}${who} is addressing the review`, actions: [] }
@@ -241,10 +249,32 @@ export function plan(input: PlanInput): Plan {
     }
   }
 
+  // A PR stacked on one that merged, still pointing at that PR's branch (the forge moves it only
+  // when the branch goes): it is moved to where its parent went. A forge action, not the worker's.
+  const st = input.stack
+  if (st?.state === 'MERGED' && pr.baseRef === st.headRef) {
+    if (!st.baseRef) {
+      const why = `#${st.number}, which this PR is stacked on, merged, and Matriarch cannot tell where it merged to: point this PR at that branch`
+      return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `stack-base:${st.number}`, `${pr.repo} #${pr.number} needs you`, why) }
+    }
+    if (ledger.retargets?.[st.number]) return { lane: 'awaiting-ci', reason: `#${st.number} merged; base moved to ${st.baseRef}, waiting for ${forgeTerms(pr.forge).name} to show it`, actions: [] }
+    return {
+      lane: 'awaiting-ci',
+      reason: `#${st.number} merged; moving the base from ${st.headRef} to ${st.baseRef}`,
+      actions: [{ kind: 'retarget', sha, parent: st.number, from: st.headRef, base: st.baseRef }]
+    }
+  }
+
   if (owner?.activity === 'working') return workingLane(input)
   if (owner?.activity === 'waiting' || owner?.activity === 'blocked') {
     const e = escalate(input, `input:${owner.since}`, `the worker on #${pr.number} is waiting for input`)
     return { lane: 'needs-you', reason: `the worker is ${owner.activity} on input`, actions: e.actions }
+  }
+
+  // 0. Its parent merged: the branch still carries the parent's commits until it is rebased off them.
+  if (st?.state === 'MERGED' && st.headAtMerge === sha) {
+    const step = restackStep(input, st)
+    if (step) return step
   }
 
   // 1. CI failing, once every check finished, so one message carries every failure.
@@ -311,6 +341,32 @@ export function plan(input: PlanInput): Plan {
   return review.pre.length > 0 ? { ...gate, actions: [...review.pre, ...gate.actions] } : gate
 }
 
+/** What the owner of a stacked PR runs once its parent merged: its own commits onto the new base. */
+export function restackCommand(base: string, parentSha: string): string {
+  return `git fetch origin && git rebase --onto origin/${base} ${parentSha} && git push --force-with-lease`
+}
+
+/**
+ * Step 0, for a PR whose parent merged while this branch still carries the parent's commits (a
+ * squash or rebase merge leaves them looking new): once, the owner is asked to rebase off them.
+ * Nothing else happens until the branch moves; then the PR goes on like any other.
+ */
+function restackStep(input: PlanInput, st: StackParent): Plan | null {
+  const { pr, owner, ledger } = input
+  const what = `#${st.number}, which this PR was stacked on, merged into ${pr.baseRef}`
+  if (ledger.restacks?.[st.number]) return { lane: 'fixing-conflict', reason: `${what}; waiting for the branch to be rebased off its commits`, actions: [] }
+  if (!owner?.address) {
+    if (input.ownersKnown === false) return { lane: 'fixing-conflict', reason: `${what}; waiting to see Orca's workers again`, actions: [] }
+    const e = escalate(input, `restack:${st.number}`, `${what}, and branch ${pr.headRef} still carries its commits, with no supervised worker on it. Rebase it off them in its worktree: ${restackCommand(pr.baseRef, st.headSha)}`)
+    return { lane: e.toHuman ? 'needs-you' : 'fixing-conflict', reason: `${what}; no worker owns this branch to rebase it`, actions: e.actions }
+  }
+  return {
+    lane: 'fixing-conflict',
+    reason: `${what}; asking the worker to rebase off its commits`,
+    actions: [{ kind: 'send-restack', to: owner.address, sha: pr.headSha, parent: st.number, parentSha: st.headSha, base: pr.baseRef }]
+  }
+}
+
 /**
  * Step 5: the crew's part. A plan when the review decides the lane (start, running, failed,
  * changes requested); otherwise null and any actions to run before the merge gate.
@@ -368,6 +424,15 @@ function mergeGate(input: PlanInput): Plan {
   const { pr, ledger, config } = input
   const sha = pr.headSha
   const { merge } = config
+  // Merging a stacked PR now would merge it into its parent's branch: it waits for its parent.
+  const st = input.stack
+  if (st && pr.baseRef === st.headRef) {
+    if (st.state === 'OPEN') return { lane: 'ready', reason: `stacked on #${st.number}; merges after it`, actions: [] }
+    if (st.state === 'CLOSED') {
+      const why = `stacked on #${st.number}, which closed without merging: retarget it or close it`
+      return { lane: 'needs-you', reason: why, actions: notifyOnce(ledger, `stack-closed:${st.number}`, `${pr.repo} #${pr.number} needs you`, why) }
+    }
+  }
   if (merge.requireHuman.length > 0) {
     const hits = matchingGlobs(merge.requireHuman, pr.files)
     if (hits.length > 0 || pr.filesTruncated) {

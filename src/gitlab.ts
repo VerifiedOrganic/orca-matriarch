@@ -446,6 +446,7 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
       ]),
     // Asynchronous, like gh pr update-branch: GitLab answers at once and rebases in the background.
     updateBranch: (repo, pr) => act(repo, 'rebase', ['-X', 'PUT', rest(projectPath(repo), `merge_requests/${pr.number}/rebase`)]),
+    retarget: (repo, pr, base) => act(repo, 'update', ['-X', 'PUT', rest(projectPath(repo), `merge_requests/${pr.number}`), '-f', `target_branch=${base}`]),
     publishReview: (repo, pr, _sha, review) =>
       act(repo, 'notes', ['-X', 'POST', rest(projectPath(repo), `merge_requests/${pr.number}/notes`), '-f', `body=${reviewNote(review)}`]),
     async failedLogs(repo, checks) {

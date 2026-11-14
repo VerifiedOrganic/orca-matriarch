@@ -7,7 +7,7 @@ import type { Exec } from './exec.ts'
 import { forgeKind, forgeTerms, type ForgeActions, type ForgeKind, type Outcome, type RepoRef } from './forge.ts'
 import { createGitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
-import { ciFailureMessage, commentsMessage, draftMessage, escalationMessage, rebaseMessage, updateMessage } from './messages.ts'
+import { ciFailureMessage, commentsMessage, draftMessage, escalationMessage, rebaseMessage, restackMessage, updateMessage } from './messages.ts'
 import { sendMessage, type OrcaCli } from './orca-cli.ts'
 import type { Action } from './plan.ts'
 import { findingsMessage, githubReview } from './review.ts'
@@ -141,6 +141,12 @@ export function createExecutor(deps: ExecutorDeps): Executor {
         }
         case 'merge':
           return forgeOf(repo).merge(repo, pr, action.sha, action.method, config.merge.deleteBranch)
+        case 'retarget':
+          return forgeOf(repo).retarget(repo, pr, action.base)
+        case 'send-restack': {
+          const m = restackMessage(pr, action.parent, action.parentSha, action.base)
+          return send(ctx, action.to, m.subject, m.body)
+        }
         case 'escalate': {
           if (action.to === 'supervisor' && action.address) {
             // Asking about a quiet draft is a routine question, sent as plain mail, not an escalation.
