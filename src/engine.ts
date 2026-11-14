@@ -20,7 +20,7 @@ import { checkKey, keepChecks, ledgerKey, loadLedger, record, recordRefusedRerun
 import { countStarts, dayOf, isWorking, loadPendingStops, loadStarts, overLimitStarts, STOP_RETRY_MS, stoppedMessage, type LimitState, type PendingStop } from './limits.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
-import { lightPaths, MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
+import { lightPaths, MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner, type Plan } from './plan.ts'
 import { supervisorTagPrefix } from './supervisor.ts'
 import type { AdvisorView, Board, LogEntry, Mark, RepoView, TrackView } from './protocol.ts'
 
@@ -507,14 +507,107 @@ function toNumbers(v: unknown): number[] {
   return Array.isArray(v) ? v.filter((n): n is number => typeof n === 'number') : []
 }
 
+/** What one tick knows before it looks at each project: set once, read by every project's steps. */
+interface TickContext {
+  deps: EngineDeps
+  opts: TickOptions
+  board: Board
+  now: number
+  since: number
+  maxAge: number
+  /** Marks for each PR's timeline from review rounds that finished this tick, by `repo#n`. */
+  crewMarks: Map<string, Mark[]>
+  workers: WorkerRow[]
+  /** Orca's worker list could be read: without it every owned PR would look orphaned. */
+  ownersKnown: boolean
+  /** When the worker list was asked for: a worker started after this may not be in it yet. */
+  workersAt: number
+  byWorktree: { get(ws: Workspace): WorkerRow | undefined }
+  /** Projects whose advisor this tick stepped or stopped; the others are polled after the loop. */
+  advised: Set<string>
+}
+
+/** A PR this tick plans for: its snapshot, its ledger, and its worktree when it has one here. */
+interface TickItem {
+  snap: PrSnapshot
+  ledger: PrLedger
+  ws: Workspace | undefined
+}
+
+/** One project's part of a tick, filled in step by step (each step says what it adds). */
+interface ProjectTick {
+  t: TickContext
+  info: RepoInfo
+  repoKey: string
+  repoWorkspaces: Workspace[]
+  cfg: ConfigResult
+  config: MatriarchConfig
+  kind: ForgeKind
+  terms: ReturnType<typeof forgeTerms>
+  forge: ForgeReader | null
+  supervisor: string | null
+  pending: { tag?: string; at?: number } | null
+  view: RepoView
+  free: number | null
+  limits: MatriarchConfig['limits']
+  lowDisk: boolean
+  whyNot: string | null
+  acting: boolean
+  byBranch: Map<string, Workspace>
+  // holdLimits
+  live: number
+  startsToday: number
+  stoppedWorktrees: Record<string, StoppedWorktree>
+  // listPrs
+  summaries: PrSummary[]
+  viewer: string
+  listed: boolean
+  base: { name: string; sha: string | null; rollup: string | null } | null
+  truncatedList: boolean
+  detailAge: number
+  follows: (s: PrSummary, who: string) => boolean
+  unknownWs: Set<string>
+  // readOpenPrs
+  trackedKey: string
+  tracked: number[]
+  open: Set<number>
+  items: TickItem[]
+  mergeBusy: Set<string>
+  runningReviews: number
+  // the cleanups
+  gone: Set<string>
+  cleanedUp: Map<number, LogEntry>
+  // prepareTracks
+  seenWorkspaces: Set<string>
+  firstOn: Map<string, number>
+  openStack: { parents: Map<string, StackCandidate>; all: Map<number, StackCandidate> }
+  closedSnaps: Map<number, PrSnapshot>
+}
+
+/** One engine tick: every opted-in project, step by step, then what is looked after across them. */
 export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> {
   const now = deps.now()
   const since = now - (opts.windowMs ?? 24 * 3600_000)
-  const maxAge = opts.detailMaxAgeMs ?? 10 * 60_000
   const board: Board = { ready: true, at: now, autopilot: opts.autopilot, since, repos: [], tracks: [], attention: [], errors: [], rate: null }
+  const crewMarks = await pollCrew(deps, board, now)
+  const workspaces = await listWorkspaces(deps, board)
+  if (!workspaces) return board
+  const repos = await groupByProject(deps, workspaces)
+  const t: TickContext = { deps, opts, board, now, since, maxAge: opts.detailMaxAgeMs ?? 10 * 60_000, crewMarks, ...(await indexWorkers(deps, board)), advised: new Set() }
+  for (const [repoKey, { info, workspaces: repoWorkspaces }] of repos) await tickProject(t, repoKey, info, repoWorkspaces)
+  await afterProjects(t, workspaces)
+  board.tracks.sort(
+    (a, b) =>
+      LANE_ORDER.indexOf(a.lane) - LANE_ORDER.indexOf(b.lane) ||
+      a.repo.localeCompare(b.repo) ||
+      (a.pr?.number ?? Infinity) - (b.pr?.number ?? Infinity) ||
+      a.workspace.name.localeCompare(b.workspace.name)
+  )
+  return board
+}
 
-  // Review rounds that finished since the last tick update their PR's ledger first, so the
-  // planner below sees the crew's outcome.
+/** Review rounds that finished since the last tick update their PR's ledger first, so the planner sees the crew's outcome. */
+async function pollCrew(deps: EngineDeps, board: Board, now: number): Promise<Map<string, Mark[]>> {
   const crewMarks = new Map<string, Mark[]>()
   const finished = deps.crew ? await deps.crew.poll().catch((error: Error) => (board.errors.push(`Review crew: ${error.message}`), [])) : []
   for (const run of finished) {
@@ -532,7 +625,11 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     const label = run.outcome ? run.outcome.summary : `review crew failed: ${run.error ?? 'unknown'}`
     crewMarks.set(`${run.repo}#${run.number}`, [...(crewMarks.get(`${run.repo}#${run.number}`) ?? []), { at: now, kind: 'review-done', label }])
   }
+  return crewMarks
+}
 
+/** Orca's workspaces on this machine, without review worktrees; null when Orca could not say. */
+async function listWorkspaces(deps: EngineDeps, board: Board): Promise<Workspace[] | null> {
   let workspaces: Workspace[]
   try {
     // Plugins run git on this machine, so workspaces on SSH hosts or paired servers are skipped.
@@ -542,9 +639,13 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     )
   } catch (error) {
     board.errors.push(`Could not list Orca workspaces: ${(error as Error).message}`)
-    return board
+    return null
   }
+  return workspaces
+}
 
+/** The workspaces by the project they belong to. */
+async function groupByProject(deps: EngineDeps, workspaces: readonly Workspace[]): Promise<Map<string, { info: RepoInfo; workspaces: Workspace[] }>> {
   const repos = new Map<string, { info: RepoInfo; workspaces: Workspace[] }>()
   for (const ws of workspaces) {
     const info = await deps.repoOf(ws.path).catch(() => null)
@@ -553,7 +654,11 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     entry.workspaces.push(ws)
     repos.set(info.key, entry)
   }
+  return repos
+}
 
+/** Orca's supervised workers, and each worktree's current one. */
+async function indexWorkers(deps: EngineDeps, board: Board): Promise<Pick<TickContext, 'workers' | 'ownersKnown' | 'workersAt' | 'byWorktree'>> {
   let workers: WorkerRow[] = []
   // Without the worker list every owned PR would look orphaned: send nothing to workers then.
   let ownersKnown = true
@@ -580,835 +685,970 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     }
   }
   const byWorktree = { get: (ws: Workspace): WorkerRow | undefined => workerKeys.get(ws.id) ?? workerKeys.get(`path:${ws.path}`) }
+  return { workers, ownersKnown, workersAt, byWorktree }
+}
 
-  // Projects whose advisor this tick stepped or stopped; the others are polled after the loop.
-  const advised = new Set<string>()
-  for (const [repoKey, { info, workspaces: repoWorkspaces }] of repos) {
-    let cfg: ConfigResult | null
-    try {
-      cfg = await deps.readConfig(info.root)
-    } catch (error) {
-      cfg = { config: defaultConfig(), errors: [`Could not read config: ${(error as Error).message}`], warnings: [] }
+/** One project's whole part of the tick, in order. */
+async function tickProject(t: TickContext, repoKey: string, info: RepoInfo, repoWorkspaces: Workspace[]): Promise<void> {
+  const cfg = await readProjectConfig(t, repoKey, info)
+  if (!cfg) return
+  const proj = await openProject(t, repoKey, info, repoWorkspaces, cfg)
+  await holdLimits(proj)
+  await handIssues(proj)
+  await listPrs(proj)
+  await stepAdvisor(proj)
+  await readOpenPrs(proj)
+  await readClosedPrs(proj)
+  await cleanupMergedWorktrees(proj)
+  await cleanupFinishedWorktrees(proj)
+  prepareTracks(proj)
+  for (const item of proj.items) await planAndAct(proj, item)
+  await logLeftoverCleanups(proj)
+  await worktreeTracks(proj)
+}
+
+/** The project's settings; null when it has none (Matriarch is off there), after stopping its advisor. */
+async function readProjectConfig(t: TickContext, repoKey: string, info: RepoInfo): Promise<ConfigResult | null> {
+  const { deps, advised } = t
+  let cfg: ConfigResult | null
+  try {
+    cfg = await deps.readConfig(info.root)
+  } catch (error) {
+    cfg = { config: defaultConfig(), errors: [`Could not read config: ${(error as Error).message}`], warnings: [] }
+  }
+  if (!cfg) {
+    // Matriarch is off here: an advisor still answering for it stops, and its worktree goes.
+    advised.add(repoKey)
+    if (deps.advisor?.stop) {
+      await deps.advisor
+        .stop({ repo: repoKey, root: info.root, supervisor: () => deps.supervisor(repoKey) })
+        .catch((error: Error) => deps.log(`${repoKey}: could not stop the advisor: ${error.message}`))
     }
-    if (!cfg) {
-      // Matriarch is off here: an advisor still answering for it stops, and its worktree goes.
-      advised.add(repoKey)
-      if (deps.advisor?.stop) {
-        await deps.advisor
-          .stop({ repo: repoKey, root: info.root, supervisor: () => deps.supervisor(repoKey) })
-          .catch((error: Error) => deps.log(`${repoKey}: could not stop the advisor: ${error.message}`))
-      }
-      continue
+    return null
+  }
+  return cfg
+}
+
+/** The project as the tick starts on it: its settings and forge, its supervisor, its board row, disk and whether Matriarch acts. */
+async function openProject(t: TickContext, repoKey: string, info: RepoInfo, repoWorkspaces: Workspace[], cfg: ConfigResult): Promise<ProjectTick> {
+  const { deps, opts, board, now, workers } = t
+  const config = cfg.config
+  const kind = forgeKind(info.ref)
+  const terms = forgeTerms(kind)
+  const forge = readerFor(deps, info.ref)
+  // The supervisor's Run: known, or found by the tag the launcher put in its objective.
+  let supervisor = await deps.supervisor(repoKey).catch(() => null)
+  // A Run Orca no longer knows is no supervisor: forget the link.
+  if (supervisor && deps.runExists && !(await deps.runExists(supervisor.replace(/^run:/, '')).catch(() => true))) {
+    await deps.store.set(`supervisor:${repoKey}`, '')
+    supervisor = null
+  }
+  let pending = (await deps.store.get(`supervisor:pending:${repoKey}`)) as { tag?: string; at?: number } | null
+  // A chat that never created its Run (closed, abandoned) stops counting as "starting" after 6 h.
+  if (pending?.tag && !supervisor && now - (pending.at ?? 0) > 6 * 3600_000) {
+    await deps.store.set(`supervisor:pending:${repoKey}`, null)
+    pending = null
+  }
+  if (!supervisor && deps.findRun) {
+    // The Run of the chat that was started, by its tag; else any supervisor Run of this
+    // project, so a tag that was lost (a restart, a cleared link) cannot orphan its Run.
+    const run = await deps.findRun(pending?.tag ?? supervisorTagPrefix(repoKey)).catch(() => null)
+    if (run) {
+      supervisor = `run:${run}`
+      await deps.store.set(`supervisor:${repoKey}`, supervisor)
     }
-    const config = cfg.config
-    const kind = forgeKind(info.ref)
-    const terms = forgeTerms(kind)
-    const forge = readerFor(deps, info.ref)
-    // The supervisor's Run: known, or found by the tag the launcher put in its objective.
-    let supervisor = await deps.supervisor(repoKey).catch(() => null)
-    // A Run Orca no longer knows is no supervisor: forget the link.
-    if (supervisor && deps.runExists && !(await deps.runExists(supervisor.replace(/^run:/, '')).catch(() => true))) {
-      await deps.store.set(`supervisor:${repoKey}`, '')
-      supervisor = null
-    }
-    let pending = (await deps.store.get(`supervisor:pending:${repoKey}`)) as { tag?: string; at?: number } | null
-    // A chat that never created its Run (closed, abandoned) stops counting as "starting" after 6 h.
-    if (pending?.tag && !supervisor && now - (pending.at ?? 0) > 6 * 3600_000) {
+  }
+  // A supervisor chat Orca says is gone cannot be opened; one that never created its Run is
+  // not starting anything either. Forget it, so the board offers a new chat.
+  const chat = (await deps.store.get(`supervisor:terminal:${repoKey}`)) as string | null
+  if (chat && deps.terminalGone && (await deps.terminalGone(chat).catch(() => false))) {
+    await deps.store.set(`supervisor:terminal:${repoKey}`, null)
+    if (!supervisor && pending?.tag) {
       await deps.store.set(`supervisor:pending:${repoKey}`, null)
       pending = null
     }
-    if (!supervisor && deps.findRun) {
-      // The Run of the chat that was started, by its tag; else any supervisor Run of this
-      // project, so a tag that was lost (a restart, a cleared link) cannot orphan its Run.
-      const run = await deps.findRun(pending?.tag ?? supervisorTagPrefix(repoKey)).catch(() => null)
-      if (run) {
-        supervisor = `run:${run}`
-        await deps.store.set(`supervisor:${repoKey}`, supervisor)
-      }
-    }
-    // A supervisor chat Orca says is gone cannot be opened; one that never created its Run is
-    // not starting anything either. Forget it, so the board offers a new chat.
-    const chat = (await deps.store.get(`supervisor:terminal:${repoKey}`)) as string | null
-    if (chat && deps.terminalGone && (await deps.terminalGone(chat).catch(() => false))) {
-      await deps.store.set(`supervisor:terminal:${repoKey}`, null)
-      if (!supervisor && pending?.tag) {
-        await deps.store.set(`supervisor:pending:${repoKey}`, null)
-        pending = null
-      }
-    }
-    const view: RepoView = {
+  }
+  const view: RepoView = {
+    repo: repoKey,
+    ...(kind === 'gitlab' ? { forge: kind } : {}),
+    root: info.root,
+    mergeMode: config.merge.mode,
+    supervisor: {
+      agent: config.supervisor.agent,
+      model: config.supervisor.model ?? null,
+      run: supervisor,
+      pending: Boolean(pending?.tag && !supervisor),
+      terminal: ((await deps.store.get(`supervisor:terminal:${repoKey}`)) as string | null) ?? null,
+      workers: supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor).length : 0,
+      maxWorkers: config.limits.maxWorkers,
+      maxStarts: config.limits.maxWorkerStartsPerDay
+    },
+    errors: [...cfg.errors],
+    warnings: [...cfg.warnings]
+  }
+  board.repos.push(view)
+  // A nearly full disk stalls builds, Orca's saves and Matriarch's own, with nothing on screen:
+  // say so once per board, before it fills. The same floor stops the supervisor starting workers.
+  const free = deps.freeSpace ? await deps.freeSpace(info.root).catch(() => null) : null
+  const limits = config.limits
+  const lowDisk = free !== null && limits.minFreeDiskGB > 0 && free < limits.minFreeDiskGB * 1024 ** 3
+  if (lowDisk && !board.attention.some((a) => a.key === 'disk')) {
+    board.attention.push({
+      key: 'disk',
       repo: repoKey,
-      ...(kind === 'gitlab' ? { forge: kind } : {}),
-      root: info.root,
-      mergeMode: config.merge.mode,
-      supervisor: {
-        agent: config.supervisor.agent,
-        model: config.supervisor.model ?? null,
-        run: supervisor,
-        pending: Boolean(pending?.tag && !supervisor),
-        terminal: ((await deps.store.get(`supervisor:terminal:${repoKey}`)) as string | null) ?? null,
-        workers: supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor).length : 0,
-        maxWorkers: config.limits.maxWorkers,
-        maxStarts: config.limits.maxWorkerStartsPerDay
-      },
-      errors: [...cfg.errors],
-      warnings: [...cfg.warnings]
-    }
-    board.repos.push(view)
-    // A nearly full disk stalls builds, Orca's saves and Matriarch's own, with nothing on screen:
-    // say so once per board, before it fills. The same floor stops the supervisor starting workers.
-    const free = deps.freeSpace ? await deps.freeSpace(info.root).catch(() => null) : null
-    const limits = config.limits
-    const lowDisk = free !== null && limits.minFreeDiskGB > 0 && free < limits.minFreeDiskGB * 1024 ** 3
-    if (lowDisk && !board.attention.some((a) => a.key === 'disk')) {
-      board.attention.push({
-        key: 'disk',
-        repo: repoKey,
-        alert: true,
-        message: `Only ${gb(free)} free on the disk with ${repoKey}. Agents' builds, Orca and Matriarch stop saving once it is full: free some space to keep the pod moving.`
-      })
-    }
-    // A config with errors may have lost a guard (a protected path, a reviewer): watch only.
-    const whyNot = notActing(opts.autopilot, deps, cfg.errors)
-    const acting = whyNot === null
-    if (opts.autopilot && cfg.errors.length > 0) view.errors.push('The config has errors, so Matriarch only watches this repository until they are fixed.')
-
-    // The supervisor's workers against the limits (limits.ts): on its row, and to the hook that
-    // refuses a start over one. A start counts once Matriarch first sees its worker in the Run's
-    // list; under autopilot, a worker whose start put the project over a limit is stopped.
-    const mine = supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor) : []
-    const prevStarts = loadStarts(await deps.store.get(`starts:${repoKey}`))
-    let starts = prevStarts
-    let fresh: WorkerRow[] = []
-    if (ownersKnown && supervisor) {
-      // A Run seen for the first time has no fresh workers: when they started cannot be told.
-      const known = prevStarts?.run === supervisor ? new Set(prevStarts.seen) : null
-      fresh = known ? mine.filter((w) => !known.has(w.dispatchId)) : []
-      starts = countStarts(prevStarts, supervisor, mine.map((w) => w.dispatchId), now)
-    }
-    let live = mine.filter(isWorking).length
-    const counted = starts && starts.day === dayOf(now) ? starts.count : 0
-    const over = overLimitStarts(fresh, { repo: repoKey, runningBefore: live - fresh.filter(isWorking).length, startsBefore: counted - fresh.length, freeBytes: free, limits })
-    // A stop that did not go through is tried again while its worker still runs.
-    const stopsKey = `overlimit:${repoKey}`
-    const pendingRaw = await deps.store.get(stopsKey)
-    const retrying = ownersKnown
-      ? loadPendingStops(pendingRaw).filter((p) => now - p.at < STOP_RETRY_MS && mine.some((w) => w.dispatchId === p.dispatchId && isWorking(w)))
-      : loadPendingStops(pendingRaw)
-    const toStop: PendingStop[] = [...retrying, ...over.filter((o) => !retrying.some((p) => p.dispatchId === o.dispatchId)).map((o) => ({ ...o, at: now }))]
-    const stopped: PendingStop[] = []
-    const unstopped: PendingStop[] = []
-    if (toStop.length > 0 && acting && deps.stopWorker) {
-      for (const o of toStop) {
-        if (opts.stillOn && !(await opts.stillOn().catch(() => false))) {
-          unstopped.push(o)
-          continue
-        }
-        const res = await deps.stopWorker(o.dispatchId).catch((error: Error) => ({ ok: false, error: error.message }))
-        if (res.ok) stopped.push(o)
-        else {
-          unstopped.push(o)
-          view.errors.push(`Could not stop worker dispatch:${o.dispatchId}, which started over a limit: ${res.error ?? 'failed'}`)
-        }
-      }
-      if (stopped.length > 0) {
-        deps.log(`${repoKey}: stopped ${stopped.map((o) => `dispatch:${o.dispatchId}`).join(', ')}, started over a limit`)
-        const keptKey = `stopped:${repoKey}`
-        const kept = ((await deps.store.get(keptKey)) as Record<string, StoppedWorktree> | null) ?? {}
-        for (const o of stopped) {
-          const row = mine.find((w) => w.dispatchId === o.dispatchId)
-          // Stopped: for the rest of this tick nothing is sent to it, and its PR's worker counts as gone.
-          if (row) Object.assign(row, { live: false, liveness: 'exited', state: 'stopped' })
-          const ws = row ? workspaceOf(row, repoWorkspaces) : undefined
-          if (!ws) continue
-          // Its worktree's log says why its worker ended, and the worktree stays for its task.
-          const key = historyKey(ws.id)
-          const entry = { at: now, kind: 'stop-worker', text: `Stopped this worktree's worker, which started over a limit: ${o.reason}` }
-          await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
-          kept[ws.path] = { dispatchId: o.dispatchId, at: now }
-        }
-        await deps.store.set(keptKey, kept as unknown as JsonValue)
-        view.warnings.push(...stopped.map((o) => `Stopped worker dispatch:${o.dispatchId}${o.taskId ? ` (task ${o.taskId})` : ''}: ${o.reason}`))
-        if (deps.tellSupervisor && supervisor) {
-          await deps.tellSupervisor(repoKey, info.root, supervisor, stoppedMessage(stopped))
-            .catch((error: Error) => view.errors.push(`Stopped workers that started over a limit, but could not tell the supervisor: ${error.message}`))
-        }
-        // A stopped worker takes no room, and its start does not count against today.
-        live -= stopped.length
-        const today = stopped.filter((o) => dayOf(o.at) === dayOf(now)).length
-        if (starts && today > 0) starts = { ...starts, count: Math.max(0, starts.count - today) }
-      }
-    } else if (toStop.length > 0) {
-      view.warnings.push(
-        ...toStop.map((o) =>
-          acting
-            ? `Worker dispatch:${o.dispatchId} started over a limit, and Matriarch cannot stop workers here: ${o.reason}`
-            : `Dry run: with autopilot on, Matriarch would stop worker dispatch:${o.dispatchId}: ${o.reason}`
-        )
-      )
-    }
-    // A stopped worker's worktree is kept for its task, as the supervisor was told, until a newer
-    // worker runs there, the worktree is gone, or a week passed.
-    const keptKey = `stopped:${repoKey}`
-    const keptBefore = ((await deps.store.get(keptKey)) as Record<string, StoppedWorktree> | null) ?? {}
-    const stoppedWorktrees: Record<string, StoppedWorktree> = {}
-    for (const [path, k] of Object.entries(keptBefore)) {
-      const ws = repoWorkspaces.find((w) => w.path === path)
-      const row = ws ? byWorktree.get(ws) : undefined
-      if (ws && now - k.at < STOPPED_KEEP_MS && (!row || row.dispatchId === k.dispatchId)) stoppedWorktrees[path] = k
-    }
-    if (JSON.stringify(stoppedWorktrees) !== JSON.stringify(keptBefore)) await deps.store.set(keptKey, stoppedWorktrees as unknown as JsonValue)
-    const stillPending = acting ? unstopped : []
-    if (JSON.stringify(stillPending) !== JSON.stringify(loadPendingStops(pendingRaw))) await deps.store.set(stopsKey, stillPending as unknown as JsonValue)
-    if (JSON.stringify(starts) !== JSON.stringify(prevStarts) && starts) await deps.store.set(`starts:${repoKey}`, starts as unknown as JsonValue)
-    const startsToday = starts && starts.day === dayOf(now) ? starts.count : 0
-    view.supervisor.live = live
-    view.supervisor.startsToday = startsToday
-    if (ownersKnown) {
-      // Only the supervisor's own terminal and its workers' are judged by the hook.
-      const terminals = [view.supervisor.terminal, ...mine.map((w) => w.terminal)].filter((t): t is string => typeof t === 'string' && t !== '')
-      deps.onLimits?.({ repo: repoKey, terminals, live, startsToday, day: dayOf(now), freeBytes: free, listedAt: workersAt, limits })
-    }
-    // Over a limit without a start to stop: workers there when Matriarch first looked at the Run
-    // or when a limit was lowered, or a dry run.
-    const overNow =
-      limits.maxWorkers > 0 && live > limits.maxWorkers
-        ? `${live} workers are running, over its limit of ${limits.maxWorkers} at once`
-        : limits.maxWorkerStartsPerDay > 0 && startsToday > limits.maxWorkerStartsPerDay
-          ? `${startsToday} workers started today, over its limit of ${limits.maxWorkerStartsPerDay} a day`
-          : null
-    if (overNow) {
-      board.attention.push({
-        key: `limits:${repoKey}`,
-        repo: repoKey,
-        alert: true,
-        message: acting
-          ? unstopped.length > 0
-            ? `${repoKey}: ${overNow}. Matriarch could not stop ${unstopped.length === 1 ? 'the worker that started' : `the ${unstopped.length} workers that started`} over it (the board says why), and tries again for a few minutes: stop ${unstopped.length === 1 ? 'it' : 'them'} yourself if that fails.`
-            : `${repoKey}: ${overNow}. Matriarch stops a worker that starts over a limit, but these were running before it looked or before the limit was lowered: ask the supervisor to let some finish, or raise the limit in Settings.`
-          : `${repoKey}: ${overNow}. In dry run Matriarch only tells you; with autopilot on it stops a worker that starts over a limit. Ask the supervisor to let some finish, or raise the limit in Settings.`,
-        terminal: view.supervisor.terminal ?? undefined
-      })
-    }
-    // Labeled issues: the supervisor's next objectives (issues.ts). None goes while the supervisor
-    // could start no worker for it: it would only be refused or stopped.
-    if (config.issues.enabled) {
-      const held =
-        lowDisk ? `only ${gb(free!)} is free on the disk, under the ${limits.minFreeDiskGB} GB floor`
-        : limits.maxWorkers > 0 && live >= limits.maxWorkers ? `${live} of ${limits.maxWorkers} workers are running, the most at once`
-        : limits.maxWorkerStartsPerDay > 0 && startsToday >= limits.maxWorkerStartsPerDay ? `${startsToday} workers started today, the most a day`
-        : null
-      const issues = await followIssues({
-        repo: repoKey,
-        ref: info.ref,
-        root: info.root,
-        forge,
-        config,
-        supervisor,
-        pending: view.supervisor.pending,
-        acting,
-        held,
-        now,
-        store: deps.store,
-        tellSupervisor: deps.tellSupervisor,
-        commentIssue: deps.commentIssue,
-        stillOn: opts.stillOn
-      })
-      view.issues = issues.view
-      view.warnings.push(...issues.warnings)
-      view.errors.push(...issues.errors)
-      board.attention.push(...issues.attention)
-    }
-
-    const byBranch = new Map<string, Workspace>()
-    for (const ws of repoWorkspaces) {
-      const name = branchName(ws.branch)
-      if (name && !byBranch.has(name)) byBranch.set(name, ws)
-    }
-
-    let summaries: PrSummary[] = []
-    let viewer = ''
-    let listed = false
-    let base: { name: string; sha: string | null; rollup: string | null } | null = null
-    // The forge had more open PRs than it lists: a PR's parent may be among those left out.
-    let truncatedList = false
-    // How long a PR's detail may be reused: shorter where the forge's list cannot show every change.
-    let detailAge = maxAge
-    // Only PRs whose branch lives in an Orca workspace and that the signed-in user opened.
-    const follows = (s: PrSummary, who: string) => byBranch.has(s.headRef) && (!who || !s.author || s.author === who)
-    try {
-      if (!forge) throw new Error(`Matriarch cannot read ${terms.name} here`)
-      const list = await forge.listOpen(info.ref, { watch: follows })
-      summaries = list.prs
-      viewer = list.viewer
-      base = list.base ?? null
-      detailAge = Math.min(maxAge, list.detailMaxAgeMs ?? maxAge)
-      truncatedList = list.truncated === true
-      // GitHub's budget is the scarce one: GitLab's shows only when no GitHub project reports one.
-      if (list.rate && (kind === 'github' || !board.rate)) board.rate = kind === 'github' ? list.rate : { ...list.rate, forge: terms.name }
-      // The real client says null when the forge has no default branch; a reader that omits it says nothing.
-      if (list.base === null) {
-        view.empty = true
-        view.errors.push(`${terms.name} has no commits for this project yet. Push a first commit to its main branch: workers branch from it and open their PRs against it.`)
-      }
-      // Conditional requests make an unchanged GitHub list free; GitLab has no such thing.
-      if (kind === 'github') board.github = { unchanged: (board.github?.unchanged ?? 0) + (list.unchanged ? 1 : 0), read: (board.github?.read ?? 0) + (list.unchanged ? 0 : 1) }
-      listed = true
-    } catch (error) {
-      view.errors.push(`${terms.name}: ${(error as Error).message}`)
-    }
-    // Workspaces whose PR state is unknown this tick keep their last known lane, unwritten.
-    const unknownWs = new Set<string>(listed ? [] : repoWorkspaces.map((w) => w.id))
-
-    // The advisor: the supervisor's questions, answered read-only on the default branch.
-    if (deps.advisor) {
-      advised.add(repoKey)
-      try {
-        const advisor = await deps.advisor.step({
-          repo: repoKey, root: info.root, config, supervisor, acting, notActing: whyNot, base: base?.name ?? null, forge: kind,
-          supervisorSenders: async () => (deps.supervisorSenders ? deps.supervisorSenders(repoKey, supervisor) : [])
-        })
-        if (advisor) {
-          view.advisor = advisor
-          const needs = advisorAttention(repoKey, advisor)
-          if (needs) board.attention.push(needs)
-        }
-      } catch (error) {
-        view.errors.push(`Advisor: ${(error as Error).message}`)
-      }
-    }
-
-    const managed = summaries.filter((s) => follows(s, viewer)).sort((a, b) => a.number - b.number)
-
-    const trackedKey = `tracked:${repoKey}`
-    const tracked = toNumbers(await deps.store.get(trackedKey))
-    const open = new Set(managed.map((s) => s.number))
-
-    const items: { snap: PrSnapshot; ledger: PrLedger; ws: Workspace | undefined }[] = []
-    const mergeBusy = new Set<string>()
-    let runningReviews = 0
-    for (const s of managed) {
-      try {
-        const baseSha = base && s.baseRef === base.name ? base.sha : null
-        const read = await snapshotFor(deps, info, s, now, detailAge, baseSha)
-        if (!read) continue
-        const snap = await withFileMoves(deps, info, config, read, now, baseSha)
-        let ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, s.number)))
-        // When each head was first seen: a new commit's checks get a grace period to register.
-        if (!ledger.heads[snap.headSha]) {
-          ledger = { ...ledger, heads: Object.fromEntries([...Object.entries(ledger.heads), [snap.headSha, now]].slice(-20)) }
-          await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
-        }
-        if (snap.ci !== 'none' && !ledger.ciSeen) {
-          ledger = { ...ledger, ciSeen: true }
-          await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
-        }
-        // A round that asked for changes on an older commit, whose findings nobody received before
-        // the PR moved on, is moot: it does not use up one of the PR's rounds. (The next round still
-        // checks its findings.)
-        const moot = Object.entries(ledger.reviews).filter(([sha, r]) => sha !== snap.headSha && r.status === 'done' && r.verdict === 'changes' && !r.delivered && !r.published && !r.superseded)
-        if (moot.length > 0) {
-          ledger = { ...ledger, reviews: { ...ledger.reviews, ...Object.fromEntries(moot.map(([sha, r]) => [sha, { ...r, superseded: true }])) } }
-          await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
-        }
-        // A round still reviewing an older commit is moot: stop it, and it uses up no round.
-        for (const old of deps.crew ? await deps.crew.supersede(repoKey, s.number, snap.headSha).catch(() => []) : []) {
-          const prior = ledger.reviews[old.sha]
-          if (prior) ledger = { ...ledger, reviews: { ...ledger.reviews, [old.sha]: { ...prior, status: 'failed', superseded: true, endedAt: now } } }
-          await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
-          crewMarks.set(`${repoKey}#${s.number}`, [
-            ...(crewMarks.get(`${repoKey}#${s.number}`) ?? []),
-            { at: now, kind: 'review-done', label: `review of ${old.sha.slice(0, 7)} stopped: the PR moved to ${snap.headSha.slice(0, 7)}` }
-          ])
-        }
-        // A round that timed out may still get its verdicts: adopt them.
-        if (deps.crew && ledger.reviews[snap.headSha]?.status === 'failed') {
-          const revived = await deps.crew.revive(repoKey, s.number, snap.headSha).catch(() => null)
-          if (revived?.status === 'running') {
-            // It was only slow: a reviewer is still producing output. Back to running.
-            const prior = ledger.reviews[snap.headSha]
-            ledger = { ...ledger, reviews: { ...ledger.reviews, [snap.headSha]: { round: prior.round, status: 'running', startedAt: prior.startedAt } } }
-            await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
-            crewMarks.set(`${repoKey}#${s.number}`, [...(crewMarks.get(`${repoKey}#${s.number}`) ?? []), { at: now, kind: 'review-start', label: 'review round resumed: a reviewer is still working' }])
-          } else if (revived?.outcome) {
-            ledger = {
-              ...ledger,
-              reviews: {
-                ...ledger.reviews,
-                [snap.headSha]: { ...ledger.reviews[snap.headSha], status: 'done', endedAt: revived.endedAt ?? now, verdict: revived.outcome.verdict, findings: revived.outcome.blocking.length }
-              }
-            }
-            await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
-            crewMarks.set(`${repoKey}#${s.number}`, [...(crewMarks.get(`${repoKey}#${s.number}`) ?? []), { at: now, kind: 'review-done', label: revived.outcome.summary }])
-          }
-        }
-        // Only a fresh request for this exact commit holds the base: a stale one must not block merges.
-        if (ledger.merge?.status === 'requested' && ledger.merge.sha === snap.headSha && now - ledger.merge.at < MERGE_TIMEOUT_MS) mergeBusy.add(snap.baseRef)
-        runningReviews += Object.values(ledger.reviews).filter((r) => r.status === 'running').length
-        items.push({ snap, ledger, ws: byBranch.get(s.headRef) })
-      } catch (error) {
-        view.errors.push(`#${s.number}: ${(error as Error).message}`)
-        const ws = byBranch.get(s.headRef)
-        if (ws) unknownWs.add(ws.id)
-      }
-    }
-    // PRs Matriarch followed that left the open list: read their final state once.
-    if (listed && forge) {
-      for (const number of tracked.filter((n) => !open.has(n))) {
-        try {
-          const { pr } = await forge.detail(info.ref, number)
-          if (!pr) continue
-          if (pr.state === 'OPEN') {
-            // Still open, but no longer followed (its worktree gone, another author): its records
-            // are pruned a week after this unless it is followed again.
-            if (!(await deps.store.get(`dropped:${repoKey}#${number}`))) await deps.store.set(`dropped:${repoKey}#${number}`, now)
-            continue
-          }
-          // Its review rounds are moot now.
-          if (deps.crew) await deps.crew.supersede(repoKey, number, null).catch(() => [])
-          const ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, number)))
-          // Its records are pruned a week after this.
-          if (!(await deps.store.get(`closed:${repoKey}#${number}`))) {
-            await deps.store.set(`closed:${repoKey}#${number}`, now)
-            // Once, when Matriarch first sees it merged, whoever merged it; like every alert, only
-            // while it acts (Orca has no notification for this one: it goes to the webhook only).
-            if (pr.state === 'MERGED' && acting) deps.alert?.({ kind: 'merged', title: `${repoKey} #${number} merged`, body: pr.title, repo: repoKey, number, url: pr.url })
-          }
-          if (pr.state === 'MERGED' && ledger.merge && ledger.merge.status !== 'merged') {
-            await deps.store.set(ledgerKey(repoKey, number), { ...ledger, merge: { ...ledger.merge, status: 'merged' } } as unknown as JsonValue)
-          }
-          // A merged PR's worktree has done its job: it goes once nothing runs there.
-          const done = byBranch.get(pr.headRef)
-          if (pr.state === 'MERGED' && done && done.path !== info.root && config.merge.removeWorktree) {
-            const list = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
-            if (!list.some((c) => c.path === done.path)) await deps.store.set(`cleanup:${repoKey}`, [...list, { path: done.path, number, at: now }] as unknown as JsonValue)
-          }
-          // Kept as it closed, so it can stay on the board without asking the forge again.
-          await deps.store.set(`snap:${repoKey}#${number}`, { snap: pr } as unknown as JsonValue)
-          items.push({ snap: pr, ledger, ws: byBranch.get(pr.headRef) })
-        } catch (error) {
-          view.errors.push(`#${number}: ${(error as Error).message}`)
-        }
-      }
-      await deps.store.set(trackedKey, [...open])
-      // Merged and closed PRs stay on the board and timeline for a while, from the state read when
-      // they closed: nothing is asked of the forge for them again.
-      if (deps.store.keys) {
-        const shown = new Set(items.map((i) => i.snap.number))
-        for (const key of (await deps.store.keys()).filter((k) => k.startsWith(`closed:${repoKey}#`))) {
-          const number = Number(key.slice(key.lastIndexOf('#') + 1))
-          const at = await deps.store.get(key)
-          if (shown.has(number) || typeof at !== 'number' || now - at > SHOW_CLOSED_MS) continue
-          const snap = ((await deps.store.get(`snap:${repoKey}#${number}`)) as { snap?: PrSnapshot } | null)?.snap
-          if (!snap || snap.state === 'OPEN') continue
-          items.push({ snap, ledger: loadLedger(await deps.store.get(ledgerKey(repoKey, number))), ws: byBranch.get(snap.headRef) })
-        }
-      }
-    }
-
+      alert: true,
+      message: `Only ${gb(free)} free on the disk with ${repoKey}. Agents' builds, Orca and Matriarch stop saving once it is full: free some space to keep the pod moving.`
+    })
+  }
+  // A config with errors may have lost a guard (a protected path, a reviewer): watch only.
+  const whyNot = notActing(opts.autopilot, deps, cfg.errors)
+  const acting = whyNot === null
+  if (opts.autopilot && cfg.errors.length > 0) view.errors.push('The config has errors, so Matriarch only watches this repository until they are fixed.')
+  const byBranch = new Map<string, Workspace>()
+  for (const ws of repoWorkspaces) {
+    const name = branchName(ws.branch)
+    if (name && !byBranch.has(name)) byBranch.set(name, ws)
+  }
+  return {
+    t, info, repoKey, repoWorkspaces, cfg, config, kind, terms, forge, supervisor, pending, view, free, limits, lowDisk, whyNot, acting, byBranch,
+    live: 0, startsToday: 0, stoppedWorktrees: {},
+    summaries: [], viewer: '', listed: false, base: null, truncatedList: false, detailAge: t.maxAge, follows: () => false, unknownWs: new Set(),
+    trackedKey: `tracked:${repoKey}`, tracked: [], open: new Set(), items: [], mergeBusy: new Set(), runningReviews: 0,
     // Worktrees removed this tick: gone from here on, so no PR or row writes to their history again.
-    const gone = new Set<string>()
+    gone: new Set(),
     // The log line for a merged PR's removed worktree, written after that PR's lane this tick.
-    const cleanedUp = new Map<number, LogEntry>()
-    // Worktrees of merged PRs: removed once no worker is live there and nothing is uncommitted.
-    if (acting && deps.removeWorktree && config.merge.removeWorktree) {
-      // Once per project: PRs merged before this cleanup existed are found by their ledgers.
-      if (!(await deps.store.get(`cleanup:scanned:${repoKey}`)) && deps.store.keys) {
-        const found: PendingCleanup[] = []
-        for (const key of (await deps.store.keys()).filter((k) => k.startsWith(`pr:${repoKey}#`))) {
-          const number = Number(key.slice(key.indexOf('#') + 1))
-          if (loadLedger(await deps.store.get(key)).merge?.status !== 'merged') continue
-          const head = ((await deps.store.get(`snap:${repoKey}#${number}`)) as { snap?: { headRef?: string } } | null)?.snap?.headRef
-          const ws = head ? byBranch.get(head) : undefined
-          if (ws && ws.path !== info.root) found.push({ path: ws.path, number, at: now })
-        }
-        const list = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
-        await deps.store.set(`cleanup:${repoKey}`, [...list, ...found.filter((f) => !list.some((c) => c.path === f.path))] as unknown as JsonValue)
-        await deps.store.set(`cleanup:scanned:${repoKey}`, now)
-      }
-      const pending = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
-      const still: PendingCleanup[] = []
-      for (const c of pending) {
-        const ws = repoWorkspaces.find((w) => w.path === c.path)
-        if (!ws || ws.path === info.root || now - c.at > CLEANUP_GIVE_UP_MS) continue
-        const owner = byWorktree.get(ws)
-        const act = deps.activity(ws.id, ws.path)
-        if ((owner && owner.live !== false) || agentBusy(act)) {
-          still.push({ ...c, kept: 'an agent is still running there' })
-          continue
-        }
-        const res = await deps.removeWorktree(ws.path).catch((error: Error) => ({ removed: false, reason: error.message }))
-        if (res.removed) {
-          deps.log(`${repoKey}: removed the worktree of merged #${c.number} (${ws.path})`)
-          gone.add(ws.path)
-          // The merged PR stays on the board for a while under its own key once its worktree is
-          // gone. When the worktree's history was this PR's, it goes with it; this tick's lane and
-          // marks are written there below.
-          const own = loadHistory(await deps.store.get(historyKey(ws.id)))
-          if (own.pr === undefined || own.pr === c.number) await deps.store.set(historyKey(`pr:${repoKey}#${c.number}`), { ...own, pr: c.number } as unknown as JsonValue)
-          cleanedUp.set(c.number, { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: no agent ran there and nothing in it was uncommitted` })
-          continue
-        }
-        still.push({ ...c, kept: res.reason ?? 'not removed' })
-        if (res.reason && res.reason !== c.kept) view.warnings.push(`Kept the worktree of merged #${c.number} (${ws.name}): ${res.reason}.`)
-      }
-      if (still.length !== pending.length || still.some((c, i) => c.kept !== pending[i]?.kept)) await deps.store.set(`cleanup:${repoKey}`, still as unknown as JsonValue)
-    }
+    cleanedUp: new Map(),
+    seenWorkspaces: new Set(), firstOn: new Map(), openStack: { parents: new Map(), all: new Map() }, closedSnaps: new Map()
+  }
+}
 
-    // Worktrees the supervisor's workers used that never became a PR (a gate, an audit, a spike):
-    // removed an hour after Matriarch first sees no worker live there, when nothing in them is
-    // uncommitted or unpushed. Only worktrees of the supervisor's own Run, never one a person made.
-    if (acting && listed && deps.removeWorktree && config.merge.removeFinishedWorktrees && supervisor) {
-      const prBranches = new Set(summaries.map((s) => s.headRef))
-      const merging = new Set((((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []).map((c) => c.path))
-      const finishedKey = `finished:${repoKey}`
-      const seen = ((await deps.store.get(finishedKey)) as Record<string, number> | null) ?? {}
-      const still: Record<string, number> = {}
-      for (const ws of repoWorkspaces) {
-        if (ws.path === info.root || merging.has(ws.path) || prBranches.has(branchName(ws.branch) ?? '') || stoppedWorktrees[ws.path]) continue
-        const row = byWorktree.get(ws)
-        if (!row?.runId || `run:${row.runId}` !== supervisor || row.live !== false) continue
-        const act = deps.activity(ws.id, ws.path)
-        if (agentBusy(act)) continue
-        const since = seen[ws.path] ?? now
-        if (now - since < FINISHED_GRACE_MS) {
-          still[ws.path] = since
-          continue
-        }
-        const res = await deps.removeWorktree(ws.path, { keepBranch: true }).catch((error: Error) => ({ removed: false, reason: error.message }))
-        if (res.removed) {
-          deps.log(`${repoKey}: removed ${ws.name}, a finished worktree that never became a PR (${ws.path})`)
-          gone.add(ws.path)
-          // In its log too, as for a merged PR's worktree (kept a week, like any worktree's history).
-          const key = historyKey(ws.id)
-          const entry = { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: its worker finished, it never became a PR, and nothing in it was uncommitted or unpushed (its branch is kept)` }
-          await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
-        } else still[ws.path] = since
-      }
-      if (JSON.stringify(still) !== JSON.stringify(seen)) await deps.store.set(finishedKey, still as unknown as JsonValue)
-    }
-
-    const seenWorkspaces = new Set<string>()
-    for (const item of items) if (item.ws && gone.has(item.ws.path)) item.ws = undefined
-    // A worktree's history belongs to the first PR on it (the lowest number, when two are first
-    // seen together); any other PR on that worktree keeps its own, by number.
-    const firstOn = new Map<string, number>()
-    for (const { ws, snap } of items) if (ws) firstOn.set(ws.id, Math.min(firstOn.get(ws.id) ?? Infinity, snap.number))
-
-    // Stacked PRs: one whose base is the head branch of another PR Matriarch follows merges only
-    // after it, and is moved and rebased once that one merged. Only a PR from a short-lived branch
-    // of this repository can be a parent (canBeParent): a release PR from a long-lived branch, or
-    // a fork's PR from its own main, never holds the PRs into that branch.
-    const parents = new Map<string, StackCandidate>()
-    for (const { snap: s } of items) {
-      if (s.state === 'OPEN' && canBeParent(s, base?.name ?? null)) parents.set(s.headRef, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef })
-    }
-    const all = new Map(summaries.map((s) => [s.number, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef ?? '' }]))
-    const openStack = { parents, all }
-    const closedSnaps = new Map(items.filter((i) => i.snap.state !== 'OPEN').map((i) => [i.snap.number, i.snap]))
-
-    for (const item of items) {
-      const { snap } = item
-      const ws = item.ws
-      const worker = ws ? byWorktree.get(ws) : undefined
-      const owner = ws ? ownerFor(ws, worker, deps.activity(ws.id, ws.path)) : null
-      if (snap.state === 'OPEN') {
-        const judged = await judgeFailures(deps, info, snap, item.ledger, config)
-        if (judged !== item.ledger) {
-          item.ledger = judged
-          await deps.store.set(ledgerKey(repoKey, snap.number), judged as unknown as JsonValue)
-        }
-      }
-      if (snap.state === 'OPEN' && listed) {
-        const st = await followStack(deps, info, snap, item.ledger, openStack, closedSnaps, base?.name ?? null)
-        if (JSON.stringify(st ?? null) !== JSON.stringify(item.ledger.stack ?? null)) {
-          const next: PrLedger = { ...item.ledger }
-          if (st) next.stack = st
-          else delete next.stack
-          item.ledger = next
-          await deps.store.set(ledgerKey(repoKey, snap.number), next as unknown as JsonValue)
-        }
-      }
-      // Who built the PR: the first worker seen on it, and whether it finished a turn since.
-      if (owner?.address) {
-        const b = item.ledger.builder
-        const next = !b
-          ? { address: owner.address, done: owner.activity === 'done' }
-          : b.address === owner.address && owner.activity === 'done' && !b.done ? { ...b, done: true } : null
-        if (next) {
-          item.ledger = { ...item.ledger, builder: next }
-          await deps.store.set(ledgerKey(repoKey, snap.number), item.ledger as unknown as JsonValue)
-        }
-      }
-      const run = deps.crew ? await deps.crew.get(repoKey, snap.number, snap.headSha).catch(() => null) : null
-      const p = plan({
-        pr: snap,
-        owner,
-        ledger: item.ledger,
-        config,
-        supervisor,
-        mergeSlotFree: !mergeBusy.has(snap.baseRef),
-        reviewSlotFree: runningReviews < config.limits.maxConcurrentReviews,
-        baseRed: base && base.name === snap.baseRef && (base.rollup === 'FAILURE' || base.rollup === 'ERROR') ? { sha: base.sha } : null,
-        // Known only for the default branch: GitHub's rollup is null when its head has no checks at all.
-        baseHasChecks: base && base.name === snap.baseRef ? base.rollup !== null : undefined,
-        ownersKnown,
-        stack: item.ledger.stack ?? null,
-        // A cut-short list may leave out the PR whose branch this one merges into.
-        unlistedBase:
-          truncatedList && snap.state === 'OPEN' && !item.ledger.stack && byBranch.has(snap.baseRef) && stackableBranch(snap.baseRef, base?.name ?? null),
-        now
-      })
-
-      // A failed round says why, not just that it failed.
-      if (run?.status === 'failed' && item.ledger.reviews[snap.headSha]?.status === 'failed') {
-        p.reason = `review round ${run.round} failed: ${run.error ?? 'unknown'}${run.reviewers.some((r) => r.status === 'failed') ? ` (${run.reviewers.filter((r) => r.status === 'failed').map((r) => `${r.name}: ${r.error ?? 'failed'}`).join('; ')})` : ''}`
-      }
-      // A reviewer stuck on an agent prompt needs a person before anything else can happen.
-      const stuck = run?.status === 'running' ? run.reviewers.find((r) => r.status === 'running' && r.blocked) : undefined
-      if (stuck) {
-        p.lane = 'needs-you'
-        p.reason = `reviewer ${stuck.name} (${stuck.agent}) needs you: ${stuck.blocked}`
-      }
-
-      let ledger = item.ledger
-      const marks: Mark[] = []
-      // What was carried out (or tried) this tick, for the track's activity log.
-      const logged: LogEntry[] = []
-      const ownerRow = item.ws ? byWorktree.get(item.ws) : undefined
-      const failedLogs = p.actions.some((a) => a.kind === 'send-ci-failure') ? await keptLogs(deps, info, snap) : {}
-      const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null, owner: owner?.address ?? null, failedLogs }
-      const run1 = async (a: Action) => {
-        try {
-          return await deps.executor!.execute(a, ctx)
-        } catch (error) {
-          return { ok: false, error: (error as Error).message }
-        }
-      }
-      for (const action of p.actions) {
-        if (action.kind === 'merge') mergeBusy.add(snap.baseRef)
-        if (action.kind === 'start-review') runningReviews++
-        if (!acting) continue
-        // The pause switch is honoured between actions, not only between ticks.
-        if (opts.stillOn && !(await opts.stillOn().catch(() => false))) break
-        // A red base is one problem per repository: escalate it once, not once per ready PR.
-        const escKey = action.kind === 'escalate' ? action.key : null
-        const baseRedKey = escKey?.startsWith('base-red:') ? `base-red:${repoKey}` : null
-        if (baseRedKey && (await deps.store.get(baseRedKey)) === escKey) {
-          ledger = record(ledger, action, now)
-          continue
-        }
-        const outcome = await run1(action)
-        if (outcome.ok) {
-          ledger = record(ledger, action, now)
-          marks.push(markFor(action, now, kind))
-          logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
-          // Saved after each success, so a later failure in this tick cannot make it run twice.
-          await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
-          if (baseRedKey && escKey) await deps.store.set(baseRedKey, escKey)
-          continue
-        }
-        if (outcome.skipped) continue
-        logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
-        view.errors.push(`#${snap.number} ${action.kind}: ${outcome.error ?? 'failed'}`)
-        // A re-run the forge refused is not asked for again: the failure goes to the worker next.
-        if (action.kind === 'rerun-check') {
-          ledger = recordRefusedRerun(ledger, action, now, outcome.error ?? 'refused')
-          await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
-        }
-        // A move of the base the forge refused is tried again later, and escalated after a few tries.
-        if (action.kind === 'retarget') {
-          ledger = recordRefusedRetarget(ledger, action, now, outcome.error ?? 'refused')
-          await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
-        }
-        if (action.kind === 'merge') ledger = { ...ledger, merge: { sha: action.sha, at: now, status: 'failed', error: outcome.error } }
-        // A supervisor that cannot be reached: tell the person now, and forget a Run Orca lost.
-        if (action.kind === 'escalate' && action.to === 'supervisor') {
-          if (/run_not_found|dispatch_not_found|not found/i.test(outcome.error ?? '')) await deps.store.set(`supervisor:${repoKey}`, '')
-          const human: Action = { kind: 'escalate', to: 'human', key: action.key.replace(/:supervisor$/, ':human'), reason: `${action.reason} (the supervisor could not be reached)`, address: null }
-          const told = await run1(human)
-          if (told.ok) {
-            ledger = record(record(ledger, action, now), human, now)
-            marks.push(markFor(human, now, kind))
-            logged.push(logEntry(human, told, now, kind, describe(human, kind)))
-            await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
-          }
-        }
-      }
-      if (ledger !== item.ledger) await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
-
-      const prKey = `pr:${repoKey}#${snap.number}`
-      const trackKey = ws && ((loadHistory(await deps.store.get(historyKey(ws.id))).pr ?? firstOn.get(ws.id)) === snap.number) ? ws.id : prKey
-      let history = loadHistory(await deps.store.get(historyKey(trackKey)))
-      if (history.lastSha !== snap.headSha) {
-        if (history.lastSha) {
-          const push: Mark = { at: now, kind: 'push', label: `pushed ${shortSha(snap.headSha)}` }
-          history = addLog(addMark(history, push), markEntry(push))
-        }
-        history = { ...history, lastSha: snap.headSha }
-      }
-      // In the log, in the order they lead to each other: what came in (a commit, a finished
-      // review), the lane that put the PR in, then what Matriarch did about it.
-      for (const m of crewMarks.get(`${repoKey}#${snap.number}`) ?? []) history = addLog(addMark(history, m), markEntry(m))
-      history = noteLane(history, p.lane, p.reason, now)
-      for (const m of marks) history = addMark(history, m)
-      for (const e of logged) history = addLog(history, e)
-      const cleaned = cleanedUp.get(snap.number)
-      if (cleaned) {
-        history = addLog(history, cleaned)
-        cleanedUp.delete(snap.number)
-      }
-      history = { ...prune(history, now), seenAt: now, pr: snap.number }
-      await deps.store.set(historyKey(trackKey), history as unknown as JsonValue)
-      if (ws) seenWorkspaces.add(ws.id)
-
-      const review = ledger.reviews[snap.headSha]
-      for (const r of run?.status === 'running' ? run.reviewers : []) {
-        if (r.status !== 'running' || !r.blocked) continue
-        board.attention.push({
-          key: `${repoKey}#${snap.number}:${r.name}`,
-          repo: repoKey,
-          message: `${repoKey} #${snap.number}: the ${r.name} reviewer (${r.agent}) needs you. ${r.blocked}.`,
-          terminal: r.blockedTerminal ?? undefined,
-          workspaceId: run?.worktree?.workspaceId ?? undefined
-        })
-      }
-      const win = windowed(history, since)
-      board.tracks.push({
-        key: trackKey,
-        repo: repoKey,
-        workspace: ws ? { id: ws.id, name: ws.name, branch: branchName(ws.branch) } : { id: prKey, name: snap.headRef, branch: snap.headRef },
-        pr: {
-          number: snap.number,
-          title: snap.title,
-          url: snap.url,
-          sha: snap.headSha,
-          base: snap.baseRef,
-          ci: snap.ci,
-          failing: snap.checks.filter((c) => c.state === 'failure').map((c) => c.name),
-          openThreads: actionableThreads(snap).length,
-          ...(ledger.stack && snap.state === 'OPEN' && snap.baseRef === ledger.stack.headRef ? { stackedOn: ledger.stack.number } : {})
-        },
-        owner: owner ? { agent: owner.agent, model: owner.model, activity: owner.activity, supervised: owner.address !== null } : null,
-        lane: p.lane,
-        reason: p.reason,
-        next: opts.autopilot ? [] : p.actions.map((a) => describe(a, kind)),
-        review:
-          review || run
-            ? {
-                round: review?.round ?? run!.round,
-                status: review?.status ?? run!.status,
-                verdict: review?.verdict,
-                summary: run?.outcome?.summary ?? run?.error ?? undefined,
-                // Capped and trimmed: the board is posted to the panel on every tick.
-                findings: (run?.outcome?.findings ?? []).slice(0, 40).map((f) => ({
-                  severity: f.severity,
-                  file: f.file,
-                  line: f.line,
-                  title: f.title,
-                  detail: f.detail.slice(0, 800),
-                  suggestion: f.suggestion.slice(0, 400),
-                  reviewers: f.reviewers
-                })),
-                reviewers: (run?.reviewers ?? []).map((r) => ({
-                  name: r.name,
-                  agent: r.agent,
-                  model: r.model,
-                  status: r.status,
-                  verdict: r.verdict?.verdict,
-                  findings: r.verdict?.findings.length,
-                  error: r.error ?? undefined,
-                  blocked: r.status === 'running' ? (r.blocked ?? undefined) : undefined,
-                  terminal: r.status === 'running' && r.blocked ? (r.blockedTerminal ?? undefined) : undefined,
-                  lock: r.lock ? LOCK_LABEL[r.lock] : undefined
-                }))
-              }
-            : null,
-        rounds: {
-          ci: roundsUsed(ledger, 'ci'),
-          conflicts: roundsUsed(ledger, 'conflicts'),
-          comments: roundsUsed(ledger, 'comments'),
-          reviews: roundsUsed(ledger, 'reviews')
-        },
-        segments: win.segments,
-        marks: win.marks
-      })
-    }
-
-    // A merged PR no longer on the board whose worktree went this tick: its line goes to its log.
-    for (const [number, entry] of cleanedUp) {
-      const key = historyKey(`pr:${repoKey}#${number}`)
-      await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
-    }
-
-    // Worktrees with no PR yet: building while their agent works, idle otherwise.
-    for (const ws of repoWorkspaces) {
-      if (seenWorkspaces.has(ws.id) || gone.has(ws.path)) continue
-      if (unknownWs.has(ws.id)) {
-        // The forge could not say what this worktree's PR is doing: show the last known lane, and
-        // leave its history alone rather than rewrite it as idle.
-        const known = loadHistory(await deps.store.get(historyKey(ws.id)))
-        const last = known.segments[known.segments.length - 1]
-        const win = windowed(known, since)
-        board.tracks.push({
-          key: ws.id,
-          repo: repoKey,
-          workspace: { id: ws.id, name: ws.name, branch: branchName(ws.branch) },
-          pr: null,
-          owner: null,
-          lane: last?.lane ?? 'idle',
-          reason: `${terms.name} is unavailable; this is the last known state${last ? `: ${last.reason}` : ''}`,
-          next: [],
-          review: null,
-          rounds: { ci: 0, conflicts: 0, comments: 0, reviews: 0 },
-          segments: win.segments,
-          marks: win.marks
-        })
+/** The supervisor's workers against the limits: counted, over-limit starts stopped, the hook told. Adds live, startsToday, stoppedWorktrees. */
+async function holdLimits(proj: ProjectTick): Promise<void> {
+  const { deps, opts, board, now, workers, ownersKnown, workersAt, byWorktree } = proj.t
+  const { repoKey, info, repoWorkspaces, supervisor, view, free, limits, acting } = proj
+  // The supervisor's workers against the limits (limits.ts): on its row, and to the hook that
+  // refuses a start over one. A start counts once Matriarch first sees its worker in the Run's
+  // list; under autopilot, a worker whose start put the project over a limit is stopped.
+  const mine = supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor) : []
+  const prevStarts = loadStarts(await deps.store.get(`starts:${repoKey}`))
+  let starts = prevStarts
+  let fresh: WorkerRow[] = []
+  if (ownersKnown && supervisor) {
+    // A Run seen for the first time has no fresh workers: when they started cannot be told.
+    const known = prevStarts?.run === supervisor ? new Set(prevStarts.seen) : null
+    fresh = known ? mine.filter((w) => !known.has(w.dispatchId)) : []
+    starts = countStarts(prevStarts, supervisor, mine.map((w) => w.dispatchId), now)
+  }
+  let live = mine.filter(isWorking).length
+  const counted = starts && starts.day === dayOf(now) ? starts.count : 0
+  const over = overLimitStarts(fresh, { repo: repoKey, runningBefore: live - fresh.filter(isWorking).length, startsBefore: counted - fresh.length, freeBytes: free, limits })
+  // A stop that did not go through is tried again while its worker still runs.
+  const stopsKey = `overlimit:${repoKey}`
+  const pendingRaw = await deps.store.get(stopsKey)
+  const retrying = ownersKnown
+    ? loadPendingStops(pendingRaw).filter((p) => now - p.at < STOP_RETRY_MS && mine.some((w) => w.dispatchId === p.dispatchId && isWorking(w)))
+    : loadPendingStops(pendingRaw)
+  const toStop: PendingStop[] = [...retrying, ...over.filter((o) => !retrying.some((p) => p.dispatchId === o.dispatchId)).map((o) => ({ ...o, at: now }))]
+  const stopped: PendingStop[] = []
+  const unstopped: PendingStop[] = []
+  if (toStop.length > 0 && acting && deps.stopWorker) {
+    for (const o of toStop) {
+      if (opts.stillOn && !(await opts.stillOn().catch(() => false))) {
+        unstopped.push(o)
         continue
       }
+      const res = await deps.stopWorker(o.dispatchId).catch((error: Error) => ({ ok: false, error: error.message }))
+      if (res.ok) stopped.push(o)
+      else {
+        unstopped.push(o)
+        view.errors.push(`Could not stop worker dispatch:${o.dispatchId}, which started over a limit: ${res.error ?? 'failed'}`)
+      }
+    }
+    if (stopped.length > 0) {
+      deps.log(`${repoKey}: stopped ${stopped.map((o) => `dispatch:${o.dispatchId}`).join(', ')}, started over a limit`)
+      const keptKey = `stopped:${repoKey}`
+      const kept = ((await deps.store.get(keptKey)) as Record<string, StoppedWorktree> | null) ?? {}
+      for (const o of stopped) {
+        const row = mine.find((w) => w.dispatchId === o.dispatchId)
+        // Stopped: for the rest of this tick nothing is sent to it, and its PR's worker counts as gone.
+        if (row) Object.assign(row, { live: false, liveness: 'exited', state: 'stopped' })
+        const ws = row ? workspaceOf(row, repoWorkspaces) : undefined
+        if (!ws) continue
+        // Its worktree's log says why its worker ended, and the worktree stays for its task.
+        const key = historyKey(ws.id)
+        const entry = { at: now, kind: 'stop-worker', text: `Stopped this worktree's worker, which started over a limit: ${o.reason}` }
+        await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
+        kept[ws.path] = { dispatchId: o.dispatchId, at: now }
+      }
+      await deps.store.set(keptKey, kept as unknown as JsonValue)
+      view.warnings.push(...stopped.map((o) => `Stopped worker dispatch:${o.dispatchId}${o.taskId ? ` (task ${o.taskId})` : ''}: ${o.reason}`))
+      if (deps.tellSupervisor && supervisor) {
+        await deps.tellSupervisor(repoKey, info.root, supervisor, stoppedMessage(stopped))
+          .catch((error: Error) => view.errors.push(`Stopped workers that started over a limit, but could not tell the supervisor: ${error.message}`))
+      }
+      // A stopped worker takes no room, and its start does not count against today.
+      live -= stopped.length
+      const today = stopped.filter((o) => dayOf(o.at) === dayOf(now)).length
+      if (starts && today > 0) starts = { ...starts, count: Math.max(0, starts.count - today) }
+    }
+  } else if (toStop.length > 0) {
+    view.warnings.push(
+      ...toStop.map((o) =>
+        acting
+          ? `Worker dispatch:${o.dispatchId} started over a limit, and Matriarch cannot stop workers here: ${o.reason}`
+          : `Dry run: with autopilot on, Matriarch would stop worker dispatch:${o.dispatchId}: ${o.reason}`
+      )
+    )
+  }
+  // A stopped worker's worktree is kept for its task, as the supervisor was told, until a newer
+  // worker runs there, the worktree is gone, or a week passed.
+  const keptKey = `stopped:${repoKey}`
+  const keptBefore = ((await deps.store.get(keptKey)) as Record<string, StoppedWorktree> | null) ?? {}
+  const stoppedWorktrees: Record<string, StoppedWorktree> = {}
+  for (const [path, k] of Object.entries(keptBefore)) {
+    const ws = repoWorkspaces.find((w) => w.path === path)
+    const row = ws ? byWorktree.get(ws) : undefined
+    if (ws && now - k.at < STOPPED_KEEP_MS && (!row || row.dispatchId === k.dispatchId)) stoppedWorktrees[path] = k
+  }
+  if (JSON.stringify(stoppedWorktrees) !== JSON.stringify(keptBefore)) await deps.store.set(keptKey, stoppedWorktrees as unknown as JsonValue)
+  const stillPending = acting ? unstopped : []
+  if (JSON.stringify(stillPending) !== JSON.stringify(loadPendingStops(pendingRaw))) await deps.store.set(stopsKey, stillPending as unknown as JsonValue)
+  if (JSON.stringify(starts) !== JSON.stringify(prevStarts) && starts) await deps.store.set(`starts:${repoKey}`, starts as unknown as JsonValue)
+  const startsToday = starts && starts.day === dayOf(now) ? starts.count : 0
+  view.supervisor.live = live
+  view.supervisor.startsToday = startsToday
+  if (ownersKnown) {
+    // Only the supervisor's own terminal and its workers' are judged by the hook.
+    const terminals = [view.supervisor.terminal, ...mine.map((w) => w.terminal)].filter((t): t is string => typeof t === 'string' && t !== '')
+    deps.onLimits?.({ repo: repoKey, terminals, live, startsToday, day: dayOf(now), freeBytes: free, listedAt: workersAt, limits })
+  }
+  // Over a limit without a start to stop: workers there when Matriarch first looked at the Run
+  // or when a limit was lowered, or a dry run.
+  const overNow =
+    limits.maxWorkers > 0 && live > limits.maxWorkers
+      ? `${live} workers are running, over its limit of ${limits.maxWorkers} at once`
+      : limits.maxWorkerStartsPerDay > 0 && startsToday > limits.maxWorkerStartsPerDay
+        ? `${startsToday} workers started today, over its limit of ${limits.maxWorkerStartsPerDay} a day`
+        : null
+  if (overNow) {
+    board.attention.push({
+      key: `limits:${repoKey}`,
+      repo: repoKey,
+      alert: true,
+      message: acting
+        ? unstopped.length > 0
+          ? `${repoKey}: ${overNow}. Matriarch could not stop ${unstopped.length === 1 ? 'the worker that started' : `the ${unstopped.length} workers that started`} over it (the board says why), and tries again for a few minutes: stop ${unstopped.length === 1 ? 'it' : 'them'} yourself if that fails.`
+          : `${repoKey}: ${overNow}. Matriarch stops a worker that starts over a limit, but these were running before it looked or before the limit was lowered: ask the supervisor to let some finish, or raise the limit in Settings.`
+        : `${repoKey}: ${overNow}. In dry run Matriarch only tells you; with autopilot on it stops a worker that starts over a limit. Ask the supervisor to let some finish, or raise the limit in Settings.`,
+      terminal: view.supervisor.terminal ?? undefined
+    })
+  }
+  proj.live = live
+  proj.startsToday = startsToday
+  proj.stoppedWorktrees = stoppedWorktrees
+}
+
+/** Labeled issues handed to the supervisor as objectives (issues.ts). */
+async function handIssues(proj: ProjectTick): Promise<void> {
+  const { deps, opts, board, now } = proj.t
+  const { repoKey, info, config, forge, supervisor, view, free, limits, lowDisk, acting, live, startsToday } = proj
+  // Labeled issues: the supervisor's next objectives (issues.ts). None goes while the supervisor
+  // could start no worker for it: it would only be refused or stopped.
+  if (config.issues.enabled) {
+    const held =
+      lowDisk ? `only ${gb(free!)} is free on the disk, under the ${limits.minFreeDiskGB} GB floor`
+      : limits.maxWorkers > 0 && live >= limits.maxWorkers ? `${live} of ${limits.maxWorkers} workers are running, the most at once`
+      : limits.maxWorkerStartsPerDay > 0 && startsToday >= limits.maxWorkerStartsPerDay ? `${startsToday} workers started today, the most a day`
+      : null
+    const issues = await followIssues({
+      repo: repoKey,
+      ref: info.ref,
+      root: info.root,
+      forge,
+      config,
+      supervisor,
+      pending: view.supervisor.pending,
+      acting,
+      held,
+      now,
+      store: deps.store,
+      tellSupervisor: deps.tellSupervisor,
+      commentIssue: deps.commentIssue,
+      stillOn: opts.stillOn
+    })
+    view.issues = issues.view
+    view.warnings.push(...issues.warnings)
+    view.errors.push(...issues.errors)
+    board.attention.push(...issues.attention)
+  }
+}
+
+/** The forge's open PRs and default branch. Adds summaries, viewer, listed, base, truncatedList, detailAge, follows, unknownWs. */
+async function listPrs(proj: ProjectTick): Promise<void> {
+  const { board, maxAge } = proj.t
+  const { info, kind, terms, forge, view, byBranch, repoWorkspaces } = proj
+  let summaries: PrSummary[] = []
+  let viewer = ''
+  let listed = false
+  let base: { name: string; sha: string | null; rollup: string | null } | null = null
+  // The forge had more open PRs than it lists: a PR's parent may be among those left out.
+  let truncatedList = false
+  // How long a PR's detail may be reused: shorter where the forge's list cannot show every change.
+  let detailAge = maxAge
+  // Only PRs whose branch lives in an Orca workspace and that the signed-in user opened.
+  const follows = (s: PrSummary, who: string) => byBranch.has(s.headRef) && (!who || !s.author || s.author === who)
+  try {
+    if (!forge) throw new Error(`Matriarch cannot read ${terms.name} here`)
+    const list = await forge.listOpen(info.ref, { watch: follows })
+    summaries = list.prs
+    viewer = list.viewer
+    base = list.base ?? null
+    detailAge = Math.min(maxAge, list.detailMaxAgeMs ?? maxAge)
+    truncatedList = list.truncated === true
+    // GitHub's budget is the scarce one: GitLab's shows only when no GitHub project reports one.
+    if (list.rate && (kind === 'github' || !board.rate)) board.rate = kind === 'github' ? list.rate : { ...list.rate, forge: terms.name }
+    // The real client says null when the forge has no default branch; a reader that omits it says nothing.
+    if (list.base === null) {
+      view.empty = true
+      view.errors.push(`${terms.name} has no commits for this project yet. Push a first commit to its main branch: workers branch from it and open their PRs against it.`)
+    }
+    // Conditional requests make an unchanged GitHub list free; GitLab has no such thing.
+    if (kind === 'github') board.github = { unchanged: (board.github?.unchanged ?? 0) + (list.unchanged ? 1 : 0), read: (board.github?.read ?? 0) + (list.unchanged ? 0 : 1) }
+    listed = true
+  } catch (error) {
+    view.errors.push(`${terms.name}: ${(error as Error).message}`)
+  }
+  // Workspaces whose PR state is unknown this tick keep their last known lane, unwritten.
+  const unknownWs = new Set<string>(listed ? [] : repoWorkspaces.map((w) => w.id))
+  Object.assign(proj, { summaries, viewer, listed, base, truncatedList, detailAge, follows, unknownWs })
+}
+
+/** The advisor: the supervisor's questions, answered read-only on the default branch. */
+async function stepAdvisor(proj: ProjectTick): Promise<void> {
+  const { deps, board, advised } = proj.t
+  const { repoKey, info, config, supervisor, acting, whyNot, base, kind, view } = proj
+  // The advisor: the supervisor's questions, answered read-only on the default branch.
+  if (deps.advisor) {
+    advised.add(repoKey)
+    try {
+      const advisor = await deps.advisor.step({
+        repo: repoKey, root: info.root, config, supervisor, acting, notActing: whyNot, base: base?.name ?? null, forge: kind,
+        supervisorSenders: async () => (deps.supervisorSenders ? deps.supervisorSenders(repoKey, supervisor) : [])
+      })
+      if (advisor) {
+        view.advisor = advisor
+        const needs = advisorAttention(repoKey, advisor)
+        if (needs) board.attention.push(needs)
+      }
+    } catch (error) {
+      view.errors.push(`Advisor: ${(error as Error).message}`)
+    }
+  }
+}
+
+/** Each followed open PR's detail and ledger, brought up to date. Adds items, mergeBusy, runningReviews, and what was tracked. */
+async function readOpenPrs(proj: ProjectTick): Promise<void> {
+  const { deps, now, crewMarks } = proj.t
+  const { repoKey, info, config, summaries, follows, viewer, detailAge, base, byBranch, view, unknownWs } = proj
+  const managed = summaries.filter((s) => follows(s, viewer)).sort((a, b) => a.number - b.number)
+
+  const trackedKey = `tracked:${repoKey}`
+  const tracked = toNumbers(await deps.store.get(trackedKey))
+  const open = new Set(managed.map((s) => s.number))
+
+  const items: { snap: PrSnapshot; ledger: PrLedger; ws: Workspace | undefined }[] = []
+  const mergeBusy = new Set<string>()
+  let runningReviews = 0
+  for (const s of managed) {
+    try {
+      const baseSha = base && s.baseRef === base.name ? base.sha : null
+      const read = await snapshotFor(deps, info, s, now, detailAge, baseSha)
+      if (!read) continue
+      const snap = await withFileMoves(deps, info, config, read, now, baseSha)
+      let ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, s.number)))
+      // When each head was first seen: a new commit's checks get a grace period to register.
+      if (!ledger.heads[snap.headSha]) {
+        ledger = { ...ledger, heads: Object.fromEntries([...Object.entries(ledger.heads), [snap.headSha, now]].slice(-20)) }
+        await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
+      }
+      if (snap.ci !== 'none' && !ledger.ciSeen) {
+        ledger = { ...ledger, ciSeen: true }
+        await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
+      }
+      // A round that asked for changes on an older commit, whose findings nobody received before
+      // the PR moved on, is moot: it does not use up one of the PR's rounds. (The next round still
+      // checks its findings.)
+      const moot = Object.entries(ledger.reviews).filter(([sha, r]) => sha !== snap.headSha && r.status === 'done' && r.verdict === 'changes' && !r.delivered && !r.published && !r.superseded)
+      if (moot.length > 0) {
+        ledger = { ...ledger, reviews: { ...ledger.reviews, ...Object.fromEntries(moot.map(([sha, r]) => [sha, { ...r, superseded: true }])) } }
+        await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
+      }
+      // A round still reviewing an older commit is moot: stop it, and it uses up no round.
+      for (const old of deps.crew ? await deps.crew.supersede(repoKey, s.number, snap.headSha).catch(() => []) : []) {
+        const prior = ledger.reviews[old.sha]
+        if (prior) ledger = { ...ledger, reviews: { ...ledger.reviews, [old.sha]: { ...prior, status: 'failed', superseded: true, endedAt: now } } }
+        await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
+        crewMarks.set(`${repoKey}#${s.number}`, [
+          ...(crewMarks.get(`${repoKey}#${s.number}`) ?? []),
+          { at: now, kind: 'review-done', label: `review of ${old.sha.slice(0, 7)} stopped: the PR moved to ${snap.headSha.slice(0, 7)}` }
+        ])
+      }
+      // A round that timed out may still get its verdicts: adopt them.
+      if (deps.crew && ledger.reviews[snap.headSha]?.status === 'failed') {
+        const revived = await deps.crew.revive(repoKey, s.number, snap.headSha).catch(() => null)
+        if (revived?.status === 'running') {
+          // It was only slow: a reviewer is still producing output. Back to running.
+          const prior = ledger.reviews[snap.headSha]
+          ledger = { ...ledger, reviews: { ...ledger.reviews, [snap.headSha]: { round: prior.round, status: 'running', startedAt: prior.startedAt } } }
+          await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
+          crewMarks.set(`${repoKey}#${s.number}`, [...(crewMarks.get(`${repoKey}#${s.number}`) ?? []), { at: now, kind: 'review-start', label: 'review round resumed: a reviewer is still working' }])
+        } else if (revived?.outcome) {
+          ledger = {
+            ...ledger,
+            reviews: {
+              ...ledger.reviews,
+              [snap.headSha]: { ...ledger.reviews[snap.headSha], status: 'done', endedAt: revived.endedAt ?? now, verdict: revived.outcome.verdict, findings: revived.outcome.blocking.length }
+            }
+          }
+          await deps.store.set(ledgerKey(repoKey, s.number), ledger as unknown as JsonValue)
+          crewMarks.set(`${repoKey}#${s.number}`, [...(crewMarks.get(`${repoKey}#${s.number}`) ?? []), { at: now, kind: 'review-done', label: revived.outcome.summary }])
+        }
+      }
+      // Only a fresh request for this exact commit holds the base: a stale one must not block merges.
+      if (ledger.merge?.status === 'requested' && ledger.merge.sha === snap.headSha && now - ledger.merge.at < MERGE_TIMEOUT_MS) mergeBusy.add(snap.baseRef)
+      runningReviews += Object.values(ledger.reviews).filter((r) => r.status === 'running').length
+      items.push({ snap, ledger, ws: byBranch.get(s.headRef) })
+    } catch (error) {
+      view.errors.push(`#${s.number}: ${(error as Error).message}`)
+      const ws = byBranch.get(s.headRef)
+      if (ws) unknownWs.add(ws.id)
+    }
+  }
+  Object.assign(proj, { trackedKey, tracked, open, items, mergeBusy, runningReviews })
+}
+
+/** PRs Matriarch followed that left the open list: their final state, read once, and the closed ones still on the board. */
+async function readClosedPrs(proj: ProjectTick): Promise<void> {
+  const { deps, now } = proj.t
+  const { repoKey, info, config, forge, listed, acting, byBranch, view, tracked, open, items, trackedKey } = proj
+  // PRs Matriarch followed that left the open list: read their final state once.
+  if (listed && forge) {
+    for (const number of tracked.filter((n) => !open.has(n))) {
+      try {
+        const { pr } = await forge.detail(info.ref, number)
+        if (!pr) continue
+        if (pr.state === 'OPEN') {
+          // Still open, but no longer followed (its worktree gone, another author): its records
+          // are pruned a week after this unless it is followed again.
+          if (!(await deps.store.get(`dropped:${repoKey}#${number}`))) await deps.store.set(`dropped:${repoKey}#${number}`, now)
+          continue
+        }
+        // Its review rounds are moot now.
+        if (deps.crew) await deps.crew.supersede(repoKey, number, null).catch(() => [])
+        const ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, number)))
+        // Its records are pruned a week after this.
+        if (!(await deps.store.get(`closed:${repoKey}#${number}`))) {
+          await deps.store.set(`closed:${repoKey}#${number}`, now)
+          // Once, when Matriarch first sees it merged, whoever merged it; like every alert, only
+          // while it acts (Orca has no notification for this one: it goes to the webhook only).
+          if (pr.state === 'MERGED' && acting) deps.alert?.({ kind: 'merged', title: `${repoKey} #${number} merged`, body: pr.title, repo: repoKey, number, url: pr.url })
+        }
+        if (pr.state === 'MERGED' && ledger.merge && ledger.merge.status !== 'merged') {
+          await deps.store.set(ledgerKey(repoKey, number), { ...ledger, merge: { ...ledger.merge, status: 'merged' } } as unknown as JsonValue)
+        }
+        // A merged PR's worktree has done its job: it goes once nothing runs there.
+        const done = byBranch.get(pr.headRef)
+        if (pr.state === 'MERGED' && done && done.path !== info.root && config.merge.removeWorktree) {
+          const list = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
+          if (!list.some((c) => c.path === done.path)) await deps.store.set(`cleanup:${repoKey}`, [...list, { path: done.path, number, at: now }] as unknown as JsonValue)
+        }
+        // Kept as it closed, so it can stay on the board without asking the forge again.
+        await deps.store.set(`snap:${repoKey}#${number}`, { snap: pr } as unknown as JsonValue)
+        items.push({ snap: pr, ledger, ws: byBranch.get(pr.headRef) })
+      } catch (error) {
+        view.errors.push(`#${number}: ${(error as Error).message}`)
+      }
+    }
+    await deps.store.set(trackedKey, [...open])
+    // Merged and closed PRs stay on the board and timeline for a while, from the state read when
+    // they closed: nothing is asked of the forge for them again.
+    if (deps.store.keys) {
+      const shown = new Set(items.map((i) => i.snap.number))
+      for (const key of (await deps.store.keys()).filter((k) => k.startsWith(`closed:${repoKey}#`))) {
+        const number = Number(key.slice(key.lastIndexOf('#') + 1))
+        const at = await deps.store.get(key)
+        if (shown.has(number) || typeof at !== 'number' || now - at > SHOW_CLOSED_MS) continue
+        const snap = ((await deps.store.get(`snap:${repoKey}#${number}`)) as { snap?: PrSnapshot } | null)?.snap
+        if (!snap || snap.state === 'OPEN') continue
+        items.push({ snap, ledger: loadLedger(await deps.store.get(ledgerKey(repoKey, number))), ws: byBranch.get(snap.headRef) })
+      }
+    }
+  }
+}
+
+/** Worktrees of merged PRs, removed once no worker is live there and nothing is uncommitted. */
+async function cleanupMergedWorktrees(proj: ProjectTick): Promise<void> {
+  const { deps, now, byWorktree } = proj.t
+  const { repoKey, info, config, acting, repoWorkspaces, byBranch, view, gone, cleanedUp } = proj
+  // Worktrees of merged PRs: removed once no worker is live there and nothing is uncommitted.
+  if (acting && deps.removeWorktree && config.merge.removeWorktree) {
+    // Once per project: PRs merged before this cleanup existed are found by their ledgers.
+    if (!(await deps.store.get(`cleanup:scanned:${repoKey}`)) && deps.store.keys) {
+      const found: PendingCleanup[] = []
+      for (const key of (await deps.store.keys()).filter((k) => k.startsWith(`pr:${repoKey}#`))) {
+        const number = Number(key.slice(key.indexOf('#') + 1))
+        if (loadLedger(await deps.store.get(key)).merge?.status !== 'merged') continue
+        const head = ((await deps.store.get(`snap:${repoKey}#${number}`)) as { snap?: { headRef?: string } } | null)?.snap?.headRef
+        const ws = head ? byBranch.get(head) : undefined
+        if (ws && ws.path !== info.root) found.push({ path: ws.path, number, at: now })
+      }
+      const list = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
+      await deps.store.set(`cleanup:${repoKey}`, [...list, ...found.filter((f) => !list.some((c) => c.path === f.path))] as unknown as JsonValue)
+      await deps.store.set(`cleanup:scanned:${repoKey}`, now)
+    }
+    const pending = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
+    const still: PendingCleanup[] = []
+    for (const c of pending) {
+      const ws = repoWorkspaces.find((w) => w.path === c.path)
+      if (!ws || ws.path === info.root || now - c.at > CLEANUP_GIVE_UP_MS) continue
+      const owner = byWorktree.get(ws)
       const act = deps.activity(ws.id, ws.path)
-      const worker = byWorktree.get(ws)
-      // Who answers this agent: the supervisor answers its workers, and the supervisor itself (in
-      // the project's own checkout) waits between turns by design. So waiting there is not
-      // "needs you", and a prompt is only once nobody has answered it for a while.
-      const isMain = ws.path === info.root
-      const answeredByMatriarch = worker !== undefined || isMain
-      const promptAge = act?.activity === 'blocked' ? now - act.since : 0
-      const lane: Lane =
-        act?.activity === 'working' ? 'building'
-        : act?.activity === 'blocked' ? (promptAge >= PROMPT_GRACE_MS ? 'needs-you' : 'building')
-        : act?.activity === 'waiting' && !answeredByMatriarch ? 'needs-you'
-        : 'idle'
-      // The project's own checkout is not a piece of work: shown only while an agent is busy there.
-      if (isMain && lane === 'idle') continue
-      const who = isMain ? 'the supervisor' : 'the agent'
-      const reason =
-        act?.activity === 'working' ? `${who} is working${isMain ? '' : '; no PR yet'}`
-        : act?.activity === 'blocked' ? (lane === 'needs-you' ? `${who} has waited ${Math.round(promptAge / 60_000)} min on a prompt in its tab` : `${who} paused on a prompt`)
-        : lane === 'needs-you' ? `${who} is waiting on input` : 'no PR and no agent working'
-      let history = loadHistory(await deps.store.get(historyKey(ws.id)))
-      history = { ...prune(noteLane(history, lane, reason, now), now), seenAt: now }
-      await deps.store.set(historyKey(ws.id), history as unknown as JsonValue)
-      const owner = ownerFor(ws, worker, act)
-      const win = windowed(history, since)
+      if ((owner && owner.live !== false) || agentBusy(act)) {
+        still.push({ ...c, kept: 'an agent is still running there' })
+        continue
+      }
+      const res = await deps.removeWorktree(ws.path).catch((error: Error) => ({ removed: false, reason: error.message }))
+      if (res.removed) {
+        deps.log(`${repoKey}: removed the worktree of merged #${c.number} (${ws.path})`)
+        gone.add(ws.path)
+        // The merged PR stays on the board for a while under its own key once its worktree is
+        // gone. When the worktree's history was this PR's, it goes with it; this tick's lane and
+        // marks are written there below.
+        const own = loadHistory(await deps.store.get(historyKey(ws.id)))
+        if (own.pr === undefined || own.pr === c.number) await deps.store.set(historyKey(`pr:${repoKey}#${c.number}`), { ...own, pr: c.number } as unknown as JsonValue)
+        cleanedUp.set(c.number, { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: no agent ran there and nothing in it was uncommitted` })
+        continue
+      }
+      still.push({ ...c, kept: res.reason ?? 'not removed' })
+      if (res.reason && res.reason !== c.kept) view.warnings.push(`Kept the worktree of merged #${c.number} (${ws.name}): ${res.reason}.`)
+    }
+    if (still.length !== pending.length || still.some((c, i) => c.kept !== pending[i]?.kept)) await deps.store.set(`cleanup:${repoKey}`, still as unknown as JsonValue)
+  }
+}
+
+/** Worktrees the supervisor's workers finished in that never became a PR, removed an hour after. */
+async function cleanupFinishedWorktrees(proj: ProjectTick): Promise<void> {
+  const { deps, now, byWorktree } = proj.t
+  const { repoKey, info, config, acting, listed, supervisor, summaries, repoWorkspaces, stoppedWorktrees, gone } = proj
+  // Worktrees the supervisor's workers used that never became a PR (a gate, an audit, a spike):
+  // removed an hour after Matriarch first sees no worker live there, when nothing in them is
+  // uncommitted or unpushed. Only worktrees of the supervisor's own Run, never one a person made.
+  if (acting && listed && deps.removeWorktree && config.merge.removeFinishedWorktrees && supervisor) {
+    const prBranches = new Set(summaries.map((s) => s.headRef))
+    const merging = new Set((((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []).map((c) => c.path))
+    const finishedKey = `finished:${repoKey}`
+    const seen = ((await deps.store.get(finishedKey)) as Record<string, number> | null) ?? {}
+    const still: Record<string, number> = {}
+    for (const ws of repoWorkspaces) {
+      if (ws.path === info.root || merging.has(ws.path) || prBranches.has(branchName(ws.branch) ?? '') || stoppedWorktrees[ws.path]) continue
+      const row = byWorktree.get(ws)
+      if (!row?.runId || `run:${row.runId}` !== supervisor || row.live !== false) continue
+      const act = deps.activity(ws.id, ws.path)
+      if (agentBusy(act)) continue
+      const since = seen[ws.path] ?? now
+      if (now - since < FINISHED_GRACE_MS) {
+        still[ws.path] = since
+        continue
+      }
+      const res = await deps.removeWorktree(ws.path, { keepBranch: true }).catch((error: Error) => ({ removed: false, reason: error.message }))
+      if (res.removed) {
+        deps.log(`${repoKey}: removed ${ws.name}, a finished worktree that never became a PR (${ws.path})`)
+        gone.add(ws.path)
+        // In its log too, as for a merged PR's worktree (kept a week, like any worktree's history).
+        const key = historyKey(ws.id)
+        const entry = { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: its worker finished, it never became a PR, and nothing in it was uncommitted or unpushed (its branch is kept)` }
+        await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
+      } else still[ws.path] = since
+    }
+    if (JSON.stringify(still) !== JSON.stringify(seen)) await deps.store.set(finishedKey, still as unknown as JsonValue)
+  }
+}
+
+/** What the tracks need across PRs: worktrees gone this tick, whose history each worktree's is, and stacked PRs' parents. */
+function prepareTracks(proj: ProjectTick): void {
+  const { items, gone, summaries, base } = proj
+  const seenWorkspaces = new Set<string>()
+  for (const item of items) if (item.ws && gone.has(item.ws.path)) item.ws = undefined
+  // A worktree's history belongs to the first PR on it (the lowest number, when two are first
+  // seen together); any other PR on that worktree keeps its own, by number.
+  const firstOn = new Map<string, number>()
+  for (const { ws, snap } of items) if (ws) firstOn.set(ws.id, Math.min(firstOn.get(ws.id) ?? Infinity, snap.number))
+  // Stacked PRs: one whose base is the head branch of another PR Matriarch follows merges only
+  // after it, and is moved and rebased once that one merged. Only a PR from a short-lived branch
+  // of this repository can be a parent (canBeParent): a release PR from a long-lived branch, or
+  // a fork's PR from its own main, never holds the PRs into that branch.
+  const parents = new Map<string, StackCandidate>()
+  for (const { snap: s } of items) {
+    if (s.state === 'OPEN' && canBeParent(s, base?.name ?? null)) parents.set(s.headRef, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef })
+  }
+  const all = new Map(summaries.map((s) => [s.number, { number: s.number, headRef: s.headRef, headSha: s.headSha, baseRef: s.baseRef ?? '' }]))
+  const openStack = { parents, all }
+  const closedSnaps = new Map(items.filter((i) => i.snap.state !== 'OPEN').map((i) => [i.snap.number, i.snap]))
+  Object.assign(proj, { seenWorkspaces, firstOn, openStack, closedSnaps })
+}
+
+/** The crew's run for a PR on its head commit, as the crew reports it. */
+type CrewRun = Awaited<ReturnType<Crew['get']>>
+
+/** One PR's turn: its ledger brought up to date, planned, acted on under autopilot, and its track written. */
+async function planAndAct(proj: ProjectTick, item: TickItem): Promise<void> {
+  const { deps, byWorktree } = proj.t
+  const ws = item.ws
+  const owner = ws ? ownerFor(ws, byWorktree.get(ws), deps.activity(ws.id, ws.path)) : null
+  await refreshLedger(proj, item, owner)
+  const { p, run } = await planFor(proj, item, owner)
+  const done = await act(proj, item, owner, p)
+  await writeTrack(proj, item, owner, p, run, done)
+}
+
+/** What the ledger learns before planning: a flaky failure judged, the PR it is stacked on, who built it. */
+async function refreshLedger(proj: ProjectTick, item: TickItem, owner: Owner | null): Promise<void> {
+  const { deps } = proj.t
+  const { repoKey, info, config, base, listed, openStack, closedSnaps } = proj
+  const { snap } = item
+  if (snap.state === 'OPEN') {
+    const judged = await judgeFailures(deps, info, snap, item.ledger, config)
+    if (judged !== item.ledger) {
+      item.ledger = judged
+      await deps.store.set(ledgerKey(repoKey, snap.number), judged as unknown as JsonValue)
+    }
+  }
+  if (snap.state === 'OPEN' && listed) {
+    const st = await followStack(deps, info, snap, item.ledger, openStack, closedSnaps, base?.name ?? null)
+    if (JSON.stringify(st ?? null) !== JSON.stringify(item.ledger.stack ?? null)) {
+      const next: PrLedger = { ...item.ledger }
+      if (st) next.stack = st
+      else delete next.stack
+      item.ledger = next
+      await deps.store.set(ledgerKey(repoKey, snap.number), next as unknown as JsonValue)
+    }
+  }
+  // Who built the PR: the first worker seen on it, and whether it finished a turn since.
+  if (owner?.address) {
+    const b = item.ledger.builder
+    const next = !b
+      ? { address: owner.address, done: owner.activity === 'done' }
+      : b.address === owner.address && owner.activity === 'done' && !b.done ? { ...b, done: true } : null
+    if (next) {
+      item.ledger = { ...item.ledger, builder: next }
+      await deps.store.set(ledgerKey(repoKey, snap.number), item.ledger as unknown as JsonValue)
+    }
+  }
+}
+
+/** The plan for a PR, with what its review round says (a failed round, a reviewer stuck on a prompt). */
+async function planFor(proj: ProjectTick, item: TickItem, owner: Owner | null): Promise<{ p: Plan; run: CrewRun | null }> {
+  const { deps, now, ownersKnown } = proj.t
+  const { repoKey, config, supervisor, base, truncatedList, byBranch, mergeBusy } = proj
+  const { snap } = item
+  const run = deps.crew ? await deps.crew.get(repoKey, snap.number, snap.headSha).catch(() => null) : null
+  const p = plan({
+    pr: snap,
+    owner,
+    ledger: item.ledger,
+    config,
+    supervisor,
+    mergeSlotFree: !mergeBusy.has(snap.baseRef),
+    reviewSlotFree: proj.runningReviews < config.limits.maxConcurrentReviews,
+    baseRed: base && base.name === snap.baseRef && (base.rollup === 'FAILURE' || base.rollup === 'ERROR') ? { sha: base.sha } : null,
+    // Known only for the default branch: GitHub's rollup is null when its head has no checks at all.
+    baseHasChecks: base && base.name === snap.baseRef ? base.rollup !== null : undefined,
+    ownersKnown,
+    stack: item.ledger.stack ?? null,
+    // A cut-short list may leave out the PR whose branch this one merges into.
+    unlistedBase:
+      truncatedList && snap.state === 'OPEN' && !item.ledger.stack && byBranch.has(snap.baseRef) && stackableBranch(snap.baseRef, base?.name ?? null),
+    now
+  })
+
+  // A failed round says why, not just that it failed.
+  if (run?.status === 'failed' && item.ledger.reviews[snap.headSha]?.status === 'failed') {
+    p.reason = `review round ${run.round} failed: ${run.error ?? 'unknown'}${run.reviewers.some((r) => r.status === 'failed') ? ` (${run.reviewers.filter((r) => r.status === 'failed').map((r) => `${r.name}: ${r.error ?? 'failed'}`).join('; ')})` : ''}`
+  }
+  // A reviewer stuck on an agent prompt needs a person before anything else can happen.
+  const stuck = run?.status === 'running' ? run.reviewers.find((r) => r.status === 'running' && r.blocked) : undefined
+  if (stuck) {
+    p.lane = 'needs-you'
+    p.reason = `reviewer ${stuck.name} (${stuck.agent}) needs you: ${stuck.blocked}`
+  }
+
+  return { p, run }
+}
+
+/** Carries out a plan's actions under autopilot, recording each in the ledger as it succeeds. Answers the ledger, and the marks and log lines for the track. */
+async function act(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Plan): Promise<{ ledger: PrLedger; marks: Mark[]; logged: LogEntry[] }> {
+  const { deps, opts, now, byWorktree } = proj.t
+  const { repoKey, info, config, kind, supervisor, acting, mergeBusy, view } = proj
+  const { snap } = item
+  let ledger = item.ledger
+  const marks: Mark[] = []
+  // What was carried out (or tried) this tick, for the track's activity log.
+  const logged: LogEntry[] = []
+  const ownerRow = item.ws ? byWorktree.get(item.ws) : undefined
+  const failedLogs = p.actions.some((a) => a.kind === 'send-ci-failure') ? await keptLogs(deps, info, snap) : {}
+  const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null, owner: owner?.address ?? null, failedLogs }
+  const run1 = async (a: Action) => {
+    try {
+      return await deps.executor!.execute(a, ctx)
+    } catch (error) {
+      return { ok: false, error: (error as Error).message }
+    }
+  }
+  for (const action of p.actions) {
+    if (action.kind === 'merge') mergeBusy.add(snap.baseRef)
+    if (action.kind === 'start-review') proj.runningReviews++
+    if (!acting) continue
+    // The pause switch is honoured between actions, not only between ticks.
+    if (opts.stillOn && !(await opts.stillOn().catch(() => false))) break
+    // A red base is one problem per repository: escalate it once, not once per ready PR.
+    const escKey = action.kind === 'escalate' ? action.key : null
+    const baseRedKey = escKey?.startsWith('base-red:') ? `base-red:${repoKey}` : null
+    if (baseRedKey && (await deps.store.get(baseRedKey)) === escKey) {
+      ledger = record(ledger, action, now)
+      continue
+    }
+    const outcome = await run1(action)
+    if (outcome.ok) {
+      ledger = record(ledger, action, now)
+      marks.push(markFor(action, now, kind))
+      logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
+      // Saved after each success, so a later failure in this tick cannot make it run twice.
+      await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
+      if (baseRedKey && escKey) await deps.store.set(baseRedKey, escKey)
+      continue
+    }
+    if (outcome.skipped) continue
+    logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
+    view.errors.push(`#${snap.number} ${action.kind}: ${outcome.error ?? 'failed'}`)
+    // A re-run the forge refused is not asked for again: the failure goes to the worker next.
+    if (action.kind === 'rerun-check') {
+      ledger = recordRefusedRerun(ledger, action, now, outcome.error ?? 'refused')
+      await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
+    }
+    // A move of the base the forge refused is tried again later, and escalated after a few tries.
+    if (action.kind === 'retarget') {
+      ledger = recordRefusedRetarget(ledger, action, now, outcome.error ?? 'refused')
+      await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
+    }
+    if (action.kind === 'merge') ledger = { ...ledger, merge: { sha: action.sha, at: now, status: 'failed', error: outcome.error } }
+    // A supervisor that cannot be reached: tell the person now, and forget a Run Orca lost.
+    if (action.kind === 'escalate' && action.to === 'supervisor') {
+      if (/run_not_found|dispatch_not_found|not found/i.test(outcome.error ?? '')) await deps.store.set(`supervisor:${repoKey}`, '')
+      const human: Action = { kind: 'escalate', to: 'human', key: action.key.replace(/:supervisor$/, ':human'), reason: `${action.reason} (the supervisor could not be reached)`, address: null }
+      const told = await run1(human)
+      if (told.ok) {
+        ledger = record(record(ledger, action, now), human, now)
+        marks.push(markFor(human, now, kind))
+        logged.push(logEntry(human, told, now, kind, describe(human, kind)))
+        await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
+      }
+    }
+  }
+  if (ledger !== item.ledger) await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
+
+  return { ledger, marks, logged }
+}
+
+/** A PR's history (its commits, lane, marks and log) written, and its card put on the board. */
+async function writeTrack(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Plan, run: CrewRun | null, done: { ledger: PrLedger; marks: Mark[]; logged: LogEntry[] }): Promise<void> {
+  const { deps, opts, board, now, since, crewMarks } = proj.t
+  const { repoKey, kind, firstOn, cleanedUp, seenWorkspaces } = proj
+  const { snap, ws } = item
+  const { ledger, marks, logged } = done
+  const prKey = `pr:${repoKey}#${snap.number}`
+  const trackKey = ws && ((loadHistory(await deps.store.get(historyKey(ws.id))).pr ?? firstOn.get(ws.id)) === snap.number) ? ws.id : prKey
+  let history = loadHistory(await deps.store.get(historyKey(trackKey)))
+  if (history.lastSha !== snap.headSha) {
+    if (history.lastSha) {
+      const push: Mark = { at: now, kind: 'push', label: `pushed ${shortSha(snap.headSha)}` }
+      history = addLog(addMark(history, push), markEntry(push))
+    }
+    history = { ...history, lastSha: snap.headSha }
+  }
+  // In the log, in the order they lead to each other: what came in (a commit, a finished
+  // review), the lane that put the PR in, then what Matriarch did about it.
+  for (const m of crewMarks.get(`${repoKey}#${snap.number}`) ?? []) history = addLog(addMark(history, m), markEntry(m))
+  history = noteLane(history, p.lane, p.reason, now)
+  for (const m of marks) history = addMark(history, m)
+  for (const e of logged) history = addLog(history, e)
+  const cleaned = cleanedUp.get(snap.number)
+  if (cleaned) {
+    history = addLog(history, cleaned)
+    cleanedUp.delete(snap.number)
+  }
+  history = { ...prune(history, now), seenAt: now, pr: snap.number }
+  await deps.store.set(historyKey(trackKey), history as unknown as JsonValue)
+  if (ws) seenWorkspaces.add(ws.id)
+
+  const review = ledger.reviews[snap.headSha]
+  for (const r of run?.status === 'running' ? run.reviewers : []) {
+    if (r.status !== 'running' || !r.blocked) continue
+    board.attention.push({
+      key: `${repoKey}#${snap.number}:${r.name}`,
+      repo: repoKey,
+      message: `${repoKey} #${snap.number}: the ${r.name} reviewer (${r.agent}) needs you. ${r.blocked}.`,
+      terminal: r.blockedTerminal ?? undefined,
+      workspaceId: run?.worktree?.workspaceId ?? undefined
+    })
+  }
+  const win = windowed(history, since)
+  board.tracks.push({
+    key: trackKey,
+    repo: repoKey,
+    workspace: ws ? { id: ws.id, name: ws.name, branch: branchName(ws.branch) } : { id: prKey, name: snap.headRef, branch: snap.headRef },
+    pr: {
+      number: snap.number,
+      title: snap.title,
+      url: snap.url,
+      sha: snap.headSha,
+      base: snap.baseRef,
+      ci: snap.ci,
+      failing: snap.checks.filter((c) => c.state === 'failure').map((c) => c.name),
+      openThreads: actionableThreads(snap).length,
+      ...(ledger.stack && snap.state === 'OPEN' && snap.baseRef === ledger.stack.headRef ? { stackedOn: ledger.stack.number } : {})
+    },
+    owner: owner ? { agent: owner.agent, model: owner.model, activity: owner.activity, supervised: owner.address !== null } : null,
+    lane: p.lane,
+    reason: p.reason,
+    next: opts.autopilot ? [] : p.actions.map((a) => describe(a, kind)),
+    review:
+      review || run
+        ? {
+            round: review?.round ?? run!.round,
+            status: review?.status ?? run!.status,
+            verdict: review?.verdict,
+            summary: run?.outcome?.summary ?? run?.error ?? undefined,
+            // Capped and trimmed: the board is posted to the panel on every tick.
+            findings: (run?.outcome?.findings ?? []).slice(0, 40).map((f) => ({
+              severity: f.severity,
+              file: f.file,
+              line: f.line,
+              title: f.title,
+              detail: f.detail.slice(0, 800),
+              suggestion: f.suggestion.slice(0, 400),
+              reviewers: f.reviewers
+            })),
+            reviewers: (run?.reviewers ?? []).map((r) => ({
+              name: r.name,
+              agent: r.agent,
+              model: r.model,
+              status: r.status,
+              verdict: r.verdict?.verdict,
+              findings: r.verdict?.findings.length,
+              error: r.error ?? undefined,
+              blocked: r.status === 'running' ? (r.blocked ?? undefined) : undefined,
+              terminal: r.status === 'running' && r.blocked ? (r.blockedTerminal ?? undefined) : undefined,
+              lock: r.lock ? LOCK_LABEL[r.lock] : undefined
+            }))
+          }
+        : null,
+    rounds: {
+      ci: roundsUsed(ledger, 'ci'),
+      conflicts: roundsUsed(ledger, 'conflicts'),
+      comments: roundsUsed(ledger, 'comments'),
+      reviews: roundsUsed(ledger, 'reviews')
+    },
+    segments: win.segments,
+    marks: win.marks
+  })
+}
+
+/** A merged PR no longer on the board whose worktree went this tick: its line goes to its log. */
+async function logLeftoverCleanups(proj: ProjectTick): Promise<void> {
+  const { deps } = proj.t
+  const { repoKey, cleanedUp } = proj
+  // A merged PR no longer on the board whose worktree went this tick: its line goes to its log.
+  for (const [number, entry] of cleanedUp) {
+    const key = historyKey(`pr:${repoKey}#${number}`)
+    await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
+  }
+}
+
+/** Worktrees with no PR yet: building while their agent works, idle otherwise. */
+async function worktreeTracks(proj: ProjectTick): Promise<void> {
+  const { deps, board, now, since, byWorktree } = proj.t
+  const { repoKey, info, terms, repoWorkspaces, seenWorkspaces, gone, unknownWs } = proj
+  // Worktrees with no PR yet: building while their agent works, idle otherwise.
+  for (const ws of repoWorkspaces) {
+    if (seenWorkspaces.has(ws.id) || gone.has(ws.path)) continue
+    if (unknownWs.has(ws.id)) {
+      // The forge could not say what this worktree's PR is doing: show the last known lane, and
+      // leave its history alone rather than rewrite it as idle.
+      const known = loadHistory(await deps.store.get(historyKey(ws.id)))
+      const last = known.segments[known.segments.length - 1]
+      const win = windowed(known, since)
       board.tracks.push({
         key: ws.id,
         repo: repoKey,
-        ...(isMain ? { role: 'supervisor' as const } : {}),
         workspace: { id: ws.id, name: ws.name, branch: branchName(ws.branch) },
         pr: null,
-        owner: owner ? { agent: owner.agent, model: owner.model, activity: owner.activity, supervised: owner.address !== null } : null,
-        lane,
-        reason,
+        owner: null,
+        lane: last?.lane ?? 'idle',
+        reason: `${terms.name} is unavailable; this is the last known state${last ? `: ${last.reason}` : ''}`,
         next: [],
         review: null,
         rounds: { ci: 0, conflicts: 0, comments: 0, reviews: 0 },
         segments: win.segments,
         marks: win.marks
       })
+      continue
     }
+    const act = deps.activity(ws.id, ws.path)
+    const worker = byWorktree.get(ws)
+    // Who answers this agent: the supervisor answers its workers, and the supervisor itself (in
+    // the project's own checkout) waits between turns by design. So waiting there is not
+    // "needs you", and a prompt is only once nobody has answered it for a while.
+    const isMain = ws.path === info.root
+    const answeredByMatriarch = worker !== undefined || isMain
+    const promptAge = act?.activity === 'blocked' ? now - act.since : 0
+    const lane: Lane =
+      act?.activity === 'working' ? 'building'
+      : act?.activity === 'blocked' ? (promptAge >= PROMPT_GRACE_MS ? 'needs-you' : 'building')
+      : act?.activity === 'waiting' && !answeredByMatriarch ? 'needs-you'
+      : 'idle'
+    // The project's own checkout is not a piece of work: shown only while an agent is busy there.
+    if (isMain && lane === 'idle') continue
+    const who = isMain ? 'the supervisor' : 'the agent'
+    const reason =
+      act?.activity === 'working' ? `${who} is working${isMain ? '' : '; no PR yet'}`
+      : act?.activity === 'blocked' ? (lane === 'needs-you' ? `${who} has waited ${Math.round(promptAge / 60_000)} min on a prompt in its tab` : `${who} paused on a prompt`)
+      : lane === 'needs-you' ? `${who} is waiting on input` : 'no PR and no agent working'
+    let history = loadHistory(await deps.store.get(historyKey(ws.id)))
+    history = { ...prune(noteLane(history, lane, reason, now), now), seenAt: now }
+    await deps.store.set(historyKey(ws.id), history as unknown as JsonValue)
+    const owner = ownerFor(ws, worker, act)
+    const win = windowed(history, since)
+    board.tracks.push({
+      key: ws.id,
+      repo: repoKey,
+      ...(isMain ? { role: 'supervisor' as const } : {}),
+      workspace: { id: ws.id, name: ws.name, branch: branchName(ws.branch) },
+      pr: null,
+      owner: owner ? { agent: owner.agent, model: owner.model, activity: owner.activity, supervised: owner.address !== null } : null,
+      lane,
+      reason,
+      next: [],
+      review: null,
+      rounds: { ci: 0, conflicts: 0, comments: 0, reviews: 0 },
+      segments: win.segments,
+      marks: win.marks
+    })
   }
+}
 
+/** What is looked after across projects once each had its turn: advisors elsewhere, Needs-you alerts, review worktrees, pruning. */
+async function afterProjects(t: TickContext, workspaces: readonly Workspace[]): Promise<void> {
+  const { deps, opts, board, now, advised } = t
   deps.onProjects?.(board.repos.map((r) => r.repo))
   // An advisor at work for a project no tick sees now (its workspaces closed) still times out,
   // is checked for prompts and unlocked resumes, and has its worktree removed and its mail sent.
@@ -1435,15 +1675,6 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     })
     if (removed > 0) deps.log(`pruned ${removed} stale storage record(s)`)
   }
-
-  board.tracks.sort(
-    (a, b) =>
-      LANE_ORDER.indexOf(a.lane) - LANE_ORDER.indexOf(b.lane) ||
-      a.repo.localeCompare(b.repo) ||
-      (a.pr?.number ?? Infinity) - (b.pr?.number ?? Infinity) ||
-      a.workspace.name.localeCompare(b.workspace.name)
-  )
-  return board
 }
 
 export type { TrackHistory, TrackView }

@@ -123,7 +123,12 @@ that agent in the throwaway worktree.
 
 - **Engine.** A `trusted-worker` plugin. A contributed status bar item keeps its worker
   running. All its state lives in `orca.storage` (and the webhook URL in `orca.secrets`), so
-  restarts and reloads lose nothing. It never calls an LLM.
+  restarts and reloads lose nothing. It never calls an LLM. A tick (`tick()` in `src/engine.ts`)
+  polls the crew, reads Orca's workspaces and workers, then gives each project its turn in steps
+  (`tickProject`: settings, supervisor and board row, worker limits, issues, the open PRs, the
+  advisor, PR details, closed PRs, the two cleanups, then each PR planned, acted on and its track
+  written, then the worktrees with no PR), and last looks after what spans projects (advisors
+  elsewhere, Needs-you alerts, review worktrees, pruning).
 - **Supervisor.** An Orca agent started on its own provider and model with a generated brief:
   the role map, exact `worker-start` command templates per tier, the PR contract below, the
   limits, and how to ask the advisor. It owns the orchestration Run. The engine raises judgment
