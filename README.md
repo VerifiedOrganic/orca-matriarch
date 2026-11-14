@@ -102,7 +102,9 @@ manages only PRs you opened from a branch that belongs to an Orca workspace.
   that PR's log, newest first: each lane it entered and why, new commits, finished reviews, and
   every message it sent (to the worker, the supervisor or you, with its subject), branch update,
   merge and cleanup, including what failed and why. Only what it did: dry run's plans stay in
-  **Would do next**. Kept for a week.
+  **Would do next**. Something that fails every check is one line with a count (`×12, last
+  14:05`). Each PR has its own log, even two from one branch. Kept for a week. Rows open with
+  Enter or Space too.
 - **Supervisor:** each project's chat, with the Run it coordinates and how many workers it has.
 - **Needs you:** a reviewer waiting on a prompt, an escalation that reached you, a nearly full
   disk. The status bar shows the same at a glance.
@@ -120,13 +122,18 @@ your desk. Open **Alerts** (next to **+ Add project**), paste the webhook URL, p
 
 - **Where:** a Slack incoming webhook, a Discord channel webhook, ntfy (ntfy.sh, or your own
   server: pick **ntfy** by hand), or any URL that takes a JSON POST with `kind`, `title`, `body`,
-  `repo`, `number` and `url`. Slack, Discord and ntfy.sh are told apart by their address.
+  `repo`, `number` and `url`. Slack, Discord and ntfy.sh are told apart by their address. A server
+  that wants a password can take it in the URL (`https://user:pass@ntfy.example.com/topic`): it is
+  sent as a Basic `Authorization` header and never shown.
 - **What:** **Needs you** (an escalation that reached you, a reviewer stuck on a prompt, a PR that
-  needs your merge or is blocked) and **Ready to merge** are on by default; **Merged** (a PR
-  Matriarch follows merged, by it or by anyone) is off.
-- **How:** each alert is posted once, with a 10-second limit, and never retried. Orca's own
-  notification comes either way. A post that fails shows on the Alerts page, without blocking
-  anything else.
+  needs your merge or is blocked) and **Ready to merge** are on by default, and go alongside Orca's
+  own notification. **Merged** (a PR Matriarch follows merged, by it or by anyone) is off by
+  default and goes to the webhook only: Orca has no notification for it.
+- **When:** while autopilot is on, like everything else Matriarch sends. In dry run only a
+  reviewer stuck on a prompt (in a review you started) is sent, as Orca notifies you of it too.
+- **How:** each alert is posted once, with a 10-second limit, and never retried or redirected.
+  Four go at a time and twenty more wait their turn; past that, the rest go as one "and N more"
+  post. A post that fails shows on the Alerts page, without blocking anything else.
 - **The URL is a secret:** anyone who has a Slack or Discord webhook URL can post to that channel.
   Matriarch keeps it in Orca's encrypted secrets (your OS key store), not in plugin storage or a
   project's settings, and shows and logs only its host. Where Orca has no OS key store, it does

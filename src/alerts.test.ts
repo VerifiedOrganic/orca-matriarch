@@ -1,7 +1,7 @@
 // Away alerts: formats, what is sent when, failures, and that the webhook URL stays a secret. No
 // test reaches a real webhook: every post goes to a fake fetch.
 import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
-import { ALERTS_ERROR_KEY, ALERTS_KEY, ALERTS_URL_SECRET, checkUrl, createAlerter, detectFormat, payload, type Alert, type FetchLike } from './alerts.ts'
+import { ALERTS_ERROR_KEY, ALERTS_KEY, ALERTS_URL_SECRET, checkUrl, createAlerter, detectFormat, payload, scrub, type Alert, type FetchLike } from './alerts.ts'
 import { validateConfig } from './config.ts'
 import { tick, type EngineDeps } from './engine.ts'
 import type { Exec } from './exec.ts'
@@ -16,30 +16,47 @@ const needsYou: Alert = { kind: 'needs-you', title: 'acme/app #12 needs you', bo
 
 /** A fake fetch that records posts; `answer` decides each reply. */
 function fakeFetch(answer: (url: string) => Promise<{ ok: boolean; status: number }> = async () => ({ ok: true, status: 200 })) {
-  const posts: { url: string; headers: Record<string, string>; body: string }[] = []
+  const posts: { url: string; headers: Record<string, string>; body: string; redirect: string }[] = []
+  let now = 0
+  let most = 0
   const fetch: FetchLike = async (url, init) => {
-    posts.push({ url, headers: init.headers, body: init.body })
-    return answer(url)
+    posts.push({ url, headers: init.headers, body: init.body, redirect: init.redirect })
+    now++
+    most = Math.max(most, now)
+    try {
+      return await answer(url)
+    } finally {
+      now--
+    }
   }
-  return { fetch, posts }
+  return { fetch, posts, most: () => most }
 }
 
-function setup(answer?: (url: string) => Promise<{ ok: boolean; status: number }>, opts: { secure?: boolean; timeoutMs?: number } = {}) {
+function setup(answer?: (url: string) => Promise<{ ok: boolean; status: number }>, opts: { secure?: boolean; timeoutMs?: number; failSet?: string } = {}) {
   const f = fakeFetch(answer)
   const secrets = new Map<string, string>()
   const storage = new Map<string, unknown>()
   const logs: string[] = []
   const alerter = createAlerter({
     fetch: f.fetch,
-    secrets: { get: async (k) => secrets.get(k) ?? null, set: async (k, v) => void secrets.set(k, v), delete: async (k) => void secrets.delete(k) },
+    secrets: {
+      get: async (k) => secrets.get(k) ?? null,
+      set: async (k, v) => {
+        if (opts.failSet) throw new Error(opts.failSet)
+        secrets.set(k, v)
+      },
+      delete: async (k) => void secrets.delete(k)
+    },
     storage: { get: async (k) => storage.get(k) ?? null, set: async (k, v) => void storage.set(k, v) },
     secure: async () => opts.secure ?? true,
     log: (m) => logs.push(m),
     now: () => 1_000,
     timeoutMs: opts.timeoutMs
   })
-  return { alerter, posts: f.posts, secrets, storage, logs }
+  return { alerter, posts: f.posts, most: f.most, secrets, storage, logs }
 }
+
+const wait = (ms: number) => new Promise<{ ok: boolean; status: number }>((resolve) => setTimeout(() => resolve({ ok: true, status: 200 }), ms))
 
 describe('formats', () => {
   test('are told from the URL, and anything else is JSON', () => {
@@ -69,6 +86,13 @@ describe('formats', () => {
     assert.equal(p.headers.click, needsYou.url)
     assert.equal(p.headers.priority, 'high')
     assert.equal(payload('ntfy', { kind: 'merged', title: 'merged', body: 'x' }).headers.priority, undefined)
+  })
+
+  test('a line break in an ntfy title cannot start a header of its own', () => {
+    const p = payload('ntfy', { ...needsYou, title: 'Fix\r\nX-Injected: 1', url: 'https://github.com/acme/app/pull/12\r\nX-Other: 2' })
+    for (const v of Object.values(p.headers)) assert.ok(!/[\r\n]/.test(v), `no line break in ${JSON.stringify(v)}`)
+    assert.equal(p.headers.title, `=?UTF-8?B?${Buffer.from('Fix\r\nX-Injected: 1').toString('base64')}?=`)
+    assert.equal(p.headers.click, 'https://github.com/acme/app/pull/12X-Other: 2')
   })
 
   test('JSON carries the fields as named', () => {
@@ -149,17 +173,65 @@ describe('the alerter', () => {
     assert.equal(ok.storage.get(ALERTS_ERROR_KEY), null)
   })
 
-  test('gives up on a webhook that does not answer, and never queues more than a few', async () => {
-    // Answers only when the post is aborted, like a server that never replies.
-    const hang = (_url: string) => new Promise<{ ok: boolean; status: number }>(() => {})
-    const h = setup(hang, { timeoutMs: 20 })
+  test('gives up on a webhook that does not answer, even one whose client ignores the abort', async () => {
+    const never = (_url: string) => new Promise<{ ok: boolean; status: number }>(() => {})
+    const h = setup(never, { timeoutMs: 20 })
     h.secrets.set(ALERTS_URL_SECRET, SLACK)
     for (let i = 0; i < 6; i++) h.alerter.send({ ...needsYou, title: `alert ${i}` })
-    assert.equal(h.logs.filter((l) => l.includes('dropped')).length, 2, 'only 4 at once; the rest are dropped, not queued')
-    const slow = setup(async (_u) => new Promise((resolve) => setTimeout(() => resolve({ ok: true, status: 200 }), 200)), { timeoutMs: 20 })
+    await h.alerter.idle()
+    assert.equal(h.posts.length, 6, 'each one tried once, the last two after a place freed')
+    assert.equal(h.logs.filter((l) => l.includes('did not answer within 0.02 s')).length, 6)
+    const slow = setup(() => wait(200), { timeoutMs: 20 })
     slow.secrets.set(ALERTS_URL_SECRET, SLACK)
-    const r = await slow.alerter.test()
-    assert.deepEqual(r, { ok: false, error: 'hooks.slack.com did not answer within 0.02 s' })
+    assert.deepEqual(await slow.alerter.test(), { ok: false, error: 'hooks.slack.com did not answer within 0.02 s' })
+  })
+
+  test('a burst against a healthy webhook: four at a time, twenty waiting, the rest as one post', async () => {
+    const h = setup(() => wait(5))
+    h.secrets.set(ALERTS_URL_SECRET, SLACK)
+    for (let i = 0; i < 30; i++) h.alerter.send({ ...needsYou, kind: 'ready', title: `acme/app #${i} is ready to merge` })
+    await h.alerter.idle()
+    assert.equal(h.most(), 4, 'never more than four at once')
+    assert.equal(h.posts.length, 25, '24 one by one, then one for the rest')
+    const last = JSON.parse(h.posts.at(-1)!.body) as { text: string }
+    assert.match(last.text, /^\*Matriarch: and 6 more\*/)
+    for (let i = 24; i < 30; i++) assert.ok(last.text.includes(`#${i} is ready`), `#${i} is named in it`)
+    assert.equal(h.logs.length, 1, 'the folding is said once')
+    // Nothing set, or switched off: nothing takes a place or says it was dropped.
+    const none = setup()
+    for (let i = 0; i < 6; i++) none.alerter.send(needsYou)
+    await none.alerter.idle()
+    assert.deepEqual([none.posts.length, none.logs], [0, []])
+  })
+
+  test('credentials in the URL go as a Basic header, never into the address, a log or the panel', async () => {
+    const h = setup(async () => ({ ok: false, status: 401 }))
+    const url = 'https://alice:p%40ss-w0rd@ntfy.example.com/alerts'
+    assert.equal(await h.alerter.save({ format: 'ntfy', events: { 'needs-you': true, ready: true, merged: false }, url }), null)
+    h.alerter.send(needsYou)
+    await h.alerter.idle()
+    assert.equal(h.posts[0].url, 'https://ntfy.example.com/alerts')
+    assert.equal(h.posts[0].headers.authorization, `Basic ${Buffer.from('alice:p@ss-w0rd').toString('base64')}`)
+    assert.equal(h.posts[0].redirect, 'error', 'a redirect cannot carry the post elsewhere')
+    const view = await h.alerter.view()
+    assert.equal(view.host, 'ntfy.example.com')
+    const shown = JSON.stringify([view, h.logs, [...h.storage]])
+    for (const secret of ['p%40ss-w0rd', 'p@ss-w0rd', 'alice:']) assert.ok(!shown.includes(secret), `${secret} is not shown`)
+  })
+
+  test('the URL is scrubbed from every error, whatever carries it', async () => {
+    const h = setup(async () => {
+      throw new TypeError(`Failed to parse URL from ${SLACK}`)
+    })
+    h.secrets.set(ALERTS_URL_SECRET, SLACK)
+    h.alerter.send(needsYou)
+    await h.alerter.idle()
+    assert.equal((h.storage.get(ALERTS_ERROR_KEY) as { message: string }).message, 'could not reach hooks.slack.com: Failed to parse URL from hooks.slack.com')
+    assert.ok(!h.logs.join('\n').includes('s3cretpath'))
+    assert.equal(scrub('POST /services/T000/B000/s3cretpath failed', SLACK), 'POST hooks.slack.com failed', 'its path alone too')
+    const failing = setup(undefined, { failSet: `keychain refused ${SLACK}` })
+    const why = await failing.alerter.save({ format: 'auto', events: { 'needs-you': true, ready: true, merged: false }, url: SLACK })
+    assert.equal(why, 'Orca could not store the webhook URL: keychain refused hooks.slack.com')
   })
 
   test('a test goes to a URL being typed without saving it, or to the saved one', async () => {
@@ -184,36 +256,41 @@ describe('where alerts come from', () => {
     assert.deepEqual(told.map((t) => t.kind), ['ready', 'needs-you', 'needs-you'])
   })
 
-  test('the engine alerts once when it first sees a PR merged', async () => {
-    const store = new Map<string, unknown>()
-    const alerts: Alert[] = []
-    let state: PrSnapshot = pr({ number: 12 })
-    const github: GitHub = {
-      listOpen: async () => ({ viewer: 'me', rate: null, prs: state.state === 'OPEN' ? [{ number: 12, headRef: state.headRef, headSha: state.headSha, author: state.author, updatedAt: state.updatedAt, rollup: state.ci }] : [] }),
-      detail: async () => ({ pr: state, rate: null })
+  test('the engine alerts once when it first sees a PR merged, only while it acts', async () => {
+    const run = async (autopilot: boolean) => {
+      const store = new Map<string, unknown>()
+      const alerts: Alert[] = []
+      let state: PrSnapshot = pr({ number: 12 })
+      const github: GitHub = {
+        listOpen: async () => ({ viewer: 'me', rate: null, prs: state.state === 'OPEN' ? [{ number: 12, headRef: state.headRef, headSha: state.headSha, author: state.author, updatedAt: state.updatedAt, rollup: state.ci }] : [] }),
+        detail: async () => ({ pr: state, rate: null })
+      }
+      const deps: EngineDeps = {
+        now: () => 1_800_000_000_000,
+        log: () => {},
+        workspaces: async () => [],
+        repoOf: async () => null,
+        readConfig: async () => validateConfig({ review: { enabled: false } }),
+        github,
+        workers: async () => [],
+        activity: () => null,
+        supervisor: async () => null,
+        store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) },
+        executor: { execute: async () => ({ ok: true }) },
+        alert: (a) => void alerts.push(a)
+      }
+      // Followed while open, from a workspace on its branch.
+      deps.workspaces = async () => [{ id: 'ws', kind: 'worktree', name: 'login', path: '/r/wt/login', branch: state.headRef, hostId: null }]
+      deps.repoOf = async () => ({ ref: { owner: 'acme', name: 'app' }, key: 'acme/app', root: '/r' })
+      await tick(deps, { autopilot })
+      state = { ...state, state: 'MERGED' }
+      await tick(deps, { autopilot })
+      await tick(deps, { autopilot })
+      return { alerts, url: state.url }
     }
-    const deps: EngineDeps = {
-      now: () => 1_800_000_000_000,
-      log: () => {},
-      workspaces: async () => [],
-      repoOf: async () => null,
-      readConfig: async () => validateConfig({ review: { enabled: false } }),
-      github,
-      workers: async () => [],
-      activity: () => null,
-      supervisor: async () => null,
-      store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) },
-      executor: null,
-      alert: (a) => void alerts.push(a)
-    }
-    // Followed while open, from a workspace on its branch.
-    deps.workspaces = async () => [{ id: 'ws', kind: 'worktree', name: 'login', path: '/r/wt/login', branch: state.headRef, hostId: null }]
-    deps.repoOf = async () => ({ ref: { owner: 'acme', name: 'app' }, key: 'acme/app', root: '/r' })
-    await tick(deps, { autopilot: false })
-    state = { ...state, state: 'MERGED' }
-    await tick(deps, { autopilot: false })
-    await tick(deps, { autopilot: false })
-    assert.deepEqual(alerts.map((a) => [a.kind, a.title, a.url]), [['merged', 'acme/app #12 merged', state.url]])
+    const acting = await run(true)
+    assert.deepEqual(acting.alerts.map((a) => [a.kind, a.title, a.url]), [['merged', 'acme/app #12 merged', acting.url]])
+    assert.deepEqual((await run(false)).alerts, [], 'dry run sends nothing, to the webhook either')
   })
 })
 

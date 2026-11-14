@@ -433,13 +433,23 @@ taught this: the only place to answer it was a terminal in a worktree you never 
   - the unread dot on the review worktree in Orca's sidebar, with a comment saying why.
 - **Away from the desk.** With a webhook set under **Alerts**, the same notices also go to Slack,
   Discord, ntfy or any JSON webhook, by kind: needs you, ready to merge, and (off by default)
-  merged. Each is posted once, never retried, with a 10-second limit raced against the request so
-  a hung webhook cannot hold anything up; at most four are in flight, and more are dropped and
-  logged rather than queued. A failed post is kept for the Alerts page until one works. The URL
-  is a secret (whoever has a Slack or Discord webhook can post to it): it lives in Orca's
-  encrypted secrets (`secrets:own`, the OS key store), is refused where Orca has none, and only
-  its host is ever shown or logged. A Discord post allows no mentions, so a PR titled
-  `@everyone` cannot ping a channel.
+  merged, which is webhook-only since Orca shows no notification for a merge. The engine's alerts
+  go only while it acts (autopilot on), like everything it sends.
+  - Each is posted once, never retried and never redirected (`redirect: 'error'`, so a 307 or 308
+    cannot carry the POST elsewhere), with a 10-second limit raced against the request so a hung
+    webhook cannot hold anything up.
+  - Whether an alert goes (its kind switched on, a URL set) is settled before it takes a place.
+    Four post at a time, twenty more wait, and anything past that is folded into one "and N more"
+    post once the queue drains.
+  - A failed post is kept for the Alerts page until one works.
+  - The URL is a secret (whoever has a Slack or Discord webhook can post to it): it lives in Orca's
+    encrypted secrets (`secrets:own`, the OS key store), is refused where Orca has none, and only
+    its host is ever shown or logged; every error is scrubbed of it, its path and any password.
+    Credentials in it go as a Basic `Authorization` header, since Node's fetch refuses them in a
+    URL.
+  - A Discord post allows no mentions, so a PR titled `@everyone` cannot ping a channel. An ntfy
+    title with a line break is RFC 2047-encoded, and the link header keeps only printable ASCII,
+    so no PR text can add a header.
 - **Naming.** Review worktrees are named `Matriarch review · #<n> · <sha>` and linked to their
   PR, so they read as Matriarch's at a glance.
 - **Timing.** A reviewer is timed out only when it has been quiet for the whole limit: no
@@ -461,11 +471,17 @@ tick (`board.changed`), and the board carries the last 24 hours of history.
 - **Log:** what Matriarch did and why, in words: each new lane with its reason (not every new
   reason within a lane, since some change each check), new commits, finished reviews, and every
   action it carried out or tried, with the recipient and subject of each message the executor
-  sent and the error of each that failed. Dry run's plans are not logged. Capped at 300 lines and
-  pruned with the rest. It is not on the board: the panel asks for one track's log
-  (`track.log`) when it is opened, and again after each tick while it stays open. When a merged
-  PR's worktree is removed, its history moves to `track:pr:<repo>#<n>`, the key its card uses
-  from then on.
+  sent and the error of each that failed. Dry run's plans are not logged. The same line right
+  after itself (an action that fails every check) is counted on the first, with when it last came,
+  so a stuck PR does not fill the log. Capped at 300 lines and pruned with the rest. It is not on
+  the board: the panel asks for one track's log (`track.log`) when it is opened, and again after
+  each tick while it stays open.
+- **Whose history:** a worktree's history (`track:<workspaceId>`) belongs to the first PR on that
+  worktree (`pr` in the record), so one row runs from building to merged. Any other PR on the
+  same worktree (a follow-up from the same branch while the first is still on the board, or one
+  per base) keeps its own under `track:pr:<repo>#<n>`, so their lanes, commits and logs never mix.
+  When a merged PR's worktree is removed, its history moves to `track:pr:<repo>#<n>` and the
+  worktree counts as gone for the rest of that tick, so the tick's lines land there too.
 
 Worktrees with no PR yet appear too: `building` while their agent works, `needs-you` while it
 waits for input, `idle` otherwise.

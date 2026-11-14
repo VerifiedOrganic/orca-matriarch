@@ -54,6 +54,10 @@ export interface LogEntry {
   subject?: string
   /** It was tried and failed: why. */
   error?: string
+  /** The same line came this many times in a row (an action that keeps failing, say); `at` is the first. */
+  count?: number
+  /** When it last came, once it came more than once. */
+  lastAt?: number
 }
 
 export interface ReviewerView {
