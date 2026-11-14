@@ -6,9 +6,13 @@
 // - the agent.tool.before hook refuses a start over a limit, with what to do instead.
 //
 // The hook judges only the supervisor's own terminal and its Run's workers' terminals, never a
-// session of the person's. Orca reports tool calls only for agents in a terminal (a chat-mode
-// session has no hook stream in Orca 1.4.257) and waits for an answer only from Claude Code, so a
-// supervisor in a chat, or on another agent, can still go over; Needs you then shows it.
+// session of the person's. Orca reports tool calls only for agents in a terminal (Orca 1.4.257
+// starts a chat session's agent without a pane identity, and plugins see only calls from a pane)
+// and waits for an answer only from Claude Code. So for a supervisor in a chat (the default) or on
+// another agent, a third way holds the limits: under autopilot, a worker whose start put the
+// project over one is stopped as soon as a tick sees it, and the supervisor is told to start it
+// again when there is room (overLimitStarts). Only a start is ever over a limit: workers that were
+// there when Matriarch first looked, or when a limit was lowered, are never stopped.
 //
 // The hook gets 2 s and may not await, so it decides from what the last tick counted, plus the
 // starts it let through since. Reading the command it fails closed: any `orchestration` followed
@@ -208,6 +212,76 @@ export function limitsMessage(limits: Limits): { subject: string; body: string }
       ? ['The user changed the worker limits. From now on:', ...lines].join('\n')
       : 'The user turned the worker limits off: Matriarch no longer refuses a worker start in this project.'
   }
+}
+
+/** A worker that started over a limit, with why, in words for the supervisor. */
+export interface OverLimit {
+  dispatchId: string
+  taskId: string | null
+  limit: 'workers' | 'day' | 'disk'
+  reason: string
+}
+
+/**
+ * Of the workers first seen this tick (`fresh`, newest first as Orca lists them), the ones the
+ * limits had no room for. They are taken in the order they started and judged as the hook would
+ * have judged each start: one that fits counts, one that does not is over. `runningBefore` and
+ * `startsBefore` are the counts without the fresh ones.
+ */
+export function overLimitStarts(
+  fresh: readonly WorkerRow[],
+  input: { repo: string; runningBefore: number; startsBefore: number; freeBytes: number | null; limits: Limits }
+): OverLimit[] {
+  const { limits, repo } = input
+  let running = input.runningBefore
+  let starts = input.startsBefore
+  const over: OverLimit[] = []
+  for (const w of [...fresh].reverse()) {
+    // One that already finished took no room; it still used a start.
+    if (!isWorking(w)) {
+      starts++
+      continue
+    }
+    const base = { dispatchId: w.dispatchId, taskId: w.taskId }
+    if (limits.maxWorkers > 0 && running + 1 > limits.maxWorkers) {
+      over.push({ ...base, limit: 'workers', reason: `it started while ${running} of ${limits.maxWorkers} workers were running in ${repo}, the most this project runs at once. Start it again once one finishes.` })
+    } else if (limits.maxWorkerStartsPerDay > 0 && starts + 1 > limits.maxWorkerStartsPerDay) {
+      over.push({ ...base, limit: 'day', reason: `${repo} had started ${starts} workers today, its limit of ${limits.maxWorkerStartsPerDay} a day. Start it again after midnight.` })
+    } else if (limits.minFreeDiskGB > 0 && input.freeBytes !== null && input.freeBytes < limits.minFreeDiskGB * GB) {
+      over.push({ ...base, limit: 'disk', reason: `only ${gb(input.freeBytes)} was free on the disk with ${repo}, under this project's ${limits.minFreeDiskGB} GB floor. Start it again once space is freed.` })
+    } else {
+      running++
+      starts++
+    }
+  }
+  return over
+}
+
+/** What the supervisor is told when Matriarch stopped workers that started over a limit. */
+export function stoppedMessage(stopped: readonly OverLimit[]): { subject: string; body: string } {
+  return {
+    subject: `Stopped ${stopped.length === 1 ? 'a worker' : `${stopped.length} workers`} that started over a limit`,
+    body: [
+      `Matriarch stopped ${stopped.length === 1 ? 'this worker' : 'these workers'} right after ${stopped.length === 1 ? 'it' : 'they'} started, because the project's limits had no room:`,
+      ...stopped.map((o) => `- dispatch:${o.dispatchId}${o.taskId ? ` (task ${o.taskId})` : ''}: ${o.reason}`),
+      '',
+      `${stopped.length === 1 ? 'Its task is' : 'Their tasks are'} not done, and ${stopped.length === 1 ? 'its worktree is' : 'their worktrees are'} kept. Start a worker only when the limits have room, so none has to be stopped.`
+    ].join('\n')
+  }
+}
+
+/** A stop that did not go through, tried again while its worker still runs. */
+export interface PendingStop extends OverLimit {
+  at: number
+}
+
+/** How long Matriarch keeps trying to stop a worker that started over a limit. */
+export const STOP_RETRY_MS = 10 * 60_000
+
+export function loadPendingStops(raw: unknown): PendingStop[] {
+  return Array.isArray(raw)
+    ? raw.filter((p): p is PendingStop => typeof p?.dispatchId === 'string' && typeof p.at === 'number' && typeof p.reason === 'string')
+    : []
 }
 
 export interface ToolCall {

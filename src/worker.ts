@@ -394,6 +394,17 @@ export function createWorker(options: WorkerOptions = {}) {
       },
       onLimits: (state) => limitsGuard.update(state),
       onProjects: (repos) => limitsGuard.keep(new Set(repos)),
+      // Fences the dispatch and stops its agent; Orca never deletes the worktree. stop_unknown
+      // means Orca fenced it but could not prove the agent exited: it no longer works for the Run.
+      stopWorker: async (dispatchId) => {
+        try {
+          await cli.run(['orchestration', 'worker-stop', '--dispatch', dispatchId])
+          return { ok: true }
+        } catch (error) {
+          if (error instanceof OrcaRefusal && error.code === 'stop_unknown') return { ok: true }
+          return { ok: false, error: (error as Error).message }
+        }
+      },
       tellSupervisor: async (repo, root, to, m) => sendMessage(cli, { to, subject: m.subject, body: m.body, from: await mailboxFor(repo, root) }),
       commentIssue: async (ref, number, body) => {
         const forge = forgeKind(ref) === 'gitlab' ? gitlabForge : githubForge

@@ -144,15 +144,21 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - **Reviews at once** (default 2) limits how many review crews run together.
 - **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
   supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
-  The supervisor's brief states them, and a running supervisor is told when you change them. A
-  start over a limit is refused, with what to do instead (wait for a worker to finish, for
-  tomorrow, or for space), when it comes from the supervisor's own terminal or one of its
-  workers' and that agent is Claude Code. Orca stops only Claude Code's tool calls, and reports
-  none for a session in a chat (the supervisor opens as one), so a supervisor in a chat or on
-  another agent can go over; **Needs you** then says so. A command that starts workers in a loop
-  is refused while a count limit is set, since how many it starts cannot be known. Limits hold in
-  dry run too: they guard your disk and accounts, not the PRs. Your own sessions are never
-  refused.
+  The supervisor's brief states them, and a running supervisor is told when you change them.
+  They are held two ways:
+  - **Before a start**, when the supervisor or one of its workers is Claude Code in a terminal:
+    its `worker-start` over a limit is refused, with what to do instead (wait for a worker to
+    finish, for tomorrow, or for space). A command that starts workers in a loop is refused while
+    a count limit is set, since how many it starts cannot be known. This holds in dry run too.
+  - **Right after a start**, for every other case: Orca reports no tool calls for a session in a
+    chat (the supervisor opens as one) and waits on none but Claude Code's. So with autopilot on,
+    a worker whose start put the project over a limit is stopped (`orca orchestration
+    worker-stop`, which keeps its worktree) as soon as Matriarch sees it, within a check, and the
+    supervisor is told to start it again when there is room. In dry run the board says it would.
+
+  Only a start is ever over a limit: workers already running when Matriarch first looks, or when
+  you lower a limit, are never stopped, and **Needs you** says the project is over. Your own
+  sessions are never refused.
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback
 model you choose; otherwise it shows the reviewer as **Needs you**.
@@ -212,6 +218,7 @@ Supervisor and worker launches are not changed.
 | `orca terminal create` | once per project: a terminal titled "Matriarch mailbox" (`cat > /dev/null`), which Orca requires as the sender of Matriarch's messages |
 | `orca orchestration worker-list`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
 | `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations and labeled issues to the supervisor |
+| `orca orchestration worker-stop --dispatch <id>` | autopilot: stop a supervisor's worker that started over the project's worker limits (its worktree is kept) |
 | `git fetch origin …`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | a review round: a throwaway worktree at the PR head, one agent per reviewer, removed afterwards |
 | `orca terminal close` | a reviewer that started without its lockdown is stopped |
 | `gh api repos/<repo>/pulls/<n>/reviews` | autopilot, when **Where reviews go** includes the PR: one comment review per round |
