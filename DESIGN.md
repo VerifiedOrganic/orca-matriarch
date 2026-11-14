@@ -431,6 +431,15 @@ taught this: the only place to answer it was a terminal in a worktree you never 
 - **Orca's own surfaces.**
   - a desktop notification the moment it happens;
   - the unread dot on the review worktree in Orca's sidebar, with a comment saying why.
+- **Away from the desk.** With a webhook set under **Alerts**, the same notices also go to Slack,
+  Discord, ntfy or any JSON webhook, by kind: needs you, ready to merge, and (off by default)
+  merged. Each is posted once, never retried, with a 10-second limit raced against the request so
+  a hung webhook cannot hold anything up; at most four are in flight, and more are dropped and
+  logged rather than queued. A failed post is kept for the Alerts page until one works. The URL
+  is a secret (whoever has a Slack or Discord webhook can post to it): it lives in Orca's
+  encrypted secrets (`secrets:own`, the OS key store), is refused where Orca has none, and only
+  its host is ever shown or logged. A Discord post allows no mentions, so a PR titled
+  `@everyone` cannot ping a channel.
 - **Naming.** Review worktrees are named `Matriarch review · #<n> · <sha>` and linked to their
   PR, so they read as Matriarch's at a glance.
 - **Timing.** A reviewer is timed out only when it has been quiet for the whole limit: no
@@ -527,7 +536,7 @@ can be changed and checked without Orca.
   - workspace: `workspace.list`
   - agents: `agents.list`
   - UI: `notifications.show`, `statusBar.update`
-  - plugin data: `storage.*`, `settings.*`
+  - plugin data: `storage.*`, `settings.*`, `secrets.*` (the away-alert webhook URL)
 - **Events:** `agent.status.changed`, `workspace.created`, `workspace.removed`.
 - **Hooks:**
   - `agent.launch.before` (built): reviewers start locked down in their agent's own read-only mode;

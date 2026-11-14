@@ -55,6 +55,9 @@
     },
     {
       "kind": "settings:own"
+    },
+    {
+      "kind": "secrets:own"
     }
   ],
   "contributes": {

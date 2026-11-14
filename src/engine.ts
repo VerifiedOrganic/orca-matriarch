@@ -4,6 +4,7 @@
 // GitHub or GitLab.
 import type { JsonValue } from 'orca/host'
 import { logEntry, markEntry } from './activity.ts'
+import type { Alert } from './alerts.ts'
 import { defaultConfig, type ConfigResult } from './config.ts'
 import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
@@ -83,6 +84,8 @@ export interface EngineDeps {
   removeWorktree?: (path: string, options?: { keepBranch?: boolean }) => Promise<{ removed: boolean; reason?: string }>
   /** Bytes free on the disk holding a path; null when it cannot tell. */
   freeSpace?: (path: string) => Promise<number | null>
+  /** Posts an away alert when the person set a webhook; returns at once and never throws. */
+  alert?: (alert: Alert) => void
 }
 
 /** Below this, the board says the disk is nearly full: a full disk stalls every agent's build. */
@@ -515,7 +518,11 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
           if (deps.crew) await deps.crew.supersede(repoKey, number, null).catch(() => [])
           const ledger = loadLedger(await deps.store.get(ledgerKey(repoKey, number)))
           // Its records are pruned a week after this.
-          if (!(await deps.store.get(`closed:${repoKey}#${number}`))) await deps.store.set(`closed:${repoKey}#${number}`, now)
+          if (!(await deps.store.get(`closed:${repoKey}#${number}`))) {
+            await deps.store.set(`closed:${repoKey}#${number}`, now)
+            // Once, when Matriarch first sees it merged, whoever merged it.
+            if (pr.state === 'MERGED') deps.alert?.({ kind: 'merged', title: `${repoKey} #${number} merged`, body: pr.title, repo: repoKey, number, url: pr.url })
+          }
           if (pr.state === 'MERGED' && ledger.merge && ledger.merge.status !== 'merged') {
             await deps.store.set(ledgerKey(repoKey, number), { ...ledger, merge: { ...ledger.merge, status: 'merged' } } as unknown as JsonValue)
           }

@@ -4,6 +4,7 @@
 // supervisor, its settings and its own work as a swimlane timeline or a board by lane.
 import type { MatriarchConfig } from '../config.ts'
 import type { Board, LogEntry, ProjectInfo, RepoView, TrackView } from '../protocol.ts'
+import { alertsForm, alertsSave, alertsState, type AlertsState } from './alerts.ts'
 import { el, sv } from './dom.ts'
 import { ago, bars, byGroup, concurrency, GROUPS, LANES, marksIn, scale, summary, ticks, type Group } from './layout.ts'
 import { draftConfig, settingsForm, settingsState, type SettingsState } from './settings.ts'
@@ -39,7 +40,7 @@ const WINDOWS = [
   { label: '24h', ms: 24 * 3600_000 }
 ]
 
-type Page = { kind: 'project'; repo: string } | { kind: 'all' } | { kind: 'add' }
+type Page = { kind: 'project'; repo: string } | { kind: 'all' } | { kind: 'add' } | { kind: 'alerts' }
 
 const state = {
   board: null as Board | null,
@@ -60,6 +61,12 @@ const state = {
   focus: null as { repo: string | null; root: string | null; enabled: boolean; name: string | null; candidates: string[] } | null,
   /** A render was skipped while the person typed. */
   deferred: false,
+  /** The away-alert form, while its page is open. */
+  alerts: null as AlertsState | null,
+  /** The page to go back to when the alerts page closes. */
+  back: null as Page | null,
+  /** The webhook's host when away alerts are on, for the button that opens them. */
+  alertsOn: null as string | null,
   /** The track whose activity log is open (one at a time), and what the worker answered. */
   log: null as { key: string; entries: LogEntry[] | null; error: string | null } | null
 }
@@ -109,14 +116,18 @@ async function request<T>(fn: () => Promise<T>): Promise<T | null> {
 }
 
 function go(page: Page): void {
+  const from = state.page
   state.page = page
   if (state.settings && (page.kind !== 'project' || page.repo !== state.settings.repo)) state.settings = null
+  if (page.kind === 'alerts' && from?.kind !== 'alerts') state.back = from
+  if (page.kind !== 'alerts') state.alerts = null
   try {
-    if (page.kind !== 'add') localStorage.setItem(PAGE_KEY, JSON.stringify(page))
+    if (page.kind !== 'add' && page.kind !== 'alerts') localStorage.setItem(PAGE_KEY, JSON.stringify(page))
   } catch {
     // not remembered; fine
   }
   if (page.kind === 'add') void loadProjects()
+  if (page.kind === 'alerts') void loadAlerts()
   render(true)
 }
 
@@ -130,7 +141,7 @@ function defaultPage(b: Board): Page {
 /** The page to show: the one picked, while it still exists. */
 function currentPage(b: Board): Page {
   const p = state.page
-  if (p?.kind === 'add' || p?.kind === 'all') return p
+  if (p?.kind === 'add' || p?.kind === 'all' || p?.kind === 'alerts') return p
   if (p?.kind === 'project' && b.repos.some((r) => r.repo === p.repo)) return p
   return defaultPage(b)
 }
@@ -195,7 +206,8 @@ async function followFocus(): Promise<void> {
   if (f.repo && f.repo !== followed) {
     followed = f.repo
     const on = f.enabled || state.board?.repos.some((r) => r.repo === f.repo)
-    if (on && !state.settings) go({ kind: 'project', repo: f.repo })
+    // Not while a form is open: the person is in the middle of something.
+    if (on && !state.settings && state.page?.kind !== 'alerts') go({ kind: 'project', repo: f.repo })
   }
   render()
 }
@@ -242,7 +254,13 @@ function projectBar(b: Board, page: Page): HTMLElement {
     b.repos.length > 1
       ? el('button', { class: 'project-chip', 'aria-pressed': page.kind === 'all' ? 'true' : 'false', title: 'Every project on one timeline', onclick: () => go({ kind: 'all' }) }, 'All')
       : null,
-    el('button', { class: page.kind === 'add' ? 'project-chip' : 'ghost', 'aria-pressed': page.kind === 'add' ? 'true' : 'false', onclick: () => go({ kind: 'add' }) }, '+ Add project')
+    el('button', { class: page.kind === 'add' ? 'project-chip' : 'ghost', 'aria-pressed': page.kind === 'add' ? 'true' : 'false', onclick: () => go({ kind: 'add' }) }, '+ Add project'),
+    el('button', {
+      class: page.kind === 'alerts' ? 'project-chip' : 'ghost',
+      'aria-pressed': page.kind === 'alerts' ? 'true' : 'false',
+      title: state.alertsOn ? `Away alerts go to ${state.alertsOn}` : 'Send what needs you to Slack, Discord, ntfy or a webhook, for when you are away',
+      onclick: () => go({ kind: 'alerts' })
+    }, state.alertsOn ? el('span', { class: 'dot', style: 'background:var(--m-ready)' }) : null, 'Alerts')
   )
 }
 
@@ -715,6 +733,54 @@ function allPage(b: Board): HTMLElement[] {
   ].filter((x): x is HTMLElement => x !== null)
 }
 
+async function loadAlerts(): Promise<void> {
+  await request(async () => {
+    const view = await orca.plugin.request('alerts.get')
+    state.alertsOn = view.host
+    state.alerts = alertsState(view)
+  })
+}
+
+async function saveAlerts(s: AlertsState): Promise<void> {
+  await request(async () => {
+    const res = await orca.plugin.request('alerts.save', alertsSave(s))
+    if (res.saved) {
+      // Start again from what is saved: the URL field closes on the host it now shows.
+      state.alerts = { ...alertsState(res.alerts), saved: true }
+      state.alertsOn = res.alerts.host
+    } else s.error = res.error
+  })
+}
+
+async function testAlerts(s: AlertsState): Promise<void> {
+  s.test = { busy: true, ok: null, message: null }
+  render(true)
+  try {
+    const typed = s.url?.trim()
+    const res = await orca.plugin.request('alerts.test', { ...(typed ? { url: typed } : {}), format: s.format })
+    s.test = { busy: false, ok: res.ok, message: res.ok ? 'Sent. Check that it arrived.' : `Not delivered: ${res.error}` }
+    // A test of the saved webhook updates its last-failure note.
+    if (!typed) s.view = { ...s.view, ...(await orca.plugin.request('alerts.get')), format: s.view.format, events: s.view.events }
+  } catch (error) {
+    s.test = { busy: false, ok: false, message: (error as Error).message }
+  }
+  render(true)
+}
+
+function alertsPage(b: Board): HTMLElement[] {
+  const s = state.alerts
+  if (!s) return [el('div', { class: 'muted' }, state.error ? `Could not read the alert settings: ${state.error}` : 'Loading…')]
+  return [
+    alertsForm(s, {
+      busy: state.busy,
+      redraw: () => render(true),
+      save: () => void saveAlerts(s),
+      test: () => void testAlerts(s),
+      close: () => go(state.back && state.back.kind !== 'alerts' ? state.back : defaultPage(b))
+    })
+  ]
+}
+
 async function loadProjects(): Promise<void> {
   await request(async () => {
     state.projects = (await orca.plugin.request('projects.list')).projects
@@ -788,7 +854,7 @@ function render(force = false): void {
     header(b),
     projectBar(b, page),
     focusNote(page) ?? '',
-    ...(page.kind === 'add' ? addPage(b) : page.kind === 'all' ? allPage(b) : projectPage(b, repo!))
+    ...(page.kind === 'add' ? addPage(b) : page.kind === 'alerts' ? alertsPage(b) : page.kind === 'all' ? allPage(b) : projectPage(b, repo!))
   )
 }
 
@@ -809,3 +875,8 @@ setInterval(() => render(), 15_000)
 void request(async () => {
   state.board = await orca.plugin.request('board.get')
 })
+// Whether away alerts are on, for the dot on their button.
+void orca.plugin.request('alerts.get').then((v) => {
+  state.alertsOn = v.host
+  render()
+}, () => {})

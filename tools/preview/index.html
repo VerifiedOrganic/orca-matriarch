@@ -129,8 +129,17 @@
     { at: now - 200 * M, kind: 'send-ci-failure', text: 'Sent the worker 1 failing check (test), round 1', to: 'worker', subject: 'CI failed on #42 (round 1 of 3)' },
     { at: now - 202 * M, kind: 'update-branch', text: 'Tried to update the branch from its base (rebase)', error: 'GitHub: the branch was updated by someone else; trying again next check' }
   ]
+  // Away alerts: ?alerts=off has no webhook yet, ?alerts=failed shows a failed post.
+  const alertsView = {
+    format: 'auto', events: { 'needs-you': true, ready: true, merged: false },
+    host: params.get('alerts') === 'off' ? null : 'hooks.slack.com', detected: params.get('alerts') === 'off' ? null : 'slack',
+    lastError: params.get('alerts') === 'failed' ? { at: now - 35 * M, message: 'hooks.slack.com answered HTTP 404' } : null, secure: true
+  }
   const replies = {
     'track.log': () => ({ key: 'search-api', entries: log }),
+    'alerts.get': () => alertsView,
+    'alerts.save': () => ({ saved: true, error: null, alerts: alertsView }),
+    'alerts.test': () => ({ ok: true, error: null }),
     'projects.list': () => ({ projects }),
     'project.enable': () => ({ ok: true, message: 'on', repo: 'acme/app' }),
     'config.get': () => ({ config: structuredClone(config), errors: [], warnings: clean ? [] : ['reviewers[2]: Matriarch can start only claude and codex reviewers read-only, so "style" (grok) is not started.'], agents }),
@@ -180,6 +189,7 @@
     else document.querySelector('.row .label[aria-expanded]')?.click()
   }, 400)
   if (params.get('page') === 'add') setTimeout(() => click('+ Add project'), 200)
+  if (params.get('page') === 'alerts') setTimeout(() => click('Alerts'), 200)
   if (params.get('page') === 'all') setTimeout(() => click('All'), 200)
 </script>
 </body>

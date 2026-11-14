@@ -144,7 +144,7 @@ const idOf = (node: HTMLElement): string => (node.id ||= `m-set-${++ids}`)
  * One setting as a row: its name with a hint under it, and the control on the right. A `stack` row
  * puts a wide control (a long dropdown, a text box) under the name while the panel is narrow.
  */
-function row(label: string, hint: string | null, control: HTMLElement, opts: { stack?: boolean; before?: Child[]; after?: Child[]; class?: string } = {}): HTMLElement {
+export function row(label: string, hint: string | null, control: HTMLElement, opts: { stack?: boolean; before?: Child[]; after?: Child[]; class?: string } = {}): HTMLElement {
   return el('div', { class: `set${opts.stack ? ' stack' : ''}${opts.class ? ` ${opts.class}` : ''}` },
     el('div', { class: 'set-text' },
       el('label', { class: 'set-label', for: idOf(control) }, label),
@@ -153,7 +153,7 @@ function row(label: string, hint: string | null, control: HTMLElement, opts: { s
 }
 
 /** A dropdown setting; one with long choices or a long hint goes under its name while the panel is narrow. */
-function choice<T extends string>(label: string, hint: string | null, value: T, options: readonly (readonly [T, string])[], set: (v: T) => void): HTMLElement {
+export function choice<T extends string>(label: string, hint: string | null, value: T, options: readonly (readonly [T, string])[], set: (v: T) => void): HTMLElement {
   return row(label, hint, select(value, options, (v) => set(v as T)), { stack: options.some(([, text]) => text.length > 24) || (hint?.length ?? 0) > 100 })
 }
 

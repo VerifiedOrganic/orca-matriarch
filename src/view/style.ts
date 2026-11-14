@@ -126,6 +126,15 @@ input.switch:focus-visible { outline: 2px solid color-mix(in srgb, var(--m-blue)
 .settings :is(input[type=text], input[type=number]):focus { outline: none; border-color: var(--m-blue); box-shadow: 0 0 0 2px color-mix(in srgb, var(--m-blue) 25%, transparent); }
 .settings input.num { width: 58px; padding: 0 4px 0 8px; text-align: right; }
 .settings .callout b { display: block; }
+/* Away alerts: the same form parts as Settings, without the groups. */
+.alerts-head { display: flex; align-items: baseline; gap: 6px; }
+.alerts .group-body.flat { padding: 0; border-top: 0; }
+.alerts .set.stack .hook-set { justify-content: flex-start; }
+.alerts .set.stack .hook-set > * { flex: none; width: auto; }
+.alerts .set.stack .hook-set > .hook-host { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.alerts input.hook-url { width: 100%; }
+.alerts-test { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 2px 0 4px; }
+.ok-text { color: var(--m-ready); font-size: 11px; }
 .set-hint { font-size: 11px; color: var(--orca-muted-foreground); }
 .unit { color: var(--orca-muted-foreground); white-space: nowrap; }
 

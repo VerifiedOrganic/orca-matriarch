@@ -1,11 +1,12 @@
 // The worker ⇄ view contract, shared by src/worker.ts and src/view/*. Also the stored shapes
 // of a track's history.
+import type { AlertFormat, AlertsSave, AlertsView } from './alerts.ts'
 import type { MatriarchConfig } from './config.ts'
 import type { ForgeKind } from './forge.ts'
 import type { CiState } from './github.ts'
 import type { Activity, Lane } from './plan.ts'
 
-export type { Activity, CiState, ForgeKind, Lane }
+export type { Activity, AlertFormat, AlertsSave, AlertsView, CiState, ForgeKind, Lane }
 
 /** A span of time a worktree spent in one lane. `to` is null while it is still there. */
 export interface Segment {
@@ -243,6 +244,12 @@ declare module 'orca' {
     'config.get': { input: { repo: string }; output: { config: MatriarchConfig; errors: string[]; warnings: string[]; agents: AgentOption[] } }
     /** Checks and saves a project's settings; nothing is written when there are errors. */
     'config.save': { input: { repo: string; config: MatriarchConfig }; output: { saved: boolean; errors: string[]; warnings: string[] } }
+    /** The away-alert settings, for every project: the webhook's host, never its URL. */
+    'alerts.get': { output: AlertsView }
+    /** Saves the away-alert settings; the URL goes to Orca's encrypted secrets. `url` absent keeps the saved one, empty removes it. */
+    'alerts.save': { input: AlertsSave; output: { saved: boolean; error: string | null; alerts: AlertsView } }
+    /** Posts a test alert now, to the URL given (not saved yet) or the saved one. */
+    'alerts.test': { input: { url?: string; format?: AlertFormat | 'auto' }; output: { ok: boolean; error: string | null } }
   }
   interface PluginPanelEvents {
     /** Posted after every tick and every autopilot change. */

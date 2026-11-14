@@ -58,7 +58,8 @@ export interface Executor {
 export interface ExecutorDeps {
   exec: Exec
   orca: OrcaCli
-  notify(title: string, body: string): Promise<void>
+  /** Tells the person, in Orca and on the away webhook; `about` says what kind of alert it is. */
+  notify(title: string, body: string, about?: { kind: 'needs-you' | 'ready'; repo: string; number: number; url: string }): Promise<void>
   crew?: Crew
   ghBin?: string
   glabBin?: string
@@ -154,7 +155,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
           }
           try {
             const title = `${pr.repo} #${pr.number} needs you`
-            await deps.notify(title, action.reason)
+            await deps.notify(title, action.reason, { kind: 'needs-you', repo: pr.repo, number: pr.number, url: pr.url })
             return { ok: true, sent: { to: 'you', subject: title } }
           } catch (error) {
             return { ok: false, error: `notification: ${(error as Error).message}` }
@@ -162,7 +163,8 @@ export function createExecutor(deps: ExecutorDeps): Executor {
         }
         case 'notify':
           try {
-            await deps.notify(action.title, action.body)
+            // A ready PR is its own kind of alert; every other notice is something that needs you.
+            await deps.notify(action.title, action.body, { kind: action.key.startsWith('ready:') ? 'ready' : 'needs-you', repo: pr.repo, number: pr.number, url: pr.url })
             return { ok: true, sent: { to: 'you', subject: action.title } }
           } catch (error) {
             return { ok: false, error: `notification: ${(error as Error).message}` }
