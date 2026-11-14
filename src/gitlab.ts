@@ -561,15 +561,15 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
       if (!added || !at || !by || id === null) return { ok: false, why: `Matriarch cannot tell who added ${label}` }
       const { data } = await graphql(repo, ISSUE_EDIT_QUERY, { path: projectPath(repo), iid: String(issue.number) })
       const edited = str(obj(obj(data.project).issue).lastEditedAt)
-      if (edited && Date.parse(edited) > Date.parse(at)) return { ok: false, why: `it was edited after ${by} added ${label}` }
+      if (edited && Date.parse(edited) > Date.parse(at)) return { ok: false, why: `it was edited after ${by} added ${label}`, at }
       const res = await glab(repo, [rest(projectPath(repo), `members/all/${id}`)])
       if (res.code !== 0) {
         const text = `${res.stderr}${res.stdout}`.trim()
-        if (/\b404\b|Not Found/i.test(text)) return { ok: false, why: `${label} was added by ${by}, who is not a member of the project` }
+        if (/\b404\b|Not Found/i.test(text)) return { ok: false, why: `${label} was added by ${by}, who is not a member of the project`, at }
         throw new GitLabError(`glab api members: ${text.slice(0, 300)}`, /rate limit|too many requests|\b429\b/i.test(text))
       }
       const level = num(obj(JSON.parse(res.stdout)).access_level)
-      return level !== null && level >= REPORTER ? { ok: true, by, at } : { ok: false, why: `${label} was added by ${by}, whose role in the project is below Reporter` }
+      return level !== null && level >= REPORTER ? { ok: true, by, at } : { ok: false, why: `${label} was added by ${by}, whose role in the project is below Reporter`, at }
     },
     commentIssue: (repo, number, body) => act(repo, 'issue notes', ['-X', 'POST', rest(projectPath(repo), `issues/${number}/notes`), '-f', `body=${body}`]),
     async failedLogs(repo, checks) {

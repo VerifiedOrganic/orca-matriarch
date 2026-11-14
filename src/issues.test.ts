@@ -162,7 +162,7 @@ describe('the message to the supervisor', () => {
   })
 })
 
-function setup(over: Partial<IssuesInput> = {}, opts: { checks?: Record<number, LabelCheck> } = {}) {
+function setup(over: Partial<IssuesInput> = {}, opts: { checks?: Record<number, LabelCheck | (() => LabelCheck)> } = {}) {
   const store = new Map<string, unknown>()
   const told: { to: string; subject: string }[] = []
   const comments: { number: number; body: string }[] = []
@@ -173,7 +173,10 @@ function setup(over: Partial<IssuesInput> = {}, opts: { checks?: Record<number, 
     listOpen: async () => ({ viewer: 'me', prs: [], rate: null }),
     detail: async () => ({ pr: null, rate: null }),
     labeledIssues: async (_ref, label) => (reads++, labels.push(label), { issues: open, truncated: false }),
-    labelCheck: async (_ref, i) => opts.checks?.[i.number] ?? { ok: true, by: 'maya', at: '2026-11-14T08:00:00Z' }
+    labelCheck: async (_ref, i) => {
+      const c = opts.checks?.[i.number]
+      return (typeof c === 'function' ? c() : c) ?? { ok: true, by: 'maya', at: '2026-11-14T08:00:00Z' }
+    }
   }
   const failing = new Set<string>()
   const input = (now: number, extra: Partial<IssuesInput> = {}): IssuesInput => ({
@@ -357,4 +360,49 @@ test('a tick hands issues over only when the project turned it on, survives stor
   assert.ok(!supervisorBrief({ repo: 'acme/app', objective: 'x', tag: 't', base: 'main', config: validateConfig({}).config }).includes('New objective'))
   assert.ok(validateConfig({ issues: { label: 'a,b' } }).errors.some((e) => e.startsWith('issues.label')))
   for (const filter of ['Any', 'none', 'No Label']) assert.ok(validateConfig({ issues: { label: filter } }).errors.some((e) => /a filter on GitLab/.test(e)), filter)
+})
+
+describe('each go-ahead goes over once', () => {
+  test('adding the label again hands it over again; a comment or an edit after the handoff does not', async () => {
+    let check: LabelCheck = { ok: true, by: 'maya', at: '2026-11-14T08:00:00Z' }
+    const s = setup({}, { checks: { 4: () => check, 7: () => check } })
+    await followIssues(s.input(T0))
+    assert.equal(s.told.length, 2)
+    // A comment: the issue was updated, its label event is the same one.
+    s.open[0] = { ...s.open[0], updatedAt: '2026-11-14T10:00:00Z' }
+    await followIssues(s.input(T0 + ISSUES_EVERY_MS))
+    assert.equal(s.told.length, 2, 'the same go-ahead does not go twice')
+    // Its author edits it after the handoff: it stays taken, not refused.
+    s.open[0] = { ...s.open[0], updatedAt: '2026-11-14T10:30:00Z' }
+    check = { ok: false, why: 'it was edited after maya added matriarch', at: '2026-11-14T08:00:00Z' }
+    const edited = await followIssues(s.input(T0 + 2 * ISSUES_EVERY_MS))
+    assert.deepEqual([edited.view.taken, edited.view.refused], [[4, 7], []])
+    // Removed and added again by someone with access: a new go-ahead.
+    s.open[0] = { ...s.open[0], updatedAt: '2026-11-14T11:00:00Z' }
+    check = { ok: true, by: 'maya', at: '2026-11-14T11:00:00Z' }
+    await followIssues(s.input(T0 + 3 * ISSUES_EVERY_MS))
+    assert.deepEqual(s.told.map((t) => t.subject.split(' ')[2]), ['acme/app#4', 'acme/app#7', 'acme/app#4'])
+  })
+
+  test('a handoff cut off before it was known to go is shown as unsure, and never sent again by itself', async () => {
+    const s = setup({ tellSupervisor: async () => { throw new Error('runtime_unavailable') } })
+    // Its record cannot be cleared after the failed send: it may or may not have gone.
+    let writes = 0
+    const base = s.input(T0)
+    const store = {
+      get: base.store.get,
+      set: async (k: string, v: JsonValue) => {
+        if (k === handoffKey('acme/app', 4) && v === null) throw new Error('ENOSPC')
+        writes++
+        await base.store.set(k, v)
+      }
+    }
+    await followIssues(s.input(T0, { store }))
+    const later = await followIssues(s.input(T0 + 61_000, { store, tellSupervisor: async (_r, _root, to, m) => void s.told.push({ to, subject: m.subject }) }))
+    assert.deepEqual(later.view.unsure, [4])
+    assert.ok(!s.told.some((t) => t.subject.includes('#4')), '#4 is not sent again')
+    assert.ok(s.told.some((t) => t.subject.includes('#7')), 'the others still go')
+    assert.match(later.warnings.join(' '), /#4 may not have reached the supervisor.*remove matriarch from the issue and add it back/)
+    assert.ok(writes > 0)
+  })
 })

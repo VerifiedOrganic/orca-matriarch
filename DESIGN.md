@@ -303,10 +303,20 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   plugin storage and survive a restart or a failed tick. Running means not settled and not seen
   exited: a worker Orca cannot vouch for (`unverifiable`: just started, restored, stale) counts.
   Orca waits on that hook only for Claude Code (`agent-tool-plugin-hooks.ts`: other agents' calls
-  are only reported), and a chat-mode session has no hook stream, so a supervisor in a chat or on
-  another agent can go over; Needs you says so. A worker counts as started when Matriarch first
-  sees it in its Run's list; the workers already there when it first looks at a Run are not
-  counted. `agent.launch.before` cannot stand in for every agent: Orca 1.4.257 gives it the
+  are only reported), and a chat session's agent starts with its pane identity removed
+  (`structured-session-child-env.ts`) while plugins see only calls from a pane, so the hook never
+  sees a supervisor in a chat, which is the default. For that and every other agent, the limits
+  hold right after a start instead: each tick judges the workers first seen in the Run's list in
+  the order they started, as the hook would have (`overLimitStarts`), and under autopilot stops
+  each one that had no room (`orchestration worker-stop`, which fences the dispatch and keeps the
+  worktree; `stop_unknown` counts as stopped) and tells the supervisor which, why, and when to
+  start it again. A stopped worker takes no room and its start does not count against the day. A
+  stop that fails is tried again while the worker runs, for 10 minutes. Only a start is ever over
+  a limit: the workers already there when Matriarch first looks at a Run, or when a limit is
+  lowered, are never stopped, and Needs you says the project is over. A worker counts as started
+  when Matriarch first sees it in its Run's list; the workers already there when it first looks
+  at a Run are not counted. A hook before an orchestration start would let Matriarch refuse every
+  agent's start instead of stopping it (docs/orca-api-requests.md). `agent.launch.before` cannot stand in for every agent: Orca 1.4.257 gives it the
   agent, workspace, a pre-allocated terminal handle and the command, with `env: {}` and no
   dispatch or task id, so a worker's launch looks like any other.
 - **Issues as objectives** (`src/issues.ts`). With `issues.enabled`, Matriarch reads the open
@@ -324,10 +334,14 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   passing issue goes to the running supervisor once, as plain mail titled "New objective:
   <repo>#<n>" and a cleaned, short title; the title and body go in a fence, marked as the issue's
   text, and the brief says the label is the user's go-ahead and asks for `Closes #<n>`. Only
-  numbers and short reasons are stored, never an issue's text (bodies are cut to 6000 characters
-  as they are read). Each handoff is recorded in its own key (`issue:<repo>#<n>`) before the
-  message is sent, and an issue with that record is never sent again, so a failed save cannot
-  hand one over twice; a storage failure only leaves an issue waiting, and never stops the tick.
+  numbers, times and short reasons are stored, never an issue's text (bodies are cut to 6000
+  characters as they are read). Each go-ahead goes over once: a handoff is tied to the time of the
+  label event that passed the check, and recorded in its own key (`issue:<repo>#<n>`, with that
+  time) before the message is sent. An issue whose record names the same label event is never sent
+  again, so a failed save cannot hand one over twice; adding the label again is a new event and a
+  new handoff. A send that fails clears the record so it is tried again; if even that write fails,
+  the record stays "sending" and the board shows the handoff as unsure, never resending it by
+  itself. A storage failure only leaves an issue waiting, and never stops the tick.
   With no supervisor running, Needs you says they wait; in dry run the board says it would hand
   them over. Labels named `any` or `none` are refused: GitLab reads them as filters.
 - **Not yet run live.** Its workers push branches and open PRs, so the first run should be on a

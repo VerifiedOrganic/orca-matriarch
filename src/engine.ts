@@ -16,7 +16,7 @@ import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type R
 import { followIssues } from './issues.ts'
 import { addLog, addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
 import { checkKey, keepChecks, ledgerKey, loadLedger, record, recordRefusedRerun, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
-import { countStarts, dayOf, isWorking, loadStarts, type LimitState } from './limits.ts'
+import { countStarts, dayOf, isWorking, loadPendingStops, loadStarts, overLimitStarts, STOP_RETRY_MS, stoppedMessage, type LimitState, type PendingStop } from './limits.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
 import { MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
@@ -96,6 +96,8 @@ export interface EngineDeps {
   onProjects?: (repos: string[]) => void
   /** Sends the supervisor's Run a message from Matriarch's mailbox (a labeled issue). */
   tellSupervisor?: (repo: string, root: string, to: string, message: { subject: string; body: string }) => Promise<void>
+  /** Stops a worker that started over a limit (`orchestration worker-stop`); its worktree is kept. */
+  stopWorker?: (dispatchId: string) => Promise<Outcome>
   /** Posts a comment on an issue on the project's forge. */
   commentIssue?: (ref: RepoRef, number: number, body: string) => Promise<Outcome>
   /** Posts an away alert when the person set a webhook; returns at once and never throws. */
@@ -516,16 +518,74 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
         message: `Only ${gb(free)} free on the disk with ${repoKey}. Agents' builds, Orca and Matriarch stop saving once it is full: free some space to keep the pod moving.`
       })
     }
-    // The supervisor's workers against the limits: on its row, and to the hook that refuses a
-    // worker start over one. A start is counted once Matriarch first sees its worker.
+    // A config with errors may have lost a guard (a protected path, a reviewer): watch only.
+    const acting = opts.autopilot && deps.executor !== null && cfg.errors.length === 0
+    if (opts.autopilot && cfg.errors.length > 0) view.errors.push('The config has errors, so Matriarch only watches this repository until they are fixed.')
+
+    // The supervisor's workers against the limits (limits.ts): on its row, and to the hook that
+    // refuses a start over one. A start counts once Matriarch first sees its worker in the Run's
+    // list; under autopilot, a worker whose start put the project over a limit is stopped.
     const mine = supervisor ? workers.filter((w) => w.runId !== null && `run:${w.runId}` === supervisor) : []
-    const live = mine.filter(isWorking).length
-    let starts = loadStarts(await deps.store.get(`starts:${repoKey}`))
+    const prevStarts = loadStarts(await deps.store.get(`starts:${repoKey}`))
+    let starts = prevStarts
+    let fresh: WorkerRow[] = []
     if (ownersKnown && supervisor) {
-      const next = countStarts(starts, supervisor, mine.map((w) => w.dispatchId), now)
-      if (JSON.stringify(next) !== JSON.stringify(starts)) await deps.store.set(`starts:${repoKey}`, next as unknown as JsonValue)
-      starts = next
+      // A Run seen for the first time has no fresh workers: when they started cannot be told.
+      const known = prevStarts?.run === supervisor ? new Set(prevStarts.seen) : null
+      fresh = known ? mine.filter((w) => !known.has(w.dispatchId)) : []
+      starts = countStarts(prevStarts, supervisor, mine.map((w) => w.dispatchId), now)
     }
+    let live = mine.filter(isWorking).length
+    const counted = starts && starts.day === dayOf(now) ? starts.count : 0
+    const over = overLimitStarts(fresh, { repo: repoKey, runningBefore: live - fresh.filter(isWorking).length, startsBefore: counted - fresh.length, freeBytes: free, limits })
+    // A stop that did not go through is tried again while its worker still runs.
+    const stopsKey = `overlimit:${repoKey}`
+    const pendingRaw = await deps.store.get(stopsKey)
+    const retrying = ownersKnown
+      ? loadPendingStops(pendingRaw).filter((p) => now - p.at < STOP_RETRY_MS && mine.some((w) => w.dispatchId === p.dispatchId && isWorking(w)))
+      : loadPendingStops(pendingRaw)
+    const toStop: PendingStop[] = [...retrying, ...over.filter((o) => !retrying.some((p) => p.dispatchId === o.dispatchId)).map((o) => ({ ...o, at: now }))]
+    const stopped: PendingStop[] = []
+    const unstopped: PendingStop[] = []
+    if (toStop.length > 0 && acting && deps.stopWorker) {
+      for (const o of toStop) {
+        if (opts.stillOn && !(await opts.stillOn().catch(() => false))) {
+          unstopped.push(o)
+          continue
+        }
+        const res = await deps.stopWorker(o.dispatchId).catch((error: Error) => ({ ok: false, error: error.message }))
+        if (res.ok) stopped.push(o)
+        else {
+          unstopped.push(o)
+          view.errors.push(`Could not stop worker dispatch:${o.dispatchId}, which started over a limit: ${res.error ?? 'failed'}`)
+        }
+      }
+      if (stopped.length > 0) {
+        deps.log(`${repoKey}: stopped ${stopped.map((o) => `dispatch:${o.dispatchId}`).join(', ')}, started over a limit`)
+        // Each stop goes in its worktree's log too, where the person looks for why its worker ended.
+        for (const o of stopped) {
+          const worktreeId = mine.find((w) => w.dispatchId === o.dispatchId)?.worktreeId
+          if (!worktreeId) continue
+          const key = historyKey(worktreeId)
+          const entry = { at: now, kind: 'stop-worker', text: `Stopped this worktree's worker, which started over a limit: ${o.reason}` }
+          await deps.store.set(key, addLog(loadHistory(await deps.store.get(key)), entry) as unknown as JsonValue)
+        }
+        view.warnings.push(...stopped.map((o) => `Stopped worker dispatch:${o.dispatchId}${o.taskId ? ` (task ${o.taskId})` : ''}: ${o.reason}`))
+        if (deps.tellSupervisor && supervisor) {
+          await deps.tellSupervisor(repoKey, info.root, supervisor, stoppedMessage(stopped))
+            .catch((error: Error) => view.errors.push(`Stopped workers that started over a limit, but could not tell the supervisor: ${error.message}`))
+        }
+        // A stopped worker takes no room, and its start does not count against today.
+        live -= stopped.length
+        const today = stopped.filter((o) => dayOf(o.at) === dayOf(now)).length
+        if (starts && today > 0) starts = { ...starts, count: Math.max(0, starts.count - today) }
+      }
+    } else if (toStop.length > 0) {
+      view.warnings.push(...toStop.map((o) => `Dry run: with autopilot on, Matriarch would stop worker dispatch:${o.dispatchId}: ${o.reason}`))
+    }
+    const stillPending = acting ? unstopped : []
+    if (JSON.stringify(stillPending) !== JSON.stringify(loadPendingStops(pendingRaw))) await deps.store.set(stopsKey, stillPending as unknown as JsonValue)
+    if (JSON.stringify(starts) !== JSON.stringify(prevStarts) && starts) await deps.store.set(`starts:${repoKey}`, starts as unknown as JsonValue)
     const startsToday = starts && starts.day === dayOf(now) ? starts.count : 0
     view.supervisor.live = live
     view.supervisor.startsToday = startsToday
@@ -534,24 +594,24 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
       const terminals = [view.supervisor.terminal, ...mine.map((w) => w.terminal)].filter((t): t is string => typeof t === 'string' && t !== '')
       deps.onLimits?.({ repo: repoKey, terminals, live, startsToday, day: dayOf(now), freeBytes: free, listedAt: workersAt, limits })
     }
-    // Orca waits on the hook only for Claude Code: a supervisor on another agent can go over.
-    const over =
+    // Over a limit without a start to stop: workers there when Matriarch first looked at the Run
+    // or when a limit was lowered, or a dry run.
+    const overNow =
       limits.maxWorkers > 0 && live > limits.maxWorkers
         ? `${live} workers are running, over its limit of ${limits.maxWorkers} at once`
         : limits.maxWorkerStartsPerDay > 0 && startsToday > limits.maxWorkerStartsPerDay
           ? `${startsToday} workers started today, over its limit of ${limits.maxWorkerStartsPerDay} a day`
           : null
-    if (over) {
+    if (overNow) {
       board.attention.push({
         key: `limits:${repoKey}`,
         repo: repoKey,
-        message: `${repoKey}: ${over}. Matriarch can refuse a start only from a Claude Code supervisor or worker in a terminal: ask the supervisor to wait for its workers to finish, or raise the limit in Settings.`,
+        message: acting
+          ? `${repoKey}: ${overNow}. Matriarch stops a worker that starts over a limit, but these were running before it looked or before the limit was lowered: ask the supervisor to let some finish, or raise the limit in Settings.`
+          : `${repoKey}: ${overNow}. In dry run Matriarch only tells you; with autopilot on it stops a worker that starts over a limit. Ask the supervisor to let some finish, or raise the limit in Settings.`,
         terminal: view.supervisor.terminal ?? undefined
       })
     }
-    // A config with errors may have lost a guard (a protected path, a reviewer): watch only.
-    const acting = opts.autopilot && deps.executor !== null && cfg.errors.length === 0
-    if (opts.autopilot && cfg.errors.length > 0) view.errors.push('The config has errors, so Matriarch only watches this repository until they are fixed.')
     // Labeled issues: the supervisor's next objectives (issues.ts).
     if (config.issues.enabled) {
       const issues = await followIssues({

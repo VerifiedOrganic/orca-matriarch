@@ -14,13 +14,16 @@ import {
   limitLines,
   limitsChanged,
   limitsMessage,
+  overLimitStarts,
   PASSED_GRACE_MS,
+  STOP_RETRY_MS,
+  stoppedMessage,
   startRefusal,
   startsIn,
   type LimitState,
   type LimitsSnapshot
 } from './limits.ts'
-import { parseWorkerList, type WorkerRow } from './orca-cli.ts'
+import { OrcaRefusal, parseWorkerList, type WorkerRow } from './orca-cli.ts'
 import { supervisorBrief, supervisorTag } from './supervisor.ts'
 import { createWorker, deactivate } from './worker.ts'
 
@@ -339,6 +342,153 @@ test("the worker refuses a Claude supervisor's start over the cap, keeps refusin
     assert.equal((await again.hooks.fire('agent.tool.before', event('term_sup'))).kind, 'deny', 'before its first tick, from storage')
   } finally {
     await again.deactivate()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+describe('a worker that started over a limit', () => {
+  const w = (id: string, over: Partial<WorkerRow> = {}): WorkerRow => ({ dispatchId: id, worktreeId: null, taskId: `t-${id}`, runId: 'r1', agent: 'codex', model: null, state: 'running', live: true, liveness: 'live', ...over })
+  const input = (over: Partial<Parameters<typeof overLimitStarts>[1]> = {}) => ({ repo: 'acme/app', runningBefore: 3, startsBefore: 0, freeBytes: 100 * GB, limits: defaults(), ...over })
+
+  test('is judged in the order they started: the first that fits stays, the next is over', () => {
+    // Orca lists the newest first: d6 started after d5.
+    const over = overLimitStarts([w('d6'), w('d5')], input())
+    assert.deepEqual(over.map((o) => [o.dispatchId, o.limit]), [['d6', 'workers']])
+    assert.match(over[0].reason, /started while 4 of 4 workers were running in acme\/app/)
+    const daily = overLimitStarts([w('d3'), w('d2')], input({ runningBefore: 0, startsBefore: 4, limits: { ...defaults(), maxWorkerStartsPerDay: 5 } }))
+    assert.deepEqual(daily.map((o) => [o.dispatchId, o.limit]), [['d3', 'day']])
+    assert.deepEqual(overLimitStarts([w('d2')], input({ runningBefore: 0, freeBytes: 2 * GB })).map((o) => o.limit), ['disk'])
+    assert.deepEqual(overLimitStarts([w('d6', { state: 'succeeded' }), w('d5')], input()), [], 'one that already finished takes no room')
+    assert.deepEqual(overLimitStarts([], input({ runningBefore: 9 })), [], 'workers already there are never over: only a start is')
+    const m = stoppedMessage(over)
+    assert.equal(m.subject, 'Stopped a worker that started over a limit')
+    assert.match(m.body, /- dispatch:d6 \(task t-d6\): it started while 4 of 4/)
+    assert.match(m.body, /Its task is not done, and its worktree is kept/)
+  })
+
+  function stopping(rowsByTick: WorkerRow[][], opts: { autopilot?: boolean; stop?: (id: string) => Promise<{ ok: boolean; error?: string }> } = {}) {
+    const store = new Map<string, unknown>()
+    const stops: string[] = []
+    const told: string[] = []
+    let i = 0
+    let now = T0
+    const deps: EngineDeps = {
+      now: () => now,
+      log: () => {},
+      workspaces: async () => [{ id: 'ws-main', kind: 'worktree', name: 'main', path: '/r', branch: 'refs/heads/main', hostId: 'local' }],
+      repoOf: async () => ({ ref: { owner: 'acme', name: 'app' }, key: 'acme/app', root: '/r' }),
+      readConfig: async () => validateConfig({ review: { enabled: false }, limits: { maxWorkers: 2, maxWorkerStartsPerDay: 3 } }),
+      github: { listOpen: async () => ({ viewer: 'me', prs: [], rate: null }), detail: async () => ({ pr: null, rate: null }) },
+      workers: async () => rowsByTick[Math.min(i, rowsByTick.length - 1)],
+      activity: () => null,
+      supervisor: async () => 'run:r1',
+      store: { get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) },
+      executor: { execute: async () => ({ ok: true }) },
+      stopWorker: async (id) => (stops.push(id), opts.stop ? opts.stop(id) : { ok: true }),
+      tellSupervisor: async (_repo, _root, _to, m) => void told.push(m.body)
+    }
+    const run = async () => {
+      const board = await tick(deps, { autopilot: opts.autopilot ?? true })
+      i++
+      now += 60_000
+      return board
+    }
+    return { run, stops, told, store, advance: (ms: number) => (now += ms) }
+  }
+
+  test('under autopilot it is stopped, the supervisor is told, and it takes no room or start', async () => {
+    const s = stopping([[w('d1')], [w('d3', { worktreeId: 'ws-d3' }), w('d2'), w('d1')]])
+    await s.run()
+    const board = await s.run()
+    assert.deepEqual(s.stops, ['d3'], 'd2 fits under the limit of 2, d3 does not')
+    const log = (s.store.get('track:ws-d3') as { log: { kind: string; text: string }[] }).log
+    assert.deepEqual(log.map((e) => e.kind), ['stop-worker'], "the stop is in that worktree's log")
+    assert.match(log[0].text, /^Stopped this worktree's worker, which started over a limit: it started while 2 of 2/)
+    assert.match(s.told[0], /dispatch:d3 \(task t-d3\): it started while 2 of 2 workers were running/)
+    assert.deepEqual([board.repos[0].supervisor.live, board.repos[0].supervisor.startsToday], [2, 1])
+    assert.ok(board.repos[0].warnings.some((x) => x.startsWith('Stopped worker dispatch:d3')))
+    assert.ok(!board.attention.some((a) => a.key === 'limits:acme/app'), 'nothing left over the limit')
+  })
+
+  test('in dry run it is only shown; the first look at a Run, and a lowered limit, stop nothing', async () => {
+    const dry = stopping([[w('d1')], [w('d3'), w('d2'), w('d1')]], { autopilot: false })
+    await dry.run()
+    const board = await dry.run()
+    assert.deepEqual(dry.stops, [])
+    assert.ok(board.repos[0].warnings.some((x) => x.startsWith('Dry run: with autopilot on, Matriarch would stop worker dispatch:d3')))
+    assert.match(board.attention.find((a) => a.key === 'limits:acme/app')?.message ?? '', /In dry run Matriarch only tells you/)
+    const first = stopping([[w('d3'), w('d2'), w('d1')]])
+    const seen = await first.run()
+    assert.deepEqual(first.stops, [], 'workers there when Matriarch first looks are never stopped')
+    assert.match(seen.attention.find((a) => a.key === 'limits:acme/app')?.message ?? '', /running before it looked or before the limit was lowered/)
+  })
+
+  test('a stop that fails is tried again while the worker runs, then given up', async () => {
+    let fail = true
+    const s = stopping([[w('d1')], [w('d3'), w('d2'), w('d1')]], { stop: async () => (fail ? { ok: false, error: 'runtime_unavailable' } : { ok: true }) })
+    await s.run()
+    const failed = await s.run()
+    assert.ok(failed.repos[0].errors.some((x) => /Could not stop worker dispatch:d3, which started over a limit: runtime_unavailable/.test(x)))
+    fail = false
+    await s.run()
+    assert.deepEqual(s.stops, ['d3', 'd3'])
+    assert.equal(s.told.length, 1)
+    const late = stopping([[w('d1')], [w('d3'), w('d2'), w('d1')]], { stop: async () => ({ ok: false, error: 'nope' }) })
+    await late.run()
+    await late.run()
+    late.advance(STOP_RETRY_MS)
+    await late.run()
+    assert.deepEqual(late.stops, ['d3'], 'not tried after the retry window')
+  })
+})
+
+test("the worker stops a worker that started over the cap with worker-stop, and takes Orca's stop_unknown as done", async () => {
+  const root = await mkdtemp(join(tmpdir(), 'matriarch-stop-'))
+  await mkdir(join(root, '.orca'), { recursive: true })
+  await writeFile(join(root, CONFIG_PATH), JSON.stringify({ version: 1, limits: { maxWorkers: 1 } }))
+  let rows = 1
+  const calls: string[][] = []
+  const orcaCli = {
+    run: async (args: readonly string[]) => {
+      calls.push([...args])
+      if (args[1] === 'worker-list') return { workers: Array.from({ length: rows }, (_, i) => ({ dispatchId: `d${rows - i}`, runId: 'r1', taskId: `t${rows - i}`, workerState: 'running' })) }
+      if (args[1] === 'run-list') return { runs: [{ id: 'r1', objective: '[matriarch:acme/app:n] x' }] }
+      if (args[1] === 'worker-stop') throw new OrcaRefusal('stop_unknown', 'agent exit not proven')
+      return {}
+    }
+  }
+  const exec = async (file: string, args: readonly string[]) => {
+    if (file !== 'git') return { code: 1, stdout: '', stderr: '' }
+    if (args.includes('--git-common-dir')) return { code: 0, stdout: `${root}/.git\n`, stderr: '' }
+    if (args.includes('remote.origin.url')) return { code: 0, stdout: 'git@github.com:acme/app.git\n', stderr: '' }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  const host = mockHost({
+    capabilities: ['workspace:read', 'workspace:write', 'agent:read', 'notifications:show', 'storage:own', 'settings:own'],
+    results: {
+      'workspace.list': { workspaces: [{ id: 'ws-main', kind: 'worktree', name: 'main', path: root, branch: 'refs/heads/main', hostId: 'local' }], truncated: false },
+      'statusBar.update': { ok: true }
+    },
+    settings: { autopilot: true, pollSeconds: 45 },
+    storage: { 'supervisor:acme/app': 'run:r1', 'mailbox:acme/app': 'term_mailbox' }
+  })
+  const github: GitHub = { listOpen: async () => ({ viewer: 'me', prs: [], rate: null }), detail: async () => ({ pr: null, rate: null }) }
+  const worker = await mountWorker({ default: createWorker({ exec, github, orcaCli, autoStart: false }), deactivate }, {
+    host,
+    events: ['agent.status.changed', 'workspace.created', 'workspace.removed'],
+    commands: ['showBoard', 'refresh', 'toggleAutopilot'],
+    hooks: ['agent.tool.before', 'agent.launch.before']
+  })
+  try {
+    await worker.command('refresh')
+    rows = 2
+    await worker.command('refresh')
+    assert.deepEqual(calls.filter((c) => c[1] === 'worker-stop'), [['orchestration', 'worker-stop', '--dispatch', 'd2', '--json']].map((c) => c.slice(0, 4)))
+    const told = calls.find((c) => c[1] === 'send' && c.includes('Stopped a worker that started over a limit'))
+    assert.ok(told, 'the supervisor is told')
+    assert.ok(told!.includes('run:r1'))
+  } finally {
+    await worker.deactivate()
     await rm(root, { recursive: true, force: true })
   }
 })

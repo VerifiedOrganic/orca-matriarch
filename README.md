@@ -102,8 +102,9 @@ is not signed in to yet, pick it under **Forge** in Settings.
 
 Turn on **Hand labeled issues to the supervisor** under **Settings → Issues**. Then label an open
 issue `matriarch` (or the label you pick there). With autopilot on, Matriarch hands it to the
-running supervisor once, as a new objective: the label is the go-ahead, and the PR that does it
-says `Closes #<n>`. Matriarch reads the labeled issues every 5 minutes (500 at most, oldest
+running supervisor as a new objective: the label is the go-ahead, each time it is added goes over
+once, and the PR that does it says `Closes #<n>`. To hand an issue over again, remove the label and
+add it back. Matriarch reads the labeled issues every 5 minutes (500 at most, oldest
 first; the board says when there are more). With no supervisor running, **Needs you** says the
 issue waits for one; in dry run the board says it would hand it over. **Comment on the issue**
 posts one short comment when the supervisor takes it up.
@@ -117,7 +118,9 @@ An issue goes over only when both hold:
   edit after the label was added; on GitLab, no edit of the title or description after it.
 
 So a label an issue template adds counts only if the issue's author has that access, and an
-issue its author edits after you labeled it waits. Such an issue stays on the board with the
+issue its author edits after you labeled it waits (an edit after the handoff changes nothing).
+If Matriarch is cut off while handing an issue over, the board says it may not have arrived, and
+it is not sent again by itself. Such an issue stays on the board with the
 reason, until someone with access adds the label again (remove it, then add it). The issue's
 title and text go to the supervisor as written, inside a fence and marked as the issue's, not
 yours, so label only issues you would give an agent to do. Labels named `any` or `none` are
@@ -203,15 +206,21 @@ after it. A PR that needs several rounds costs several reviews. To keep it in ha
 - **Reviews at once** (default 2) limits how many review crews run together.
 - **Workers at once** (default 4) and **Worker starts a day** (default no limit) cap the
   supervisor's workers, and **Disk floor** (default 10 GB) stops new ones on a nearly full disk.
-  The supervisor's brief states them, and a running supervisor is told when you change them. A
-  start over a limit is refused, with what to do instead (wait for a worker to finish, for
-  tomorrow, or for space), when it comes from the supervisor's own terminal or one of its
-  workers' and that agent is Claude Code. Orca stops only Claude Code's tool calls, and reports
-  none for a session in a chat (the supervisor opens as one), so a supervisor in a chat or on
-  another agent can go over; **Needs you** then says so. A command that starts workers in a loop
-  is refused while a count limit is set, since how many it starts cannot be known. Limits hold in
-  dry run too: they guard your disk and accounts, not the PRs. Your own sessions are never
-  refused.
+  The supervisor's brief states them, and a running supervisor is told when you change them.
+  They are held two ways:
+  - **Before a start**, when the supervisor or one of its workers is Claude Code in a terminal:
+    its `worker-start` over a limit is refused, with what to do instead (wait for a worker to
+    finish, for tomorrow, or for space). A command that starts workers in a loop is refused while
+    a count limit is set, since how many it starts cannot be known. This holds in dry run too.
+  - **Right after a start**, for every other case: Orca reports no tool calls for a session in a
+    chat (the supervisor opens as one) and waits on none but Claude Code's. So with autopilot on,
+    a worker whose start put the project over a limit is stopped (`orca orchestration
+    worker-stop`, which keeps its worktree) as soon as Matriarch sees it, within a check, and the
+    supervisor is told to start it again when there is room. In dry run the board says it would.
+
+  Only a start is ever over a limit: workers already running when Matriarch first looks, or when
+  you lower a limit, are never stopped, and **Needs you** says the project is over. Your own
+  sessions are never refused.
 
 When a reviewer's account hits its usage limit, Matriarch can restart it once on a fallback
 model you choose; otherwise it shows the reviewer as **Needs you**.
@@ -280,6 +289,7 @@ are not changed.
 | `orca orchestration worker-list`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
 | `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations, labeled issues and the advisor's answers to the supervisor |
 | `orca orchestration check --terminal <mailbox> --peek`, then `check --terminal <mailbox>` | with an advisor: read the supervisor's questions sent to Matriarch's mailbox, then mark them read |
+| `orca orchestration worker-stop --dispatch <id>` | autopilot: stop a supervisor's worker that started over the project's worker limits (its worktree is kept) |
 | `git fetch origin …`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | a review round: a throwaway worktree at the PR head, one agent per reviewer, removed afterwards |
 | `git fetch origin <main>`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | autopilot, with an advisor: one throwaway worktree of the main branch per question, the advisor in it, removed once it answers |
 | `orca terminal close` | a reviewer or advisor that started without its lockdown is stopped |

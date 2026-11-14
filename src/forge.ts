@@ -72,9 +72,10 @@ export interface IssueList {
 
 /**
  * Whether an issue may be handed over: the label was last added by someone allowed to triage
- * issues, and neither its title nor its body changed after that.
+ * issues, and neither its title nor its body changed after that. `at` is when that label event
+ * happened, when it was found: each time the label is added is its own go-ahead.
  */
-export type LabelCheck = { ok: true; by: string; at: string } | { ok: false; why: string }
+export type LabelCheck = { ok: true; by: string; at: string } | { ok: false; why: string; at?: string }
 
 /** A title and body as the forge gave them, cut to size before anything keeps them. */
 export const issueText = (title: string, body: string): { title: string; body: string } => ({
