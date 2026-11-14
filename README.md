@@ -37,7 +37,8 @@ model (Claude on Fable at max effort, say). The supervisor asks it for a second 
 chooses to: a risky plan, a reviewer and a worker who disagree, being stuck, a step that is hard
 to undo. Matriarch runs it read-only in a throwaway worktree of the main branch, locked down like
 a reviewer, and mails its answer back to the supervisor's chat. It answers one question at a time,
-only with autopilot on, and costs nothing until the supervisor asks.
+only with autopilot on, only questions from the project's supervisor (anything else that reaches
+Matriarch's mailbox is dropped), and costs nothing until the supervisor asks.
 
 ## Requirements
 
@@ -193,7 +194,8 @@ are not changed.
 | `orca terminal create` | once per project: a terminal titled "Matriarch mailbox" (`cat > /dev/null`), which Orca requires as the sender of Matriarch's messages |
 | `orca orchestration worker-list`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
 | `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations and the advisor's answers to the supervisor |
-| `orca orchestration check --terminal <mailbox> --peek`, then `check --terminal <mailbox>` | with an advisor: read the supervisor's questions sent to Matriarch's mailbox, then mark them read |
+| `orca orchestration check --terminal <mailbox> --peek --full`, then `check --terminal <mailbox> --full` | with an advisor: read the questions sent to Matriarch's mailbox, with their senders, then mark them read |
+| `orca orchestration run-show --id <run> --full` | with an advisor, when a question came: the handle the supervisor's Run is bound to, to tell its questions from anyone else's |
 | `git fetch origin …`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | a review round: a throwaway worktree at the PR head, one agent per reviewer, removed afterwards |
 | `git fetch origin <main>`, `orca worktree create`, `orca agent launch --model …`, `orca worktree rm` | autopilot, with an advisor: one throwaway worktree of the main branch per question, the advisor in it, removed once it answers |
 | `orca terminal close` | a reviewer or advisor that started without its lockdown is stopped |

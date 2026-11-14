@@ -8,7 +8,7 @@ import { AGENT_CATALOG, agentOptions, MODEL_LISTERS, parseModelList, type LiveMo
 import { readModelCatalog, readOrcaProfile } from './orca-profile.ts'
 import { createAdvisor, GONE_TERMINAL, type Advisor } from './advisor.ts'
 import { advisorUsable, CONFIG_OFF_PATH, CONFIG_PATH, defaultConfig, forgeSettingOf, parseConfig, validateConfig, type ForgeSetting, type MatriarchConfig } from './config.ts'
-import { createCrew, launchedTerminal, type Crew } from './crew.ts'
+import { createCrew, launchedSession, launchedTerminal, type Crew } from './crew.ts'
 import { branchName, tick, type ActivityInfo, type EngineDeps, type RepoInfo, type Workspace } from './engine.ts'
 import { nodeExec, type Exec } from './exec.ts'
 import { createExecutor } from './executor.ts'
@@ -77,6 +77,28 @@ export function createMailboxes(cli: OrcaCli, store: { get(key: string): Promise
       void store.set(`mailbox:${repo}`, null).catch(() => {})
     }
   }
+}
+
+/**
+ * The addresses a project's supervisor sends orchestration mail as. Orca 1.4.257 stores a sender
+ * as its caller's address: a chat (an Orca agent session) as `orca_session_id:<id>`, its id the
+ * root that survives /clear; a terminal agent as its terminal handle. So: the session the chat
+ * launch opened, the terminal a terminal launch opened, and the handle the supervisor's Run is
+ * bound to now (`run-show --full`; Orca hides a Run's coordinator session id).
+ */
+export async function supervisorSenders(cli: OrcaCli, store: { get(key: string): Promise<unknown> }, repo: string, run: string | null): Promise<string[]> {
+  const senders = new Set<string>()
+  const session = await store.get(`supervisor:session:${repo}`)
+  if (typeof session === 'string' && session) senders.add(`orca_session_id:${session}`)
+  // A chat's launch handle is not where it sends from; a terminal's is.
+  const terminal = await store.get(`supervisor:terminal:${repo}`)
+  if (typeof terminal === 'string' && terminal && !session) senders.add(terminal)
+  if (run) {
+    const shown = (await cli.run(['orchestration', 'run-show', '--id', run.replace(/^run:/, ''), '--full']).catch(() => null)) as { run?: { coordinator_handle?: unknown } } | null
+    const handle = shown?.run?.coordinator_handle
+    if (typeof handle === 'string' && handle) senders.add(handle)
+  }
+  return [...senders]
 }
 
 /** Both read-only guards as one: review rounds' worktrees and the advisor's. */
@@ -427,6 +449,7 @@ export function createWorker(options: WorkerOptions = {}) {
       store: orca.storage,
       crew,
       advisor,
+      supervisorSenders: (repo, run) => supervisorSenders(cli, orca.storage, repo, run),
       freeSpace: async (path) => {
         const s = await statfs(path)
         return Number(s.bavail) * Number(s.bsize)
@@ -597,10 +620,14 @@ export function createWorker(options: WorkerOptions = {}) {
         }
       }
       const terminal = launchedTerminal(receipt)
+      // A chat sends its orchestration mail as its Orca session: how the advisor knows its questions.
+      const session = launchedSession(receipt)
       await exclusive(async () => {
         await orca.storage.delete(`supervisor:${repo}`)
         if (terminal) await orca.storage.set(`supervisor:terminal:${repo}`, terminal)
         else await orca.storage.delete(`supervisor:terminal:${repo}`)
+        if (session) await orca.storage.set(`supervisor:session:${repo}`, session)
+        else await orca.storage.delete(`supervisor:session:${repo}`)
         await orca.storage.set(`supervisor:pending:${repo}`, { tag, at: now() })
         await advisor.briefed(repo, advice)
       })

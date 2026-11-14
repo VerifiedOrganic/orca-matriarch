@@ -16,7 +16,7 @@ import { LOCK_LABEL } from './lockdown.ts'
 import type { WorkerRow } from './orca-cli.ts'
 import { lightPaths, MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner } from './plan.ts'
 import { supervisorTagPrefix } from './supervisor.ts'
-import type { Board, Mark, RepoView, TrackView } from './protocol.ts'
+import type { AdvisorView, Board, Mark, RepoView, TrackView } from './protocol.ts'
 
 export interface Workspace {
   id: string
@@ -77,7 +77,12 @@ export interface EngineDeps {
   /** Runs AI review rounds; null where there is no crew (tests of other parts). */
   crew?: Crew | null
   /** Answers the supervisor's questions for a second opinion; absent where there is none. */
-  advisor?: (Pick<Advisor, 'step'> & Partial<Pick<Advisor, 'stop'>>) | null
+  advisor?: (Pick<Advisor, 'step'> & Partial<Pick<Advisor, 'stop' | 'poll'>>) | null
+  /**
+   * The addresses a project's supervisor sends mail as (its chat's Orca session, its terminal, the
+   * handle its Run is bound to): only questions from these reach the advisor. None when absent.
+   */
+  supervisorSenders?: (repo: string, run: string | null) => Promise<string[]>
   /**
    * Removes a merged PR's worktree when it is safe: answers why not (uncommitted changes, Orca
    * refused) otherwise. Absent where nothing is removed (tests of other parts).
@@ -248,6 +253,18 @@ async function snapshotFor(
   return pr
 }
 
+/** An advisor waiting on a prompt, under Needs you with the terminal to open. */
+function advisorAttention(repo: string, advisor: AdvisorView): Board['attention'][number] | null {
+  if (!advisor.answering?.blocked) return null
+  return {
+    key: `${repo}:advisor`,
+    repo,
+    message: `${repo}: the advisor (${advisor.agent}) needs you. ${advisor.answering.blocked}.`,
+    terminal: advisor.answering.terminal ?? undefined,
+    workspaceId: advisor.answering.workspaceId ?? undefined
+  }
+}
+
 /** A failed read of a PR's file moves is tried again after this; an answer is kept for the commit. */
 export const MOVES_RETRY_MS = 10 * 60_000
 
@@ -347,6 +364,8 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
   }
   const byWorktree = { get: (ws: Workspace): WorkerRow | undefined => workerKeys.get(ws.id) ?? workerKeys.get(`path:${ws.path}`) }
 
+  // Projects whose advisor this tick stepped or stopped; the others are polled after the loop.
+  const advised = new Set<string>()
   for (const [repoKey, { info, workspaces: repoWorkspaces }] of repos) {
     let cfg: ConfigResult | null
     try {
@@ -356,6 +375,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     }
     if (!cfg) {
       // Matriarch is off here: an advisor still answering for it stops, and its worktree goes.
+      advised.add(repoKey)
       if (deps.advisor?.stop) {
         await deps.advisor
           .stop({ repo: repoKey, root: info.root, supervisor: () => deps.supervisor(repoKey), acting: opts.autopilot && deps.executor !== null })
@@ -469,19 +489,16 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
 
     // The advisor: the supervisor's questions, answered read-only on the default branch.
     if (deps.advisor) {
+      advised.add(repoKey)
       try {
-        const advisor = await deps.advisor.step({ repo: repoKey, root: info.root, config, supervisor, acting, base: base?.name ?? null, forge: kind })
+        const advisor = await deps.advisor.step({
+          repo: repoKey, root: info.root, config, supervisor, acting, base: base?.name ?? null, forge: kind,
+          supervisorSenders: async () => (deps.supervisorSenders ? deps.supervisorSenders(repoKey, supervisor) : [])
+        })
         if (advisor) {
           view.advisor = advisor
-          if (advisor.answering?.blocked) {
-            board.attention.push({
-              key: `${repoKey}:advisor`,
-              repo: repoKey,
-              message: `${repoKey}: the advisor (${advisor.agent}) needs you. ${advisor.answering.blocked}.`,
-              terminal: advisor.answering.terminal ?? undefined,
-              workspaceId: advisor.answering.workspaceId ?? undefined
-            })
-          }
+          const needs = advisorAttention(repoKey, advisor)
+          if (needs) board.attention.push(needs)
         }
       } catch (error) {
         view.errors.push(`Advisor: ${(error as Error).message}`)
@@ -914,6 +931,17 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
     }
   }
 
+  // An advisor at work for a project no tick sees now (its workspaces closed) still times out,
+  // is checked for prompts and unlocked resumes, and has its worktree removed and its mail sent.
+  if (deps.advisor?.poll) {
+    const elsewhere = await deps.advisor
+      .poll({ skip: advised, acting: opts.autopilot && deps.executor !== null, supervisor: (repo) => deps.supervisor(repo) })
+      .catch((error: Error) => (board.errors.push(`Advisor: ${error.message}`), []))
+    for (const { repo, view } of elsewhere) {
+      const needs = advisorAttention(repo, view)
+      if (needs) board.attention.push(needs)
+    }
+  }
   if (deps.crew) await deps.crew.sweep().catch((error: Error) => deps.log(`review sweep: ${error.message}`))
   // Hourly at most: drop records of PRs closed a week ago and worktrees gone a week.
   if (deps.store.keys && deps.store.delete) {
