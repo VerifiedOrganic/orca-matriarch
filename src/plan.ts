@@ -3,7 +3,7 @@
 // Every tick re-plans from current facts, so a message held back while a worker was busy goes
 // out once it is free, and nothing is sent twice for the same commit. It reads GitHub and GitLab
 // alike; only the words and commands in its reasons come from the PR's forge.
-import { shortSha } from './values.ts'
+import { clip, shortSha } from './values.ts'
 import { ALWAYS_FULL_REVIEW, type MatriarchConfig, type ReviewerSpec } from './config.ts'
 import { forgeTerms } from './forge.ts'
 import { actionableThreads, type CheckInfo, type PrSnapshot, type ThreadInfo } from './github.ts'
@@ -156,18 +156,25 @@ export const RETARGET_TRIES = 3
 /** The wait after a refused move of the base: 5 minutes, then 10. */
 export const retargetBackoff = (failures: number): number => 5 * 60_000 * 2 ** Math.max(0, failures - 1)
 
-/** Worker → supervisor → human. Each step happens once per problem key. */
+/**
+ * Worker → supervisor → human. Each step happens once per problem key (which carries the commit,
+ * so a new push starts over). The person hears of it once the supervisor has had
+ * `humanAfterMinutes` to deal with it; a supervisor that answered gets that long again from its
+ * first answer, and if the problem is still there after it, the person hears with its answer.
+ */
 function escalate(input: PlanInput, problemKey: string, reason: string): { actions: Action[]; toHuman: boolean } {
   const { ledger, config, supervisor, now } = input
   const supKey = `${problemKey}:supervisor`
   const humanKey = `${problemKey}:human`
   if (ledger.escalations[humanKey]) return { actions: [], toHuman: true }
+  const sup = ledger.escalations[supKey]
   if (config.escalation.supervisorFirst && supervisor) {
-    const sup = ledger.escalations[supKey]
     if (!sup) return { actions: [{ kind: 'escalate', to: 'supervisor', key: supKey, reason, address: supervisor }], toHuman: false }
-    if (now - sup.at < config.escalation.humanAfterMinutes * 60_000) return { actions: [], toHuman: false }
+    const since = sup.answered ? Math.max(sup.at, sup.answered.at) : sup.at
+    if (now - since < config.escalation.humanAfterMinutes * 60_000) return { actions: [], toHuman: false }
   }
-  return { actions: [{ kind: 'escalate', to: 'human', key: humanKey, reason, address: null }], toHuman: true }
+  const answer = sup?.answered ? `. The supervisor answered ${Math.max(1, Math.round((now - sup.answered.at) / 60_000))} min ago, and it is still so: "${clip(sup.answered.text.replace(/\s+/g, ' ').trim(), 400)}"` : ''
+  return { actions: [{ kind: 'escalate', to: 'human', key: humanKey, reason: `${reason}${answer}`, address: null }], toHuman: true }
 }
 
 function notifyOnce(ledger: PrLedger, key: string, title: string, body: string): Action[] {

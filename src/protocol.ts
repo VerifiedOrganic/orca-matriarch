@@ -43,7 +43,7 @@ export interface Mark {
  */
 export interface LogEntry {
   at: number
-  /** The action's kind (send-ci-failure, merge, ...), or `lane`, `push`, `review-done`, `cleanup`, `stop-worker`. */
+  /** The action's kind (send-ci-failure, merge, ...), or `lane`, `push`, `review-done`, `cleanup`, `stop-worker`, `reply`. */
   kind: string
   /** What happened, as a sentence. */
   text: string
@@ -59,6 +59,10 @@ export interface LogEntry {
   count?: number
   /** When it last came, once it came more than once. */
   lastAt?: number
+  /** For a reply to Matriarch's mail (`reply`): who wrote it. */
+  from?: 'supervisor' | 'worker'
+  /** The whole of a reply too long for its line. */
+  detail?: string
 }
 
 export interface ReviewerView {
@@ -123,6 +127,8 @@ export interface TrackView {
     openThreads: number
     /** The PR this one is stacked on: its base is that PR's branch, so it merges after it. */
     stackedOn?: number
+    /** The latest reply to Matriarch's mail about this PR: what the supervisor (or its worker) said. */
+    note?: { at: number; from: 'supervisor' | 'worker'; text: string }
   } | null
   owner: { agent: string | null; model: string | null; activity: Activity; supervised: boolean } | null
   lane: Lane

@@ -23,6 +23,20 @@ export interface Escalation {
   to: 'supervisor' | 'human'
   at: number
   reason: string
+  /**
+   * The supervisor answered it (a reply in its thread, mailbox.ts): when it first did, which
+   * starts the one more window it gets before the person is told, and what it said last.
+   */
+  answered?: { at: number; text: string; count?: number }
+}
+
+/** A reply to Matriarch's mail about this PR, as the card and the person's escalation show it. */
+export interface SupervisorNote {
+  at: number
+  from: 'supervisor' | 'worker'
+  /** The subject of the message it answered. */
+  subject: string
+  text: string
 }
 
 /**
@@ -85,6 +99,8 @@ export interface PrLedger {
    * that failed (the forge gives the new one another), and the forge's words when it refused.
    */
   reruns?: Record<string, Rerun>
+  /** Replies to Matriarch's mail about this PR, oldest first, the last few. */
+  notes?: SupervisorNote[]
 }
 
 export interface RetargetFailure {
@@ -135,8 +151,18 @@ export function loadLedger(raw: unknown): PrLedger {
     ...(Object.keys(rec(r.retargetFailures)).length ? { retargetFailures: { ...rec(r.retargetFailures) } } : {}),
     ...(Object.keys(rec(r.restacks)).length ? { restacks: { ...rec(r.restacks) } } : {}),
     ...(Object.keys(rec(r.flaky)).length ? { flaky: { ...rec(r.flaky) } } : {}),
-    ...(Object.keys(rec(r.reruns)).length ? { reruns: { ...rec(r.reruns) } } : {})
+    ...(Object.keys(rec(r.reruns)).length ? { reruns: { ...rec(r.reruns) } } : {}),
+    ...(notesOf((raw as { notes?: unknown } | null)?.notes).length ? { notes: notesOf((raw as { notes?: unknown }).notes) } : {})
   }
+}
+
+function notesOf(v: unknown): SupervisorNote[] {
+  return Array.isArray(v) ? v.filter(isNote) : []
+}
+
+function isNote(v: unknown): v is SupervisorNote {
+  const n = rec(v) as Record<string, unknown>
+  return typeof n.at === 'number' && typeof n.text === 'string' && typeof n.subject === 'string' && (n.from === 'supervisor' || n.from === 'worker')
 }
 
 function stackOf(raw: unknown): StackParent | null {

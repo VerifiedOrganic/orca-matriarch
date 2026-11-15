@@ -16,7 +16,8 @@ import { forgeKind, forgeTerms, gitlabRef, parseRemote, repoKey, type ForgeReade
 import { createGitHub, parseGitHubRemote, type GitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
 import { ledgerKey, loadLedger, record, roundsUsed } from './ledger.ts'
-import { createdTerminal, createOrcaCli, GONE_TERMINAL, listWorkers, OrcaRefusal, OrcaUnavailable, sendFrom, type OrcaCli } from './orca-cli.ts'
+import { createdTerminal, createOrcaCli, GONE_TERMINAL, listWorkers, OrcaRefusal, OrcaUnavailable, sendFrom, type OrcaCli, type SentReceipt } from './orca-cli.ts'
+import { createMailReader, learnedSenders, loadMailState, mailKey, recordSent } from './mailbox.ts'
 import { selectReviewers, type Activity, type Lane } from './plan.ts'
 import { findTaggedRun, supervisorBrief, supervisorLaunchArgs, supervisorTag, workerSettingsMessage } from './supervisor.ts'
 import { createAlerter, hostOf, type FetchLike } from './alerts.ts'
@@ -74,12 +75,26 @@ export function createMailboxes(cli: OrcaCli, store: { get(key: string): Promise
       })
       return made
     },
+    /**
+     * The mailbox the project already has, or null: never made here. Mail can only have come to a
+     * mailbox Matriarch sent from, so reading needs no new tab. One Orca says is gone is forgotten
+     * by the reader (takeMail), and the next send makes a new one.
+     */
+    async existing(repo: string): Promise<string | null> {
+      const cached = mailboxes.get(repo)
+      if (cached) return cached
+      const saved = await store.get(`mailbox:${repo}`)
+      return typeof saved === 'string' && saved ? saved : null
+    },
     /** Orca says this mailbox is gone. Only the handle still in use is dropped. */
     forget(repo: string, handle: string): void {
-      if (known.get(repo) !== handle) return
+      // The one in use, or (before any send this run) the one saved: either is gone now.
+      if (known.has(repo) && known.get(repo) !== handle) return
       mailboxes.delete(repo)
       known.delete(repo)
-      void store.set(`mailbox:${repo}`, null).catch(() => {})
+      void (async () => {
+        if ((await store.get(`mailbox:${repo}`)) === handle) await store.set(`mailbox:${repo}`, null)
+      })().catch(() => {})
     }
   }
 }
@@ -88,11 +103,15 @@ export function createMailboxes(cli: OrcaCli, store: { get(key: string): Promise
  * The addresses a project's supervisor sends orchestration mail as. Orca 1.4.257 stores a sender
  * as its caller's address: a chat (an Orca agent session) as `orca_session_id:<id>`, its id the
  * root that survives /clear; a terminal agent as its terminal handle. So: the session the chat
- * launch opened, the terminal a terminal launch opened, and the handle the supervisor's Run is
- * bound to now (`run-show --full`; Orca hides a Run's coordinator session id).
+ * launch opened, the terminal a terminal launch opened, the handle the supervisor's Run is bound
+ * to now (`run-show --full`; Orca hides a Run's coordinator session id), and the senders of its
+ * replies in threads Matriarch started with that Run.
  */
 export async function supervisorSenders(cli: OrcaCli, store: { get(key: string): Promise<unknown> }, repo: string, run: string | null): Promise<string[]> {
   const senders = new Set<string>()
+  // Whoever replied in threads Matriarch started with this Run (mailbox.ts): a supervisor opened
+  // before Matriarch kept its chat's session, or by hand, is known from its first reply.
+  if (run) for (const who of learnedSenders(loadMailState(await store.get(mailKey(repo))), run)) senders.add(who)
   const session = await store.get(`supervisor:session:${repo}`)
   if (typeof session === 'string' && session) senders.add(`orca_session_id:${session}`)
   // A chat's launch handle is not where it sends from; a terminal's is.
@@ -438,8 +457,9 @@ export function createWorker(options: WorkerOptions = {}) {
     const mailboxes = createMailboxes(cli, orca.storage)
     const mailboxFor = (repo: string, root: string): Promise<string | null> => mailboxes.get(repo, root)
     /** Sends a message from the project's mailbox (sendFrom); one Orca says is gone (its tab was closed) is replaced on the next send. */
-    const sendFromMailbox = (repo: string, root: string, to: string, m: { subject: string; body: string }): Promise<void> =>
+    const sendFromMailbox = (repo: string, root: string, to: string, m: { subject: string; body: string }): Promise<SentReceipt> =>
       sendFrom(cli, { address: () => mailboxFor(repo, root), gone: (handle) => mailboxes.forget(repo, handle) }, { to, subject: m.subject, body: m.body })
+    const mailReader = createMailReader(cli)
 
     const deps: EngineDeps = {
       now,
@@ -507,6 +527,9 @@ export function createWorker(options: WorkerOptions = {}) {
         }
       },
       tellSupervisor: (repo, root, to, m) => sendFromMailbox(repo, root, to, m),
+      mailbox: (repo) => mailboxes.existing(repo),
+      mailboxGone: (repo, handle) => mailboxes.forget(repo, handle),
+      mail: mailReader,
       commentIssue: async (ref, number, body) => {
         const forge = forgeKind(ref) === 'gitlab' ? gitlabForge : githubForge
         return forge.commentIssue ? forge.commentIssue(ref, number, body) : { ok: false, error: `cannot comment on ${forgeTerms(forgeKind(ref)).name} issues here` }
@@ -897,6 +920,8 @@ export function createWorker(options: WorkerOptions = {}) {
       const tell = async (m: { subject: string; body: string }, what: string) => {
         if (!run) return
         await sendFromMailbox(repo, root, run, m)
+          // Kept with what Matriarch sent, so the supervisor's reply is known as one (mailbox.ts).
+          .then((receipt) => recordSent(orca.storage, repo, receipt, { at: now(), to: run, subject: m.subject, kind: 'settings' }))
           .catch((error: Error) => orca.log(`${repo}: could not tell the supervisor about the new ${what}: ${error.message}`))
       }
       if (JSON.stringify(before?.config.workers ?? null) !== JSON.stringify(checked.config.workers)) await tell(workerSettingsMessage(checked.config), 'worker settings')

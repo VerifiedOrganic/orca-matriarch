@@ -1,8 +1,9 @@
 import { assert, describe, test } from 'orca/testing'
 import {
-  adviceQuestions, ADVICE_MAX_MS, ADVICE_REPLY, advisorBrief, answerPath, createAdvisor, MAX_QUEUED, outputLines, parseAnswer, parseMail,
-  type AdviceRun, type Advisor, type AdvisorDeps, type MailItem
+  adviceQuestions, ADVICE_MAX_MS, advisorBrief, answerPath, createAdvisor, MAX_QUEUED, outputLines, parseAnswer,
+  type AdviceRun, type Advisor, type AdvisorDeps
 } from './advisor.ts'
+import { parseMail, type MailMessage, type MailReader } from './mailbox.ts'
 import { validateConfig, type AdvisorSpec, type MatriarchConfig } from './config.ts'
 import { createCrew, launchedSession, REVIEW_BRANCH_PREFIX, REVIEWER_TIMEOUT_MS } from './crew.ts'
 import { tick, type EngineDeps } from './engine.ts'
@@ -17,22 +18,16 @@ import { createMailboxes, joinGuards, reviewGuard, supervisorSenders } from './w
 
 const FABLE: AdvisorSpec = { agent: 'claude', model: 'claude-fable-5-2', effort: 'max' }
 const withAdvisor = (advisor: AdvisorSpec | null = FABLE): MatriarchConfig => config((c) => (c.advisor = advisor))
-const mail = (id: string, subject: string, body = ''): MailItem => ({ id, from: 'term_sup', subject, body, complete: true })
+const mail = (id: string, subject: string, body = ''): MailMessage => ({ id, from: 'term_sup', to: 'term_mail', subject, body, threadId: null, runId: null, at: 0 })
 const at = (args: readonly string[], flag: string) => args[args.indexOf(flag) + 1]
 
 describe('the advisor: mail and answers', () => {
-  test('reads both views of a mailbox check, and takes "Advice:" messages as questions, not a reply to an answer', () => {
+  test('takes "Advice:" messages as questions, not a reply to an answer', () => {
     const concise = parseMail({ messages: [{ id: 'm1', type: 'status', from: 'term_sup', subject: 'Advice: one PR or two?', body: 'ctx' }, { id: 'm2', from: 'd1', subject: 'Re: #12' }] })
-    const full = parseMail({ messages: [{ id: 'm3', from_handle: 'run:r1', subject: 'advice:  rollback plan?', body: 'b', read: 0 }], count: 1 })
-    assert.deepEqual(concise.map((m) => m.id), ['m1', 'm2'])
-    assert.equal(full[0].from, 'run:r1')
-    const qs = adviceQuestions([...concise, ...full, mail('m4', 'Re: Advice: and the backfill?')], 5)
+    const full = parseMail({ messages: [{ id: 'm3', from_handle: 'run:r1', subject: 'advice:  rollback plan?', body: 'b' }], count: 1 })
+    const qs = adviceQuestions([...concise, ...full, mail('m4', 'Re: Advice: and the backfill?'), mail('m5', 'RE: re: Advice: x')], 5)
     // A reply ("thanks") would start a second, possibly costly, run on the same question.
-    assert.deepEqual(qs.map((q) => [q.id, q.question, q.context]), [['m1', 'one PR or two?', 'ctx'], ['m3', 'rollback plan?', 'b']])
-    assert.ok(ADVICE_REPLY.test('Re: Advice: and the backfill?') && ADVICE_REPLY.test('RE: re: Advice: x') && !ADVICE_REPLY.test('Advice: x'))
-    assert.deepEqual(parseMail(null), [])
-    // A record without its subject or body was not read whole.
-    assert.equal(parseMail({ messages: [{ id: 'm5', type: 'status' }] })[0].complete, false)
+    assert.deepEqual(qs.map((q) => [q.id, q.question, q.context, q.from]), [['m1', 'one PR or two?', 'ctx', 'term_sup'], ['m3', 'rollback plan?', 'b', 'run:r1']])
   })
 
   test('an answer is {"answer": ...}, also fenced or with words around it; anything else is not one', () => {
@@ -112,9 +107,8 @@ function advisorHarness(opts: HarnessOptions = {}) {
   const calls: string[][] = []
   const sent: { to: string; subject: string; body: string; from: string | null }[] = []
   const files: Record<string, string> = {}
+  /** What came to Matriarch's mailbox since the last step: the engine reads it (mailbox.ts) and hands it over. */
   let inbox: { id: string; from: string; subject?: string; body?: string }[] = []
-  /** Mail that arrives between the peek and the consuming check. */
-  let lateMail: { id: string; from: string; subject: string; body: string }[] = []
   const tails: Record<string, string[]> = {}
   let mailbox = 'term_mail'
   const closedTerminals = new Set<string>()
@@ -126,22 +120,11 @@ function advisorHarness(opts: HarnessOptions = {}) {
     async run(args) {
       calls.push([...args])
       const [a, b] = args
-      if (a === 'orchestration' && b === 'check') {
-        if (closedTerminals.has(at(args, '--terminal'))) throw new OrcaRefusal('terminal_handle_stale', 'gone')
-        if (!args.includes('--peek')) {
-          inbox.push(...lateMail)
-          lateMail = []
-        }
-        // --full: the record as Orca stores it, its sender in from_handle.
-        const batch = inbox.map(({ from, ...m }) => (args.includes('--full') ? { ...m, from_handle: from, to_handle: 'term_mail', type: 'status', read: 0 } : { ...m, from, type: 'status' }))
-        if (!args.includes('--peek')) inbox = []
-        return { messages: batch, count: batch.length }
-      }
       if (a === 'orchestration' && b === 'send') {
         const from = args.includes('--from') ? at(args, '--from') : null
         if (from && closedTerminals.has(from)) throw new OrcaRefusal('terminal_not_found', 'gone')
         sent.push({ to: at(args, '--to'), subject: at(args, '--subject'), body: at(args, '--body'), from })
-        return {}
+        return { messageId: `msg_${sent.length}` }
       }
       if (a === 'worktree' && b === 'create') {
         if (opts.createFails === 'throw') throw new Error('disk full')
@@ -205,18 +188,37 @@ function advisorHarness(opts: HarnessOptions = {}) {
   deps.log = (m) => void logs.push(m)
   let senderAsks = 0
   const senders = async () => (senderAsks++, opts.senders ?? ['term_sup'])
-  const step = (over: { acting?: boolean; notActing?: string | null; supervisor?: string | null; config?: MatriarchConfig; base?: string | null } = {}) =>
-    advisor!.step({
+  const step = (over: { acting?: boolean; notActing?: string | null; supervisor?: string | null; config?: MatriarchConfig; base?: string | null } = {}) => {
+    // As the engine hands it over: each message once, as Orca stored it.
+    const questions = parseMail({ messages: inbox.map(({ from, ...m }) => ({ ...m, from_handle: from, to_handle: mailbox })) })
+    inbox = []
+    return advisor!.step({
       repo: 'acme/app', root: '/r', config: over.config ?? withAdvisor(), supervisor: over.supervisor === undefined ? 'run:r1' : over.supervisor,
-      acting: over.acting ?? true, notActing: over.notActing ?? null, base: over.base === undefined ? 'main' : over.base, supervisorSenders: senders
+      acting: over.acting ?? true, notActing: over.notActing ?? null, base: over.base === undefined ? 'main' : over.base, supervisorSenders: senders, questions
     })
+  }
   const creates = () => calls.filter((c) => c[0] === 'worktree' && c[1] === 'create')
+  // The mailbox as the engine reads it (mailbox.ts), over the same mail.
+  const asStored = () => parseMail({ messages: inbox.map(({ from, ...m }) => ({ ...m, from_handle: from, to_handle: mailbox })) })
+  const reader: MailReader = {
+    unread: async (address) => {
+      if (closedTerminals.has(address)) throw new OrcaRefusal('terminal_handle_stale', 'gone')
+      return asStored()
+    },
+    recent: async () => asStored(),
+    markRead: async () => {
+      const batch = asStored()
+      inbox = []
+      return batch
+    },
+    runMail: async () => []
+  }
   return {
-    advisor, calls, sent, files, store, step, tails, state, logs, senderAsks: () => senderAsks,
+    advisor, calls, sent, files, store, step, tails, state, logs, senderAsks: () => senderAsks, reader, mailbox: () => mailbox,
     ask: (id: string, question: string, body = 'context', from = 'term_sup') => void inbox.push({ id, from, subject: `Advice: ${question}`, body }),
     raw: (m: { id: string; from: string; subject?: string; body?: string }) => void inbox.push(m),
-    arriveLate: (id: string, question: string) => void lateMail.push({ id, from: 'term_sup', subject: `Advice: ${question}`, body: '' }),
     closeTerminal: (handle: string) => closedTerminals.add(handle),
+    mailboxGone: (handle: string) => deps.mailboxGone?.('acme/app', handle),
     failStartingSaves: (on: boolean) => (failStartingSave = on),
     setWorkspaceIds: (ids: (string | null)[]) => (workspaceIds = [...ids]),
     advance: (ms: number) => (now += ms),
@@ -277,19 +279,6 @@ describe('the advisor at work', () => {
     await h.step()
     assert.equal(h.launches().length, 2, 'the second starts once the first is answered')
     assert.ok(at(h.launches()[1], '--prompt').includes('second'))
-  })
-
-  test('a message that arrives between the peek and the consuming check is taken too; one without subject or body is not marked read', async () => {
-    const h = advisorHarness()
-    await h.briefed()
-    h.ask('m1', 'first')
-    h.arriveLate('m2', 'late')
-    h.raw({ id: 'm3', from: 'term_sup' })
-    const view = await h.step()
-    assert.equal(view?.queued, 1, 'the late one waits behind the first')
-    const saved = h.store.get('advice:acme/app') as { seen: string[]; queue: { question: string }[] }
-    assert.deepEqual(saved.queue.map((q) => q.question), ['late'])
-    assert.deepEqual(saved.seen, ['m1', 'm2'])
   })
 
   test('in dry run, or with no supervisor, questions wait; nothing starts and nothing is sent', async () => {
@@ -484,9 +473,9 @@ describe('the advisor at work', () => {
     assert.ok(h.sent[0].body.includes('--to term_mail'))
     await h.step()
     assert.equal(h.sent.length, 1, 'once')
-    // The mailbox terminal was closed: Orca refuses it, so a new one is made and the supervisor told.
-    h.closeTerminal('term_mail')
-    await h.step()
+    // The mailbox terminal was closed: Orca refuses it (the engine's read finds so), a new one is
+    // made, and the supervisor is told the new address.
+    h.mailboxGone('term_mail')
     await h.step()
     assert.equal(h.sent.length, 2)
     assert.ok(h.sent[1].body.includes('--to term_mail2'))
@@ -638,7 +627,9 @@ describe('the engine with the advisor', () => {
     store: { get: async () => null, set: async () => {} },
     executor: { execute: async () => ({ ok: true }) },
     advisor: h.advisor,
-    supervisorSenders: async () => ['term_sup']
+    supervisorSenders: async () => ['term_sup'],
+    mail: h.reader,
+    mailbox: async () => h.mailbox()
   })
 
   test('a real advisor: started from a tick, shown on its project, and stopped when the project is turned off', async () => {
@@ -692,9 +683,6 @@ describe('only the supervisor asks the advisor', () => {
     assert.equal(h.sent.length, 0, 'nobody is told about the dropped ones')
     assert.ok(h.logs.some((l) => l.includes('from dispatch:d-login, which is not the supervisor')))
     assert.ok(h.logs.some((l) => l.includes('from term_other, which is not the supervisor')))
-    // Read once: the dropped ones are not looked at again.
-    const saved = h.store.get('advice:acme/app') as { seen: string[] }
-    assert.deepEqual(saved.seen, ['m1', 'm2', 'm3'])
     // The board counts them, so a person can see someone else is writing to the mailbox.
     assert.equal(view?.dropped?.count, 2)
   })
@@ -721,14 +709,30 @@ describe('only the supervisor asks the advisor', () => {
     assert.equal(h.store.get('advice:acme/app'), null)
   })
 
-  test('a reply to an answer is read and logged, not answered again', async () => {
+  test('a reply to an answer is not a question, and is not answered again', async () => {
     const h = advisorHarness()
     await h.briefed()
     h.raw({ id: 'm1', from: 'term_sup', subject: 'Re: Advice: one PR or two?', body: 'thanks' })
     const view = await h.step()
     assert.equal(h.launches().length, 0)
     assert.equal(view?.queued, 0)
-    assert.ok(h.logs.some((l) => l.includes('a reply to an answer of the advisor is not a question')))
+  })
+
+  test('a question with no advisor to answer it: the supervisor hears so at once, in dry run too, and only the supervisor', async () => {
+    const h = advisorHarness()
+    h.ask('m1', 'one PR or two?')
+    h.ask('m2', 'from someone else', 'x', 'term_other')
+    const view = await h.step({ config: withAdvisor(null), acting: false })
+    assert.equal(view, null, 'no advisor shows on the board')
+    assert.deepEqual(h.sent.map((m) => [m.to, m.subject]), [['run:r1', 'Advice: one PR or two? (no answer)']])
+    assert.match(h.sent[0].body, /no advisor is set for this project in Matriarch's Settings/)
+    assert.equal(h.launches().length, 0)
+    // Kept with what Matriarch sent, so a reply to it is known.
+    assert.deepEqual((h.store.get('mail:acme/app') as { sent: { id: string; kind: string }[] }).sent.map((s) => [s.id, s.kind]), [['msg_1', 'advice']])
+    const unusable = advisorHarness()
+    unusable.ask('m1', 'q')
+    await unusable.step({ config: withAdvisor({ agent: 'opencode', model: 'x' }) })
+    assert.match(unusable.sent.at(-1)?.body ?? '', /the opencode advisor set for this project cannot be started read-only/)
   })
 
   test('who the supervisor is, is asked only when a question came; with nobody known, nothing is answered', async () => {
@@ -782,7 +786,9 @@ describe('the advisor is polled for projects no tick sees', () => {
     store: { get: async () => null, set: async () => {} },
     executor: { execute: async () => ({ ok: true }) },
     advisor: h.advisor,
-    supervisorSenders: async () => ['term_sup']
+    supervisorSenders: async () => ['term_sup'],
+    mail: h.reader,
+    mailbox: async () => h.mailbox()
   })
 
   test('its answer is still sent, and its worktree removed, after the workspaces close', async () => {

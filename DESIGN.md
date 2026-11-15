@@ -137,8 +137,9 @@ that agent in the throwaway worktree.
   that carries the `Matriarch-Task: <taskId>` trailer, and report `worker_done` with the PR
   URL. The brief has the supervisor end every task spec with this contract.
 - **Mailbox.** Orca accepts a message only from a terminal, so Matriarch keeps one of its own in
-  each project ("Matriarch mailbox", `cat > /dev/null`). It sends everything from it, and the
-  supervisor sends the advisor's questions to it.
+  each project ("Matriarch mailbox", `cat > /dev/null`). It sends everything from it, and reads
+  it each tick: replies to its messages, and the supervisor's questions for the advisor (see
+  [Mailbox](#mailbox)).
 - **Feedback.** `orca orchestration send --to dispatch:<id>` works from outside any Run, and a
   finished worker gets the message as a follow-up task.
 
@@ -247,7 +248,10 @@ round. When `maxRounds` is used up the PR escalates:
    problem and commit. It can re-plan, spawn a fixer on a stronger tier, resolve the conflict
    itself, or split the PR.
 3. **Human**: if nothing changes within `humanAfterMinutes`, Matriarch sends a desktop
-   notification and puts the PR in `needs-you`.
+   notification and puts the PR in `needs-you`. A supervisor that answered the escalation (a
+   reply in its thread, [Mailbox](#mailbox)) gets `humanAfterMinutes` again from its first
+   answer; if the problem is still there after it, the person is told with that answer.
+   Later answers update its words, not its time.
 
 ## Review crew (phase 3, built)
 
@@ -461,12 +465,11 @@ the supervisor chooses to ask.
   mails it again when any of these change, or when the advisor is turned off. A supervisor whose
   sender Matriarch cannot name (a chat opened by hand) is not told at all, since every question
   it sent would be dropped; the board says so.
-- **Reading.** Each tick, `orchestration check --terminal <mailbox> --peek --full` reads new mail
-  as Orca stores it; questions (`Advice: …`; a reply such as `Re: Advice: …` is logged and not
-  answered again, and a follow-up is a new `Advice:`) are saved, by message id,
-  before a plain `check --full` marks the batch read, so a crash in between loses nothing and
-  nothing is taken twice. Mail that came between the two is taken from that batch. A message is
-  marked read only once its subject or body was read. Mail that is not a question is dropped.
+- **Reading.** The engine reads the mailbox ([Mailbox](#mailbox)) and hands the advisor each
+  question (`Advice: …`) once; a reply such as `Re: Advice: …` is not one, and a follow-up is a
+  new `Advice:`. The advisor also keeps the ids it took, so a batch handed over twice never starts
+  a second run. A question asked while no advisor is set, or one Matriarch cannot start, gets an
+  answer saying so at once, as a notice of how the advisor is set up.
 - **Only the supervisor.** A question counts only when its `from_handle` is one of the
   supervisor's addresses; anything else is dropped and logged, and nobody is told. Orca 1.4.257
   stores a sender as its caller's address: a chat (an Orca agent session) as
@@ -474,8 +477,10 @@ the supervisor chooses to ask.
   handle. Matriarch keeps the session id from the chat's launch receipt (`outcome.sessionId` when
   `outcome.kind` is `structured`) and the terminal from a terminal launch, and reads the handle
   the Run is bound to now (`run-show --full`: `coordinator_handle`; Orca hides a Run's
-  coordinator session id). A supervisor Matriarch did not launch is known only by that handle,
-  so a chat started by hand gets no answers. The board counts dropped questions. This is an
+  coordinator session id), and the senders of the supervisor's replies in threads Matriarch
+  started with its Run ([Mailbox](#mailbox)). So a supervisor Matriarch did not launch (one
+  opened before it kept the launch receipt, or by hand) can ask once it has answered any of
+  Matriarch's mail. The board counts dropped questions. This is an
   address match, not authentication: Orca does not authenticate senders (see SECURITY.md).
 - **Answering.** One question at a time per project, up to 10 waiting: a throwaway worktree of
   the default branch (a `matriarch/review-` branch, so the board skips it), the advisor launched
@@ -505,6 +510,56 @@ the supervisor chooses to ask.
 - **Board.** The supervisor's card shows the advisor and its question, an advisor set that
   Matriarch cannot start (with why), and how many questions it dropped; one stuck on a prompt
   shows under **Needs you** with its terminal.
+
+### Mailbox
+
+`src/mailbox.ts`. Matriarch sends its mail from its mailbox terminal, and replies come back to
+it: Orca addresses a reply to the sender of the message it answers and gives it that message's
+id as `thread_id` (the supervisor's chat answers Matriarch's escalations, draft nudges and
+notices; a worker may answer a fix request). The supervisor's questions for the advisor come
+there too.
+
+- **Read each tick, each message once.** `check --terminal <mailbox> --peek --full` reads the
+  unread mail with its sender (`from_handle`), run, thread and time. Matriarch's own record of the
+  messages it handled (by id, for a week) is what counts, not Orca's unread mark: an older
+  Matriarch marked mail read without reading it, and anything else might. So every half hour
+  `inbox --terminal <mailbox> --limit 500 --full` reads the recent mail, read or not, and what
+  was not handled yet is handled then. Neither reads further back or by time; mail older than a
+  week is not handled.
+- **Marked read as a courtesy.** After reading, `check --terminal <mailbox> --full` marks the
+  oldest unread batch read, and anything in it that arrived since the look is taken too. Only
+  Matriarch reads this mailbox, and an empty unread list keeps each tick's read small.
+- **What Matriarch sent** is kept a week (`mail:<repo>`): each message's id (from the send's
+  `{messageId}`), where it went, its subject, its PR and, for an escalation, its ledger key. Mail
+  sent before Matriarch kept this, or whose record a racing write lost, is found in Orca: a reply
+  whose thread is unknown is looked up among the messages in the supervisor Run's mailbox
+  (`inbox --terminal run:<id>`) that came from one of Matriarch's own mailboxes; its PR is read
+  from its subject, and the escalation it raised from its text.
+- **Routed.** A question goes to the advisor. A reply in a thread Matriarch started goes to that
+  PR: a note on the ledger (the card shows the latest), a line in its activity log at the time it
+  came, and, from the supervisor to a current escalation, the escalation marked answered
+  ([Fix rounds and escalation](#fix-rounds-and-escalation)): not one already sent on to the
+  person, nor one newer than the reply. A reply whose thread Orca no longer has, with a PR in its
+  subject, is only shown in that PR's log. Anything else (mail from Matriarch's own mailboxes, a
+  message in no thread of Matriarch's) is logged and dropped: the mailbox is no way to hand
+  Matriarch work.
+- **The supervisor learned.** A reply in a thread Matriarch started with `run:<id>`, filed by Orca
+  under that Run, names the supervisor's address (a chat's `orca_session_id:<id>`); it joins the
+  addresses the advisor answers. An address match, as every sender check is.
+- **Dry run.** Reading, the notes, the log lines and answered escalations happen in dry run too:
+  they only read. What sends waits for autopilot, as everywhere.
+- **No new tab for reading.** Only a mailbox that already exists is read: mail can only have come
+  to one Matriarch sent from. One Orca says is gone is forgotten, and the next send makes a new
+  one (the advisor then tells the supervisor its new address).
+- **Why not a Run of its own.** A Run's mailbox (`run:<id>`) outlives a terminal, so Matriarch
+  could give itself one with `run-create` bound to its mailbox terminal. It does not: Orca 1.4.257
+  binds a Run to a coordinator agent (its delivery takes a consumer generation that another
+  binding fences, `consumer_fenced`; rebinding after the terminal is gone is a "legacy takeover"
+  that "must be invoked by the live coordinator agent terminal it will bind"), it nudges that
+  coordinator as an agent, and the Run would show among the person's Runs. A `cat` terminal
+  coordinating a Run would need the same rebinding when it closes, which is the loss it was meant
+  to avoid. So mail sent to the mailbox while its terminal is closed is lost: Orca keeps it, but
+  `inbox` answers nothing for a handle that is gone ("Return empty for stale/unknown handles").
 
 ## Merging (phase 5)
 
@@ -1039,14 +1094,16 @@ lockdown was checked live (2026-11-10, Claude Code 2.1.322, Codex 0.167.0):
 Everything below is built and covered by tests against stand-ins for Orca, GitHub and GitLab,
 but has not run on a real project or a live Orca yet:
 
-- **The advisor's mailbox.** That `orchestration check --terminal <mailbox> --peek --full --json`
-  works from the plugin's worker with the mailbox named, answers `{messages: [{id, from_handle,
-  subject, body, …}], count}`, and that a plain `check --full` marks that batch read for a plain
-  terminal; that a supervisor chat's `send --to <terminal handle>` is stored for the mailbox, not
-  only typed into it; that its `from_handle` is `orca_session_id:<id>` with the id the chat's
-  launch receipt gave, still after `/clear`; that a terminal supervisor's sender is its handle,
-  equal to the Run's `coordinator_handle` from `run-show --full` (also after a restart re-issues
-  it); and whether any other caller can send as the supervisor's session.
+- **The mailbox.** Read live on Orca 1.4.257 (2026-11-14), from a shell: `check --terminal
+  <mailbox> --peek --full --json` answers `{messages: [{id, run_id, from_handle, to_handle,
+  subject, body, type, thread_id, created_at, …}]}`; `--all` answers the newest 100, read or
+  not; a chat supervisor's replies carry `from_handle: orca_session_id:claude_<id>`, its Run's
+  `run_id` and the answered message's id as `thread_id`; `send --from <mailbox>` answers
+  `{messageId}`; a send with no sender terminal is refused (`no_active_sender_terminal`). Not yet
+  run from the plugin's worker: the reading itself, `inbox --terminal <mailbox>` and `inbox
+  --terminal run:<id>`, a plain `check --full` marking a terminal mailbox's batch read, the
+  learned supervisor answering the advisor end to end, and whether the chat's session id equals
+  the one its launch receipt gave, still after `/clear`.
 - **Worker limits.** That `agent.tool.before` never fires for a supervisor in a chat (read from
   Orca's source, above), and that `worker-stop` on a live dispatch stops it and keeps its
   worktree.

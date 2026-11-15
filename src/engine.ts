@@ -15,11 +15,12 @@ import { flakyReason } from './flaky.ts'
 import { forgeKind, forgeTerms, type FailureDetails, type FileMoves, type ForgeKind, type ForgeReader, type Outcome } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { followIssues } from './issues.ts'
-import { addLog, addMark, historyKey, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
+import { addLog, addMark, historyKey, insertLog, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
 import { checkKey, keepChecks, ledgerKey, loadLedger, record, recordRefusedRerun, recordRefusedRetarget, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
 import { countStarts, dayOf, isWorking, loadPendingStops, loadStarts, overLimitStarts, STOP_RETRY_MS, stoppedMessage, type LimitState, type PendingStop } from './limits.ts'
 import { LOCK_LABEL } from './lockdown.ts'
-import type { WorkerRow } from './orca-cli.ts'
+import type { SentReceipt, WorkerRow } from './orca-cli.ts'
+import { applyReply, loadMailState, mailKey, recordSent, replyLine, takeMail, type MailMessage, type MailReader } from './mailbox.ts'
 import { lightPaths, MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner, type Plan } from './plan.ts'
 import { supervisorTagPrefix } from './supervisor.ts'
 import type { AdvisorView, Board, LogEntry, Mark, RepoView, TrackView } from './protocol.ts'
@@ -101,7 +102,16 @@ export interface EngineDeps {
   /** The opted-in projects a tick saw, once it could read Orca's workspaces (not called otherwise). */
   onProjects?: (repos: string[]) => void
   /** Sends the supervisor's Run a message from Matriarch's mailbox: a labeled issue, workers stopped over a limit. */
-  tellSupervisor?: (repo: string, root: string, to: string, message: { subject: string; body: string }) => Promise<void>
+  tellSupervisor?: (repo: string, root: string, to: string, message: { subject: string; body: string }) => Promise<SentReceipt | void>
+  /**
+   * Matriarch's mailbox in a project, when one exists: where replies to its mail come back. It is
+   * never made here, so a project nothing was sent from gets no mailbox tab.
+   */
+  mailbox?: (repo: string) => Promise<string | null>
+  /** Orca says this mailbox is gone: the next one asked for is made anew. */
+  mailboxGone?: (repo: string, handle: string) => void
+  /** Reads mailboxes (mailbox.ts); absent where nothing is read (tests of other parts). */
+  mail?: MailReader | null
   /** Stops a worker that started over a limit (`orchestration worker-stop`); its worktree is kept. */
   stopWorker?: (dispatchId: string) => Promise<Outcome>
   /** Posts a comment on an issue on the project's forge. */
@@ -554,6 +564,11 @@ interface ProjectTick {
   whyNot: string | null
   acting: boolean
   byBranch: Map<string, Workspace>
+  // readMail
+  /** Questions for the advisor that came this tick. */
+  questions: MailMessage[]
+  /** Replies to Matriarch's mail, by the PR they are about: for that PR's log this tick. */
+  mailLog: Map<number, LogEntry[]>
   // holdLimits
   live: number
   startsToday: number
@@ -694,6 +709,7 @@ async function tickProject(t: TickContext, repoKey: string, info: RepoInfo, repo
   if (!cfg) return
   const proj = await openProject(t, repoKey, info, repoWorkspaces, cfg)
   await holdLimits(proj)
+  await readMail(proj)
   await handIssues(proj)
   await listPrs(proj)
   await stepAdvisor(proj)
@@ -704,6 +720,7 @@ async function tickProject(t: TickContext, repoKey: string, info: RepoInfo, repo
   prepareTracks(proj)
   for (const item of proj.items) await planAndAct(proj, item)
   await logLeftoverCleanups(proj)
+  await logLeftoverReplies(proj)
   await worktreeTracks(proj)
 }
 
@@ -811,6 +828,7 @@ async function openProject(t: TickContext, repoKey: string, info: RepoInfo, repo
   }
   return {
     t, info, repoKey, repoWorkspaces, cfg, config, kind, terms, forge, supervisor, pending, view, free, limits, lowDisk, whyNot, acting, byBranch,
+    questions: [], mailLog: new Map(),
     live: 0, startsToday: 0, stoppedWorktrees: {},
     summaries: [], viewer: '', listed: false, base: null, truncatedList: false, detailAge: t.maxAge, follows: () => false, unknownWs: new Set(),
     trackedKey: `tracked:${repoKey}`, tracked: [], open: new Set(), items: [], mergeBusy: new Set(), runningReviews: 0,
@@ -820,6 +838,69 @@ async function openProject(t: TickContext, repoKey: string, info: RepoInfo, repo
     cleanedUp: new Map(),
     seenWorkspaces: new Set(), firstOn: new Map(), openStack: { parents: new Map(), all: new Map() }, closedSnaps: new Map()
   }
+}
+
+/**
+ * The project's mail (mailbox.ts): questions for the advisor kept for its step, and each reply to
+ * Matriarch's mail marked on its PR: a note, an escalation it answers, a line in its log. It only
+ * reads, so it happens in dry run too. Adds questions, mailLog.
+ */
+async function readMail(proj: ProjectTick): Promise<void> {
+  const { deps, now } = proj.t
+  const { repoKey, supervisor, view } = proj
+  if (!deps.mail || !deps.mailbox) return
+  const address = await deps.mailbox(repoKey).catch(() => null)
+  if (!address) return
+  const key = mailKey(repoKey)
+  const before = loadMailState(await deps.store.get(key))
+  const taken = await takeMail({ reader: deps.mail, address, state: before, supervisor, now, log: (m) => deps.log(`${repoKey}: ${m}`) })
+  if (taken.gone) {
+    // Closed, or lost in a restart: the next send makes a new one, and the supervisor is told.
+    deps.mailboxGone?.(repoKey, address)
+    return
+  }
+  proj.questions.push(...taken.questions)
+  const byPr = new Map<number, LogEntry[]>()
+  const note = (number: number, entry: LogEntry) => byPr.set(number, [...(byPr.get(number) ?? []), entry])
+  for (const reply of taken.replies) {
+    const { sent, message, who } = reply
+    if (sent.number === undefined) {
+      deps.log(`${repoKey}: the ${who} replied to "${sent.subject}": ${replyLine(message.body, 200)}`)
+      continue
+    }
+    const lk = ledgerKey(repoKey, sent.number)
+    const out = applyReply(loadLedger(await deps.store.get(lk)), reply, now)
+    await deps.store.set(lk, out.ledger as unknown as JsonValue)
+    if (out.answered) deps.log(`${repoKey} #${sent.number}: the supervisor answered the escalation ${out.answered}`)
+    note(sent.number, out.entry)
+  }
+  for (const { message, number } of taken.loose) {
+    // Its thread is gone from Orca: shown where it belongs, and nothing more is made of it.
+    note(number, { at: message.at || now, kind: 'reply', text: `A reply about this PR came in: ${replyLine(message.body, 240)}`, subject: message.subject })
+  }
+  proj.mailLog = byPr
+  try {
+    await deps.store.set(key, taken.state as unknown as JsonValue)
+  } catch (error) {
+    view.errors.push(`Could not save what Matriarch read from its mailbox: ${(error as Error).message}`)
+  }
+}
+
+/** Replies about a PR that is not on the board this tick: they go to its own log. */
+async function logLeftoverReplies(proj: ProjectTick): Promise<void> {
+  const { deps } = proj.t
+  for (const [number, entries] of proj.mailLog) {
+    const key = historyKey(`pr:${proj.repoKey}#${number}`)
+    let history = loadHistory(await deps.store.get(key))
+    for (const e of entries) history = insertLog(history, e)
+    await deps.store.set(key, history as unknown as JsonValue)
+  }
+  proj.mailLog.clear()
+}
+
+/** A reply as the card shows it: who, when, and its first lines. */
+function noteView(n: { at: number; from: 'supervisor' | 'worker'; text: string }): { at: number; from: 'supervisor' | 'worker'; text: string } {
+  return { at: n.at, from: n.from, text: replyLine(n.text, 300) }
 }
 
 /** The supervisor's workers against the limits: counted, over-limit starts stopped, the hook told. Adds live, startsToday, stoppedWorktrees. */
@@ -883,7 +964,9 @@ async function holdLimits(proj: ProjectTick): Promise<void> {
       await deps.store.set(keptKey, kept as unknown as JsonValue)
       view.warnings.push(...stopped.map((o) => `Stopped worker dispatch:${o.dispatchId}${o.taskId ? ` (task ${o.taskId})` : ''}: ${o.reason}`))
       if (deps.tellSupervisor && supervisor) {
-        await deps.tellSupervisor(repoKey, info.root, supervisor, stoppedMessage(stopped))
+        const m = stoppedMessage(stopped)
+        await deps.tellSupervisor(repoKey, info.root, supervisor, m)
+          .then((receipt) => (receipt ? recordSent(deps.store, repoKey, receipt, { at: now, to: supervisor, subject: m.subject, kind: 'stop' }) : undefined))
           .catch((error: Error) => view.errors.push(`Stopped workers that started over a limit, but could not tell the supervisor: ${error.message}`))
       }
       // A stopped worker takes no room, and its start does not count against today.
@@ -972,7 +1055,13 @@ async function handIssues(proj: ProjectTick): Promise<void> {
       held,
       now,
       store: deps.store,
-      tellSupervisor: deps.tellSupervisor,
+      // Each handoff is kept with the mail Matriarch sent, so the supervisor's reply is known as its.
+      tellSupervisor: deps.tellSupervisor
+        ? async (repo, root, to, m) => {
+            const receipt = await deps.tellSupervisor!(repo, root, to, m)
+            if (receipt) await recordSent(deps.store, repo, receipt, { at: now, to, subject: m.subject, kind: 'issue' }).catch(() => {})
+          }
+        : undefined,
       commentIssue: deps.commentIssue,
       stillOn: opts.stillOn
     })
@@ -1033,6 +1122,7 @@ async function stepAdvisor(proj: ProjectTick): Promise<void> {
     try {
       const advisor = await deps.advisor.step({
         repo: repoKey, root: info.root, config, supervisor, acting, notActing: whyNot, base: base?.name ?? null, forge: kind,
+        questions: proj.questions,
         supervisorSenders: async () => (deps.supervisorSenders ? deps.supervisorSenders(repoKey, supervisor) : [])
       })
       if (advisor) {
@@ -1417,6 +1507,13 @@ async function act(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Pl
     }
     const outcome = await run1(action)
     if (outcome.ok) {
+      // What went to an agent is kept with its id, so a reply in its thread finds this PR (mailbox.ts).
+      if (outcome.sent?.messageId && outcome.sent.address) {
+        await recordSent(deps.store, repoKey, { id: outcome.sent.messageId, from: outcome.sent.from ?? null }, {
+          at: now, to: outcome.sent.address, subject: outcome.sent.subject, kind: action.kind === 'escalate' && action.key.startsWith('draft:') ? 'draft' : action.kind,
+          number: snap.number, ...(action.kind === 'escalate' ? { key: action.key } : {})
+        }).catch(() => {})
+      }
       ledger = record(ledger, action, now)
       marks.push(markFor(action, now, kind))
       logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
@@ -1479,6 +1576,9 @@ async function writeTrack(proj: ProjectTick, item: TickItem, owner: Owner | null
   history = noteLane(history, p.lane, p.reason, now)
   for (const m of marks) history = addMark(history, m)
   for (const e of logged) history = addLog(history, e)
+  // Replies to Matriarch's mail about this PR, at the times they came.
+  for (const e of proj.mailLog.get(snap.number) ?? []) history = insertLog(history, e)
+  proj.mailLog.delete(snap.number)
   const cleaned = cleanedUp.get(snap.number)
   if (cleaned) {
     history = addLog(history, cleaned)
@@ -1513,7 +1613,8 @@ async function writeTrack(proj: ProjectTick, item: TickItem, owner: Owner | null
       ci: snap.ci,
       failing: snap.checks.filter((c) => c.state === 'failure').map((c) => c.name),
       openThreads: actionableThreads(snap).length,
-      ...(ledger.stack && snap.state === 'OPEN' && snap.baseRef === ledger.stack.headRef ? { stackedOn: ledger.stack.number } : {})
+      ...(ledger.stack && snap.state === 'OPEN' && snap.baseRef === ledger.stack.headRef ? { stackedOn: ledger.stack.number } : {}),
+      ...(ledger.notes?.length ? { note: noteView(ledger.notes[ledger.notes.length - 1]) } : {})
     },
     owner: owner ? { agent: owner.agent, model: owner.model, activity: owner.activity, supervised: owner.address !== null } : null,
     lane: p.lane,

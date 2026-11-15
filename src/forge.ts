@@ -42,8 +42,12 @@ export interface Outcome {
   error?: string
   /** Set when the action was deliberately not carried out (not built yet, say). */
   skipped?: string
-  /** The message it sent, for the activity log: who to, its subject, and why it went there. */
-  sent?: { to: 'worker' | 'supervisor' | 'you'; subject: string; note?: string }
+  /**
+   * The message it sent, for the activity log: who to, its subject, and why it went there. A
+   * message to an agent also has the address it went to and the id Orca gave it, so a reply in
+   * its thread is known to be about this PR (mailbox.ts).
+   */
+  sent?: { to: 'worker' | 'supervisor' | 'you'; subject: string; note?: string; address?: string; messageId?: string | null; from?: string | null }
 }
 
 /** An open issue, as handed to the supervisor. */

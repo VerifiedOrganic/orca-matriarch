@@ -257,7 +257,7 @@ describe('executor', () => {
     // Known finished: straight to the supervisor.
     const finished = { ...ctx, supervisor: 'run:r1', worktree: '/r/wt/login', ownerLive: false }
     // The activity log says who got it, and why the supervisor did.
-    assert.deepEqual(await ex.execute(action, finished), { ok: true, sent: { to: 'supervisor', subject: '#12 needs a follow-up: #12 conflicts with main, round 1/2', note: 'its worker had finished, so the supervisor got it' } })
+    assert.deepEqual(await ex.execute(action, finished), { ok: true, sent: { to: 'supervisor', subject: '#12 needs a follow-up: #12 conflicts with main, round 1/2', note: 'its worker had finished, so the supervisor got it', address: 'run:r1', messageId: null, from: 'term_mailbox' } })
     const first = sent.at(-1)!
     assert.equal(first[first.indexOf('--to') + 1], 'run:r1')
     assert.ok(!first.includes('--type'), 'plain mail: Orca takes --type escalation only from a worker')
@@ -281,7 +281,7 @@ describe('executor', () => {
     const f = fakeExec((file, args) => (file === 'gh' ? { stdout: '2026-11-10T10:00:00.1Z step 1\n2026-11-10T10:00:01.2Z \u001b[31mError: boom\u001b[0m\n' } : args[0] === 'orchestration' ? { stdout: '{"ok":true,"result":{}}' } : {}))
     const ex = createExecutor({ exec: f.exec, orca: createOrcaCli(f.exec), notify: async () => {} })
     const out = await ex.execute({ kind: 'send-ci-failure', to: 'dispatch:d1', sha: SHA, round: 1, checks: [check('test', 'failure', 99)], signature: 'test' }, ctx)
-    assert.deepEqual(out, { ok: true, sent: { to: 'worker', subject: 'CI failed on #12 (a1b2c3d), round 1/3' } })
+    assert.deepEqual(out, { ok: true, sent: { to: 'worker', subject: 'CI failed on #12 (a1b2c3d), round 1/3', address: 'dispatch:d1', messageId: null, from: null } })
     assert.deepEqual(f.calls[0].args, ['api', 'repos/acme/app/actions/jobs/99/logs'])
     const send = f.calls[1].args
     const body = send[send.indexOf('--body') + 1]

@@ -40,7 +40,7 @@
     ],
     tracks: [
       track({ key: 'search-api', lane: 'needs-you', reason: 'conflicts with main; 2/2 rounds used, escalated to you',
-        pr: { number: 42, title: 'Search API pagination', url: '#', sha: 'b'.repeat(40), base: 'main', ci: 'passing', failing: [], openThreads: 0 },
+        pr: { number: 42, title: 'Search API pagination', url: '#', sha: 'b'.repeat(40), base: 'main', ci: 'passing', failing: [], openThreads: 0, note: { at: now - 48 * M, from: 'supervisor', text: 'The conflict is in the shared pagination helper that #39 also changes. I am holding #42 until #39 merges, then I will start a fixer on the rebased branch.' } },
         owner: { agent: 'codex', model: 'gpt-6-astra', activity: 'done', supervised: true }, rounds: { ci: 1, conflicts: 2, comments: 0, reviews: 1 },
         segments: segs([['building', 300], ['awaiting-ci', 215], ['fixing-ci', 200], ['awaiting-ci', 185], ['ai-review', 170], ['fixing-conflict', 120], ['awaiting-ci', 95], ['fixing-conflict', 70], ['needs-you', 40]]),
         marks: [mark('push', 215, 'pushed'), mark('ci-sent', 200, 'CI failure sent (round 1)'), mark('review-start', 170, 'review round 1'), mark('rebase-sent', 120, 'rebase requested (round 1)'), mark('rebase-sent', 70, 'rebase requested (round 2)'), mark('escalate-supervisor', 55, 'escalated to supervisor'), mark('escalate-human', 40, 'escalated to you')] }),
@@ -123,6 +123,7 @@
   const log = [
     { at: now - 40 * M, kind: 'escalate', text: 'Told you: conflicts with main; 2/2 rounds used', to: 'you', subject: 'acme/app #42 needs you' },
     { at: now - 40 * M, kind: 'lane', lane: 'needs-you', text: 'conflicts with main; 2/2 rounds used, escalated to you' },
+    { at: now - 48 * M, kind: 'reply', from: 'supervisor', text: 'The supervisor answered the escalation: The conflict is in the shared pagination helper that #39 also changes. I am holding #42 until #39 merges, then I will start a fixer on the…', subject: 'Escalation: acme/app #42 needs a decision', detail: 'The conflict is in the shared pagination helper that #39 also changes. I am holding #42 until #39 merges, then I will start a fixer on the rebased branch.\n\nIf #39 slips past today, I will ask the advisor whether to split the helper change out of #42 instead.' },
     { at: now - 55 * M, kind: 'escalate', text: 'Escalated to the supervisor: conflicts with main; 2/2 rounds used', to: 'supervisor', subject: 'Escalation: acme/app #42 needs a decision' },
     { at: now - 70 * M, kind: 'send-rebase', text: 'Asked the supervisor to rebase onto main, round 2 (its worker had finished, so the supervisor got it)', to: 'supervisor', subject: '#42 needs a follow-up: Rebase #42 onto main (round 2 of 2)' },
     { at: now - 70 * M, kind: 'lane', lane: 'fixing-conflict', text: 'conflicts with main; asking the worker to rebase (round 2/2)' },

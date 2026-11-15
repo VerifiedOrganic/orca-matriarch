@@ -133,31 +133,42 @@ export interface Mailbox {
   gone(handle: string): void
 }
 
+/** What Orca made of a message Matriarch sent: its id (a reply comes back in its thread) and the mailbox it went from. */
+export interface SentReceipt {
+  id: string | null
+  from: string | null
+}
+
 /**
  * Sends a message from a mailbox, the one way Matriarch sends mail: Orca refuses a sender it
  * cannot place in a terminal, and a plugin has none of its own. A mailbox Orca says is gone is
  * dropped, so the next send makes a new one; the error still reaches the caller.
  */
-export async function sendFrom(cli: OrcaCli, mailbox: Mailbox | null, message: { to: string; subject: string; body: string; type?: 'status' | 'escalation' }): Promise<void> {
+export async function sendFrom(cli: OrcaCli, mailbox: Mailbox | null, message: { to: string; subject: string; body: string; type?: 'status' | 'escalation' }): Promise<SentReceipt> {
   const from = mailbox ? await mailbox.address().catch(() => null) : null
   try {
-    await sendMessage(cli, { ...message, from })
+    return { id: await sendMessage(cli, { ...message, from }), from }
   } catch (error) {
     if (from && error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)) mailbox!.gone(from)
     throw error
   }
 }
 
-/** Delivers a message to a worker (`dispatch:<id>`) or a supervisor's Run (`run:<id>`). */
+/**
+ * Delivers a message to a worker (`dispatch:<id>`) or a supervisor's Run (`run:<id>`). Answers the
+ * message's id (Orca 1.4.257: `{messageId}`), which a reply carries as its thread; null when Orca
+ * did not say.
+ */
 export async function sendMessage(
   cli: OrcaCli,
   message: { to: string; subject: string; body: string; type?: 'status' | 'escalation'; from?: string | null }
-): Promise<void> {
+): Promise<string | null> {
   const args = ['orchestration', 'send', '--to', message.to, '--subject', message.subject, '--body', message.body]
   if (message.type) args.push('--type', message.type)
   // Orca names the sender by its terminal; a plugin has none, so it sends from its own mailbox.
   if (message.from) args.push('--from', message.from)
-  await cli.run(args)
+  const receipt = obj(await cli.run(args))
+  return str(receipt.messageId) ?? str(obj(receipt.message).id)
 }
 
 /** The terminal handle in an `orca terminal create` receipt. */

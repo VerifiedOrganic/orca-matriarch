@@ -7,10 +7,13 @@ The first release.
 - A **supervisor** chat per project, on the agent and model you choose, plans the work, starts
   workers in their own worktrees on your worker tiers, answers their questions and handles
   escalations, so a run keeps going while you are away. Changing the worker settings or limits
-  tells a running supervisor.
+  tells a running supervisor. Matriarch reads what the supervisor (or a worker) writes back to
+  its mail: each reply shows on its PR and in its log, and an answered escalation gives the
+  supervisor that long again before you are told, with its answer.
   - An optional **advisor** gives the supervisor a second opinion when it asks, on its own agent,
     model and thinking level (Claude on Fable 5.2, say): one question at a time, read-only, in a
-    throwaway worktree, only from the supervisor Matriarch opened, and only with autopilot on.
+    throwaway worktree, only from the supervisor (known from its chat's launch, or from its
+    replies to Matriarch's mail), and only with autopilot on.
   - **Worker and disk limits** per project: workers at once, worker starts a day, and a disk
     floor. The supervisor's brief states them; a Claude Code supervisor or worker in a terminal
     has a start over a limit refused, and with autopilot on, any other worker that starts over a

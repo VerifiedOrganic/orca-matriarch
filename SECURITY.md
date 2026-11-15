@@ -30,8 +30,10 @@ Not vulnerabilities in Matriarch:
 - what the advisor advises: it only reads, and the supervisor weighs its answer;
 - another agent on your machine posing as the supervisor to the advisor. The check is an address
   match: a question is answered only when Orca stored it as sent from the supervisor's chat
-  session, its terminal or the handle its Run is bound to. Orca does not authenticate senders,
-  so an agent that learned one of those addresses can send as it. What that allows is limited:
+  session, its terminal, the handle its Run is bound to, or the sender of a reply in a thread
+  Matriarch started with that Run (Orca gives a reply the id of the message it answers, which
+  only the Run's coordinator received). Orca does not authenticate senders, so an agent that
+  learned one of those addresses can send as it. What that allows is limited:
   the advisor runs read-only, so the cost is one agent session per question, and the text it
   writes reaches the supervisor framed as a second opinion, which the supervisor weighs and does
   not obey.

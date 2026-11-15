@@ -380,6 +380,8 @@ function logList(t: TrackView): HTMLElement {
           // The same line, again and again: counted, with when it last came.
           e.count && e.count > 1 ? el('span', { class: 'log-count', title: `${e.count} times, last ${new Date(e.lastAt ?? e.at).toLocaleString()}` }, ` ×${e.count}, last ${clock(e.lastAt ?? e.at)}`) : null,
           e.subject ? el('div', { class: 'muted' }, `“${e.subject}”`) : null,
+          // A reply too long for its line opens in full.
+          e.detail ? el('details', { class: 'log-detail' }, el('summary', {}, 'The whole reply'), el('div', { class: 'reply-text' }, e.detail)) : null,
           e.error ? el('div', { class: 'warn-text' }, e.error) : null))))
 }
 
@@ -540,6 +542,9 @@ function card(t: TrackView): HTMLElement {
         `${t.owner.agent ?? 'worker'}${t.owner.model ? ` · ${t.owner.model}` : ''} · ${t.owner.activity}`) : null,
       t.review ? el('span', { class: 'pill' }, `review r${t.review.round} ${t.review.verdict ?? t.review.status}`) : null),
     el('div', { class: 'reason' }, t.reason),
+    // What the supervisor (or the worker) last answered about this PR.
+    pr?.note ? el('div', { class: 'note', title: `${pr.note.from === 'supervisor' ? 'The supervisor' : 'Its worker'} replied ${new Date(pr.note.at).toLocaleString()}` },
+      el('b', {}, `${pr.note.from === 'supervisor' ? 'Supervisor' : 'Worker'}, ${clock(pr.note.at)}: `), pr.note.text) : null,
     t.review && t.review.reviewers.length
       ? el('div', { class: 'chips', title: t.review.summary ?? '' },
           ...t.review.reviewers.map((r) =>

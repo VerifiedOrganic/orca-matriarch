@@ -286,6 +286,8 @@ ol.log li.lane .log-text { color: var(--orca-muted-foreground); }
 ol.log li.lane .log-text b { color: var(--orca-foreground); font-weight: 500; }
 ol.log li.failed time { color: var(--m-fixing); }
 ol.log .log-count { color: var(--orca-muted-foreground); white-space: nowrap; }
+ol.log .log-detail summary { cursor: pointer; color: var(--orca-muted-foreground); }
+ol.log .reply-text { white-space: pre-wrap; overflow-wrap: anywhere; padding: 2px 0 2px 8px; border-left: 2px solid var(--orca-border); }
 .row .label:focus-visible { outline: 2px solid color-mix(in srgb, var(--m-blue) 50%, transparent); outline-offset: -2px; }
 .log-note { font-size: 11px; padding: 2px 0; }
 .log-details { border-top: 1px dashed var(--orca-border); padding-top: 3px; font-size: 11px; }
@@ -303,6 +305,7 @@ ol.log .log-count { color: var(--orca-muted-foreground); white-space: nowrap; }
 .card .top { display: flex; gap: 6px; align-items: baseline; }
 .card .top .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card .reason { color: var(--orca-muted-foreground); }
+.card .note { border-left: 2px solid var(--m-blue); padding-left: 6px; overflow-wrap: anywhere; }
 .card .next { font-size: 11px; border-top: 1px dashed var(--orca-border); padding-top: 3px; }
 .card .next li { margin-left: 14px; }
 .card ul { margin: 0; padding: 0; }

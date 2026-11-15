@@ -236,7 +236,7 @@ describe('acting on GitLab', () => {
 
   test('GitLab cannot merge the base into a branch: the worker that owns it is asked instead', async () => {
     const { g, ex } = lab()
-    assert.deepEqual(await ex.execute({ kind: 'update-branch', sha: SHA, method: 'merge' }, { ...ctx, owner: 'dispatch:d1' }), { ok: true, sent: { to: 'worker', subject: '#12 is behind main: bring it up to date' } })
+    assert.deepEqual(await ex.execute({ kind: 'update-branch', sha: SHA, method: 'merge' }, { ...ctx, owner: 'dispatch:d1' }), { ok: true, sent: { to: 'worker', subject: '#12 is behind main: bring it up to date', address: 'dispatch:d1', messageId: null, from: null } })
     assert.ok(!g.calls.some((c) => c.file === 'glab'))
     const send = g.calls[0].args
     assert.equal(send[send.indexOf('--to') + 1], 'dispatch:d1')

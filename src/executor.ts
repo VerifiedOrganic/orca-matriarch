@@ -97,15 +97,15 @@ export function createExecutor(deps: ExecutorDeps): Executor {
     const viaSupervisor = async (): Promise<Outcome> => {
       const m = forSupervisor(ctx, to, subject, body)
       // Not --type escalation: Orca takes that only from a worker ("No active Dispatch belongs to this message sender").
-      await sendFrom(deps.orca, mailbox, { to: ctx.supervisor!, subject: m.subject, body: m.body })
-      return { ok: true, sent: { to: 'supervisor', subject: m.subject, note: 'its worker had finished, so the supervisor got it' } }
+      const receipt = await sendFrom(deps.orca, mailbox, { to: ctx.supervisor!, subject: m.subject, body: m.body })
+      return { ok: true, sent: { to: 'supervisor', subject: m.subject, note: 'its worker had finished, so the supervisor got it', address: ctx.supervisor!, messageId: receipt.id, from: receipt.from } }
     }
     try {
       if (to.startsWith('dispatch:') && ctx.ownerLive === false && ctx.supervisor) return await viaSupervisor()
       // Matriarch is not a worker, so an escalation goes as plain mail with the word in its subject.
       const sentSubject = type === 'escalation' && !/escalat/i.test(subject) ? `Escalation: ${subject}` : subject
-      await sendFrom(deps.orca, mailbox, { to, subject: sentSubject, body })
-      return { ok: true, sent: { to: to.startsWith('dispatch:') ? 'worker' : 'supervisor', subject: sentSubject } }
+      const receipt = await sendFrom(deps.orca, mailbox, { to, subject: sentSubject, body })
+      return { ok: true, sent: { to: to.startsWith('dispatch:') ? 'worker' : 'supervisor', subject: sentSubject, address: to, messageId: receipt.id, from: receipt.from } }
     } catch (error) {
       const message = (error as Error).message
       if (to.startsWith('dispatch:') && ctx.supervisor && COORDINATOR_ONLY.test(message)) {

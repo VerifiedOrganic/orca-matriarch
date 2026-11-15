@@ -34,8 +34,10 @@ autopilot. [Dry run and autopilot](#dry-run-and-autopilot) lists what runs in ea
    if the project allows it. A PR [stacked](#stacked-prs) on another of yours waits for that one.
 
 Anything that needs a decision goes to the supervisor first, then to you if it is not settled
-after a while (30 minutes by default). The supervisor can ask an [advisor](#advisor) for a second
-opinion. Matriarch never answers an agent's permission prompt for you: those show as **Needs you**.
+after a while (30 minutes by default). Matriarch reads what the supervisor writes back: its
+answer shows on the PR, and a supervisor that answered gets that long again before you are told,
+with its answer. The supervisor can ask an [advisor](#advisor) for a second opinion. Matriarch
+never answers an agent's permission prompt for you: those show as **Needs you**.
 
 ## Requirements
 
@@ -109,13 +111,13 @@ Matriarch manages only PRs you opened from a branch that belongs to an Orca work
 - **Timeline:** one row per worktree or PR, colored by state: working, awaiting CI, fixing, AI
   review, needs you, ready, merged. Dots mark pushes, messages, reviews, escalations and merges.
   Worktrees with no PR and nothing running fold into one line.
-- **Board:** cards by state with the agent and model, CI, comments and rounds used, and in dry
-  run what Matriarch would do next. **Run AI review now** on any card runs the crew on that
-  commit, in dry run too.
+- **Board:** cards by state with the agent and model, CI, comments and rounds used, the
+  supervisor's latest reply about the PR, and in dry run what Matriarch would do next. **Run AI
+  review now** on any card runs the crew on that commit, in dry run too.
 - **What Matriarch did:** click a timeline row, or open **What Matriarch did** on a card, for
   that PR's log, newest first: each lane it entered and why, new commits, finished reviews, and
-  every message it sent (to the worker, the supervisor or you, with its subject), branch update,
-  merge and cleanup, including what failed and why. It holds only what Matriarch did; dry run's
+  every message it sent (to the worker, the supervisor or you, with its subject) and each reply
+  to one, branch update, merge and cleanup, including what failed and why. It holds only what Matriarch did; dry run's
   plans stay in **Would do next**. An action that fails on every poll is one line with a count
   (`×12, last 14:05`), and each PR keeps its own log. Kept for a week.
 - **Supervisor:** each project's chat, with the Run it coordinates, how many of its workers are
@@ -147,11 +149,14 @@ sees only what the supervisor sends it.
   unless you mark it **Run it without the read-only lockdown**.
 - **One at a time:** one question per project, up to 10 waiting. One that gets no answer (quiet
   for 30 minutes, or running over 2 hours) is ended, and the supervisor is told.
-- **Who may ask:** only the supervisor Matriarch opened with **Open supervisor chat**. Anything
-  else that reaches Matriarch's mailbox is dropped, and the board counts what was dropped. A
-  supervisor chat you start by hand is not offered the advisor at all, since Matriarch could not
-  tell its questions from anyone else's; the board says so. A follow-up is a new `Advice:`
-  message; a reply to an answer is read and not answered again.
+- **Who may ask:** only the supervisor. Matriarch knows it as the chat it opened with **Open
+  supervisor chat**, and from the supervisor's replies to Matriarch's own mail to its Run, so a
+  supervisor opened earlier, or by hand, can ask once it has answered any of that mail. A question
+  from anyone else is dropped, and the board counts what was dropped. Until Matriarch knows the
+  supervisor, it is not offered the advisor, and the board says so. A follow-up is a new
+  `Advice:` message; a reply to an answer is not answered again.
+- **None set:** a question sent while no advisor is set (or one Matriarch cannot start) gets an
+  answer saying so, at once.
 - **When:** answers only with autopilot on. In dry run questions wait, and the board says so.
 - **Cost:** nothing until the supervisor asks, then one agent session per question.
 
@@ -334,7 +339,9 @@ a poll.
   advisor turned on, changed or off, and that Matriarch was turned off for the project (with
   any questions that were waiting). Those notices only say how Matriarch is set up, and you made
   the change, so they go whatever autopilot says;
-- keeps the supervisor's questions to the advisor, read from its mailbox, until autopilot is on.
+- reads its mailbox: each reply to its mail goes in that PR's log and on its card, and marks the
+  escalation it answers as answered; the supervisor's questions to the advisor wait for
+  autopilot, and one asked while no advisor is set is answered at once that none is.
 
 **Only with autopilot on,** Matriarch:
 
@@ -366,8 +373,9 @@ machine, so Orca asks you to approve it on install. It needs that to run `git`, 
 - **Show notifications** (`notifications:show`): tells you when something needs you while Orca
   is in the background.
 - **Own storage** (`storage:own`): each PR's history, activity log and review state, the alert
-  settings (but not the URL), the worker and start counts behind the limits, and which issues it
-  handed over, in the plugin's own storage.
+  settings (but not the URL), the worker and start counts behind the limits, which issues it
+  handed over, and a week of its mail (what it sent from its mailbox, and which messages it
+  read), in the plugin's own storage.
 - **Own settings** (`settings:own`): autopilot on or off, and how often it checks GitHub and GitLab.
 - **Own secrets** (`secrets:own`): the [away-alert](#away-alerts) webhook URL, when you set one, in
   Orca's encrypted secrets.
@@ -415,7 +423,9 @@ It never passes `--admin` and never bypasses branch protection or GitLab's merge
 | `orca terminal switch` | **Open it** under Needs you, and the status bar item: bring that terminal to the front |
 | `orca orchestration worker-list --full`, `run-list` | find the worker that owns each branch, and the supervisor's Run |
 | `orca orchestration send --from <mailbox>` | autopilot: CI failures, comments, AI findings and update requests to a worker; escalations, labeled issues, stopped workers and the advisor's answers to the supervisor |
-| `orca orchestration check --terminal <mailbox> --peek --full`, then `check --terminal <mailbox> --full` | with an advisor: read the questions sent to Matriarch's mailbox, with their senders, then mark them read |
+| `orca orchestration check --terminal <mailbox> --peek --full`, then `check --terminal <mailbox> --full` | every poll, once Matriarch has a mailbox in the project: its new mail (replies to its messages, questions for the advisor) with their senders, then marked read |
+| `orca orchestration inbox --terminal <mailbox> --limit 500 --full` | every half hour: the recent mail, read or not, so mail something else marked read is still handled |
+| `orca orchestration inbox --terminal run:<id> --limit 500 --full` | a reply whose thread Matriarch has no record of: the message it answers, among what Matriarch sent the supervisor's Run |
 | `orca orchestration run-show --id <run> --full` | with an advisor, when a question came: the handle the supervisor's Run is bound to, to tell its questions from anyone else's |
 | `orca orchestration worker-stop --dispatch <id>` | autopilot: stop a supervisor's worker that started over the project's worker limits (its worktree is kept) |
 | `git fetch origin …`, `orca worktree create`, `orca worktree set`, `orca agent launch --model …`, `orca worktree rm` | a review round: a throwaway worktree at the PR head, named for it in Orca's sidebar, one agent per reviewer, removed afterwards |
@@ -513,8 +523,13 @@ with it. No issue text is stored.
     merge request diffs, moving a merge request's target branch, job retries and merge bases.
 - The [options](#options) and the [worker and disk limits](#worker-and-disk-limits) are new: so
   far they have run only in Matriarch's tests, against stand-ins for Orca, GitHub and GitLab, not
-  on a real project or a live Orca. The advisor's mailbox, and how Orca names the sender of a
-  question, depend most on Orca's behaving as its 1.4.257 source reads.
+  on a real project or a live Orca. The mailbox's shapes (each message's sender, its thread, the
+  id a send answers) were read from a live Orca 1.4.257.
+- Mail sent to Matriarch's mailbox while its terminal is closed is lost: Orca keeps it, but
+  answers nothing for a terminal that is gone. Matriarch makes a new mailbox and tells the
+  supervisor the new address; a reply to a message sent from the old one is lost the same way.
+- Matriarch handles mail up to a week old. Its half-hourly read of mail it may not have seen
+  reaches back the newest 500 messages (Orca reads no further back, nor by time).
 - The advisor answers only the supervisor's questions by matching the address Orca stored for
   the sender. Orca does not authenticate senders, so another agent on your machine that learned
   the supervisor's address could ask as it; see [SECURITY.md](SECURITY.md) for what that allows.

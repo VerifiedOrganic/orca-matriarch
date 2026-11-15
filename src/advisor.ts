@@ -1,7 +1,7 @@
 // The advisor: a role above the supervisor, on its own agent and model, that the supervisor asks
 // for a second opinion. The supervisor mails Matriarch's mailbox (Matriarch's own terminal in the
-// project) a message whose subject starts "Advice:". Each tick Matriarch reads the mailbox, queues
-// the questions and answers them one at a time: a throwaway worktree at the default branch, the
+// project) a message whose subject starts "Advice:". Each tick the engine reads the mailbox
+// (mailbox.ts) and hands the advisor its questions; it queues them and answers them one at a time: a throwaway worktree at the default branch, the
 // advisor started there read-only, locked down by its own agent exactly like a reviewer, and the
 // answer it writes mailed back to the supervisor. The worktree goes once it answers or gives up.
 // Like automatic reviews it starts only with autopilot on; in dry run questions wait, and so do
@@ -19,7 +19,8 @@ import {
 import { forgeTerms, type ForgeKind } from './forge.ts'
 import type { Guard } from './guard.ts'
 import { LOCK_LABEL, type LockMode } from './lockdown.ts'
-import { GONE_TERMINAL, OrcaRefusal, sendFrom, type Mailbox } from './orca-cli.ts'
+import { ADVICE_SUBJECT, sendRecorded, type MailMessage } from './mailbox.ts'
+import { GONE_TERMINAL, OrcaRefusal, type Mailbox } from './orca-cli.ts'
 import type { AdvisorView } from './protocol.ts'
 import { advisorMessage, advisorName } from './supervisor.ts'
 
@@ -27,8 +28,8 @@ import { advisorMessage, advisorName } from './supervisor.ts'
 export const ADVICE_MAX_MS = 2 * 3600_000
 /** Questions that may wait behind the one being answered; more are turned away. */
 export const MAX_QUEUED = 10
-const MAX_SEEN = 200
 const MAX_OUTBOX = 20
+const MAX_SEEN = 200
 /** The context sent with a question is cut to this, to keep the advisor's launch prompt in bounds. */
 export const MAX_CONTEXT = 20_000
 const MAX_ANSWER = 30_000
@@ -41,36 +42,6 @@ const stateKey = (repo: string): string => `advice:${repo}`
 const ACTIVE = 'advice:active'
 
 
-/** One message in Matriarch's mailbox. */
-export interface MailItem {
-  id: string
-  from: string | null
-  subject: string
-  body: string
-  /** The record carried its subject or body: what it asks was read. */
-  complete: boolean
-}
-
-/** The messages in `orca orchestration check --json`: the concise view, or the full record. */
-export function parseMail(result: unknown): MailItem[] {
-  const r = obj(result)
-  const list = Array.isArray(r.messages) ? r.messages : Array.isArray(result) ? result : []
-  const items: MailItem[] = []
-  for (const m of list) {
-    const o = obj(m)
-    const id = str(o.id)
-    if (!id) continue
-    items.push({
-      id,
-      from: str(o.from) ?? str(o.from_handle),
-      subject: typeof o.subject === 'string' ? o.subject : '',
-      body: typeof o.body === 'string' ? o.body : '',
-      complete: typeof o.subject === 'string' || typeof o.body === 'string'
-    })
-  }
-  return items
-}
-
 export interface AdviceQuestion {
   /** The mailbox message it came in. */
   id: string
@@ -80,16 +51,11 @@ export interface AdviceQuestion {
   at: number
 }
 
-/** A question's subject: "Advice: …". A reply to an answer ("Re: Advice: …") is not a question. */
-const ADVICE = /^\s*advice\s*:\s*/i
-/** A reply to one of the advisor's answers: read, logged, and not answered again. */
-export const ADVICE_REPLY = /^\s*(?:re|aw|fwd?)\s*:\s*(?:(?:re|aw|fwd?)\s*:\s*)*advice\s*:/i
-
-/** The questions among a batch of mail: messages whose subject starts "Advice:". */
-export function adviceQuestions(items: readonly MailItem[], at: number): AdviceQuestion[] {
+/** The questions among a batch of mail: messages whose subject starts "Advice:" (a reply to an answer is not one). */
+export function adviceQuestions(items: readonly MailMessage[], at: number): AdviceQuestion[] {
   return items
-    .filter((m) => ADVICE.test(m.subject))
-    .map((m) => ({ id: m.id, question: m.subject.replace(ADVICE, '').trim() || 'a second opinion', context: m.body.trim().slice(0, MAX_CONTEXT), from: m.from, at }))
+    .filter((m) => ADVICE_SUBJECT.test(m.subject))
+    .map((m) => ({ id: m.id, question: m.subject.replace(ADVICE_SUBJECT, '').trim() || 'a second opinion', context: m.body.trim().slice(0, MAX_CONTEXT), from: m.from, at }))
 }
 
 /** The answer an advisor wrote: `{"answer": "..."}`, also inside a fenced block. Null otherwise. */
@@ -185,7 +151,11 @@ export interface AdviceState {
   v: 1
   queue: AdviceQuestion[]
   running: AdviceRun | null
-  /** Mailbox message ids already read, newest last. */
+  /**
+   * Questions already taken, by message id, newest last. The mailbox hands each over once
+   * (mailbox.ts); this keeps a batch handed over again (its record not saved, say) from starting
+   * a second, possibly costly, run.
+   */
   seen: string[]
   /** Mail for the supervisor that waits for autopilot (answers, refusals). */
   outbox: { subject: string; body: string }[]
@@ -271,6 +241,8 @@ export interface AdviceStepInput {
   /** The default branch the advisor reads; null when the forge could not be read this tick. */
   base: string | null
   forge?: ForgeKind
+  /** Questions that came to Matriarch's mailbox since the last tick (mailbox.ts), each once. */
+  questions?: readonly MailMessage[]
   /**
    * Who the supervisor sends mail as: its chat's `orca_session_id:<id>`, its terminal's handle,
    * the handle its Run is bound to. Only questions from one of these are answered; asked only
@@ -355,11 +327,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     if (next.length !== list.length) await deps.store.set(ACTIVE, next)
   }
 
-  /** A refusal that says Matriarch's mailbox is gone, when reading it: the next tick makes a new one. */
-  const noteGone = (repo: string, handle: string | null, error: unknown) => {
-    if (handle && error instanceof OrcaRefusal && GONE_TERMINAL.has(error.code)) deps.mailboxGone?.(repo, handle)
-  }
-  /** The project's mailbox, to send from (sendFrom); `known` pins the address the supervisor is being given. */
+  /** The project's mailbox, to send from; `known` pins the address the supervisor is being given. */
   const mailboxOf = (repo: string, root: string, known?: string): Mailbox => ({
     address: () => (known ? Promise.resolve(known) : deps.mailbox(repo, root)),
     gone: (handle) => deps.mailboxGone?.(repo, handle)
@@ -397,47 +365,39 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
   }
 
   /**
-   * Reads the mailbox: new questions are saved before the batch is marked read. Each is the full
-   * record (`--full`), so its sender is the address Orca stored, and only the supervisor's are
-   * taken. Anything else is dropped and logged; nobody is told, so the mailbox is no way in.
+   * The questions the engine read from the mailbox (mailbox.ts), each once. Its sender is the
+   * address Orca stored, and only the supervisor's are taken; anything else is dropped and
+   * counted, and nobody is told, so the mailbox is no way in. Answers those it kept.
    */
-  async function intake(state: AdviceState, repo: string, address: string, senders: () => Promise<readonly string[]>, save: () => Promise<void>): Promise<void> {
-    let known: ReadonlySet<string> | null = null
-    const take = async (items: MailItem[]): Promise<boolean> => {
-      // A message is read once: its subject and body taken as Orca gave them.
-      const fresh = items.filter((m) => m.complete && !state.seen.includes(m.id))
-      for (const m of items) if (!m.complete) deps.log(`${repo}: a message in Matriarch's mailbox came without its subject or body (${m.id})`)
-      if (fresh.length === 0) return false
-      state.seen = [...state.seen, ...fresh.map((m) => m.id)].slice(-MAX_SEEN)
-      for (const m of fresh) if (ADVICE_REPLY.test(m.subject)) deps.log(`${repo}: a reply to an answer of the advisor is not a question, and is not answered: "${clip(m.subject, 80)}"`)
-      for (const q of adviceQuestions(fresh, deps.now())) {
-        known ??= new Set(await senders().catch(() => []))
-        if (!q.from || !known.has(q.from)) {
-          deps.log(`${repo}: dropped a question for the advisor from ${q.from ?? 'an unknown sender'}, which is not the supervisor: "${clip(q.question, 80)}"`)
-          state.dropped = { count: (state.dropped?.count ?? 0) + 1, at: deps.now() }
-          continue
-        }
-        // The one about to start does not wait: it does not count against the queue.
-        if (state.queue.length >= MAX_QUEUED + (state.running ? 0 : 1)) state.outbox.push(noAnswerMessage(q, `${MAX_QUEUED} questions already wait for it; ask again once some are answered`))
-        else state.queue.push(q)
+  async function takeQuestions(state: AdviceState, repo: string, mail: readonly MailMessage[], senders: () => Promise<readonly string[]>): Promise<AdviceQuestion[]> {
+    const questions = adviceQuestions(mail, deps.now()).filter((q) => !state.seen.includes(q.id))
+    if (questions.length === 0) return []
+    state.seen = [...state.seen, ...questions.map((q) => q.id)].slice(-MAX_SEEN)
+    const known = new Set(await senders().catch(() => []))
+    const kept: AdviceQuestion[] = []
+    for (const q of questions) {
+      if (!q.from || !known.has(q.from)) {
+        deps.log(`${repo}: dropped a question for the advisor from ${q.from ?? 'an unknown sender'}, which is not the supervisor: "${clip(q.question, 80)}"`)
+        state.dropped = { count: (state.dropped?.count ?? 0) + 1, at: deps.now() }
+        continue
       }
-      return true
+      kept.push(q)
     }
-    let peeked: MailItem[]
-    try {
-      peeked = parseMail(await deps.orca.run(['orchestration', 'check', '--terminal', address, '--peek', '--full']))
-    } catch (error) {
-      noteGone(repo, address, error)
-      deps.log(`${repo}: could not read Matriarch's mailbox: ${(error as Error).message}`)
-      return
-    }
-    if (peeked.length === 0) return
-    if (await take(peeked)) await save()
-    // Only Matriarch reads its own mailbox: marking the batch read keeps the next look short. Mail
-    // that arrived since the peek comes in this batch, with its subject and body.
-    const consumed = await deps.orca.run(['orchestration', 'check', '--terminal', address, '--full']).catch(() => null)
-    if (consumed && (await take(parseMail(consumed)))) await save()
+    return kept
   }
+
+  /** Puts questions in the queue; past what it holds, the asker is told to ask again later. */
+  function enqueue(state: AdviceState, questions: readonly AdviceQuestion[]): void {
+    for (const q of questions) {
+      // The one about to start does not wait: it does not count against the queue.
+      if (state.queue.length >= MAX_QUEUED + (state.running ? 0 : 1)) state.outbox.push(noAnswerMessage(q, `${MAX_QUEUED} questions already wait for it; ask again once some are answered`))
+      else state.queue.push(q)
+    }
+  }
+
+  /** Mail to the supervisor from the project's mailbox, kept with what Matriarch sent (mailbox.ts). */
+  const send = (repo: string, mailbox: Mailbox, to: string, m: { subject: string; body: string }) =>
+    sendRecorded(deps.orca, mailbox, deps.store, repo, { to, subject: m.subject, body: m.body }, { kind: 'advice', at: deps.now() })
 
   /**
    * Every terminal in the advisor's worktree: what each shows (without the brief echoed back), and
@@ -635,7 +595,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
     while (state.outbox.length > 0) {
       const m = state.outbox[0]
       try {
-        await sendFrom(deps.orca, mailbox, { to: supervisor, subject: m.subject, body: m.body })
+        await send(repo, mailbox, supervisor, m)
         state.outbox.shift()
       } catch (error) {
         deps.log(`${repo}: could not send the advisor's mail to the supervisor: ${(error as Error).message}`)
@@ -706,8 +666,9 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
       // Answers wait for autopilot; notices of how the advisor is set up do not (see the top).
       const canSend = input.acting && input.supervisor !== null
       let unreachable = false
-      // No advisor set, nothing in flight and nobody to tell: nothing to do.
-      if (!advisor && !state.running && state.queue.length === 0 && state.outbox.length === 0 && state.leftovers.length === 0 && !state.told?.advisor) return null
+      const mail = input.questions ?? []
+      // No advisor set, nothing asked, nothing in flight and nobody to tell: nothing to do.
+      if (!advisor && mail.length === 0 && !state.running && state.queue.length === 0 && state.outbox.length === 0 && state.leftovers.length === 0 && !state.told?.advisor) return null
 
       // Worktrees that could not be removed before are tried again.
       if (state.leftovers.length > 0) {
@@ -723,11 +684,22 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
         if (state.told?.advisor && input.supervisor) {
           const m = advisorMessage(null)
           try {
-            await sendFrom(deps.orca, mailboxOf(input.repo, input.root), { to: input.supervisor, subject: m.subject, body: m.body })
+            await send(input.repo, mailboxOf(input.repo, input.root), input.supervisor, m)
             state.told = { run: input.supervisor, address: state.told.address, advisor: null }
           } catch (error) {
             deps.log(`${input.repo}: could not tell the supervisor the advisor is off: ${(error as Error).message}`)
           }
+        }
+        // A question with no advisor to answer it: the supervisor hears so at once, as it hears of
+        // any other change in how the advisor is set up, whatever autopilot says.
+        const why = advisor ? `the ${advisor.agent} advisor set for this project cannot be started read-only, so it is not started` : "no advisor is set for this project in Matriarch's Settings"
+        for (const q of await takeQuestions(state, input.repo, mail, input.supervisorSenders)) {
+          if (!input.supervisor) {
+            deps.log(`${input.repo}: a question for the advisor came with no supervisor Run to answer: "${clip(q.question, 80)}"`)
+            continue
+          }
+          await send(input.repo, mailboxOf(input.repo, input.root), input.supervisor, noAnswerMessage(q, why))
+            .catch((error: Error) => deps.log(`${input.repo}: could not tell the supervisor there is no advisor: ${error.message}`))
         }
       } else {
         // The mailbox: where questions arrive, and the address the supervisor was given.
@@ -748,7 +720,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
               const m = advisorMessage({ role, address })
               try {
                 // From the very address it is being told to write to.
-                await sendFrom(deps.orca, mailboxOf(input.repo, input.root, address), { to: input.supervisor, subject: m.subject, body: m.body })
+                await send(input.repo, mailboxOf(input.repo, input.root, address), input.supervisor, m)
                 state.told = { run: input.supervisor, ...want }
               } catch (error) {
                 deps.log(`${input.repo}: could not tell the supervisor about the advisor: ${(error as Error).message}`)
@@ -756,7 +728,7 @@ export function createAdvisor(deps: AdvisorDeps): Advisor {
             }
           }
         }
-        if (address) await intake(state, input.repo, address, input.supervisorSenders, save)
+        enqueue(state, await takeQuestions(state, input.repo, mail, input.supervisorSenders))
         if (state.running) await advance(state, input.repo)
         if (!state.running && state.queue.length > 0 && input.acting && input.supervisor && input.base) await start(state, input, role, input.base, save)
       }

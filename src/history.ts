@@ -83,6 +83,17 @@ export function addLog(h: TrackHistory, entry: LogEntry): TrackHistory {
   return { ...h, log: [...h.log, entry] }
 }
 
+/**
+ * Puts an entry in at its own time, not at the end: a reply that came in while Matriarch was not
+ * reading (or before it read its mailbox at all) goes where it happened.
+ */
+export function insertLog(h: TrackHistory, entry: LogEntry): TrackHistory {
+  if (h.log.some((e) => e.kind === entry.kind && e.at === entry.at && e.text === entry.text)) return h
+  let i = h.log.length
+  while (i > 0 && h.log[i - 1].at > entry.at) i--
+  return { ...h, log: [...h.log.slice(0, i), entry, ...h.log.slice(i)] }
+}
+
 /** Drops what ended before `now - keepMs` and caps the counts. */
 export function prune(h: TrackHistory, now: number, keepMs = KEEP_MS): TrackHistory {
   const cutoff = now - keepMs
