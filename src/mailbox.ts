@@ -15,7 +15,7 @@
 // Run's own mailbox, where Orca keeps it. A message that is neither a question nor a reply in a
 // thread Matriarch started is logged and dropped: the mailbox is no way to hand Matriarch work.
 import type { JsonValue } from 'orca/host'
-import type { PrLedger, SupervisorNote } from './ledger.ts'
+import { repoWide, type Escalation, type PrLedger, type SupervisorNote } from './ledger.ts'
 import { GONE_TERMINAL, OrcaRefusal, sendFrom, type Mailbox, type OrcaCli, type SentReceipt } from './orca-cli.ts'
 import type { LogEntry } from './protocol.ts'
 import { clip, obj, str } from './values.ts'
@@ -105,12 +105,14 @@ export interface MailState {
   senders: Record<string, { run: string; at: number }>
   /** When the recent mail was last read, read or not. */
   caughtUpAt: number | null
+  /** Questions read for the advisor that it has not stored yet (takenQuestions). */
+  pending: MailMessage[]
 }
 
 export const mailKey = (repo: string): string => `mail:${repo}`
 
 export function emptyMailState(): MailState {
-  return { v: 1, handled: {}, sent: [], own: [], senders: {}, caughtUpAt: null }
+  return { v: 1, handled: {}, sent: [], own: [], senders: {}, caughtUpAt: null, pending: [] }
 }
 
 export function loadMailState(raw: unknown): MailState {
@@ -128,7 +130,8 @@ export function loadMailState(raw: unknown): MailState {
     sent: (Array.isArray(r.sent) ? r.sent : []).filter((s): s is SentMail => typeof obj(s).id === 'string' && typeof obj(s).to === 'string' && typeof obj(s).at === 'number'),
     own: (Array.isArray(r.own) ? r.own : []).filter((h): h is string => typeof h === 'string'),
     senders,
-    caughtUpAt: typeof r.caughtUpAt === 'number' ? r.caughtUpAt : null
+    caughtUpAt: typeof r.caughtUpAt === 'number' ? r.caughtUpAt : null,
+    pending: (Array.isArray(r.pending) ? r.pending : []).filter((m): m is MailMessage => typeof obj(m).id === 'string' && typeof obj(m).subject === 'string' && typeof obj(m).at === 'number')
   }
 }
 
@@ -138,7 +141,8 @@ export function pruneMail(state: MailState, now: number): MailState {
   const handled = Object.fromEntries(Object.entries(state.handled).filter(([, at]) => at >= cutoff))
   const sent = state.sent.filter((s) => s.at >= cutoff).slice(-MAX_SENT)
   const senders = Object.fromEntries(Object.entries(state.senders).sort(([, a], [, b]) => a.at - b.at).slice(-MAX_SENDERS))
-  return { ...state, handled, sent, own: state.own.slice(-MAX_OWN), senders }
+  const pending = state.pending.filter((m) => m.at === 0 || m.at >= cutoff).slice(-MAX_PENDING)
+  return { ...state, handled, sent, own: state.own.slice(-MAX_OWN), senders, pending }
 }
 
 /** The store, as much of it as the mail record needs. */
@@ -247,29 +251,33 @@ export function newMail(state: MailState, batches: readonly MailMessage[], now: 
   return out.sort((a, b) => a.at - b.at)
 }
 
-/** A reply in a thread Matriarch started, with what it answers. */
+/** Who wrote a reply, as far as the address Orca stored tells (an address match, SECURITY.md). */
+export type Replier = 'supervisor' | 'worker' | 'other'
+
+/** A reply in a thread Matriarch started, with what it answers and who wrote it. */
 export interface MailReply {
   message: MailMessage
   sent: SentMail
-  /** Who replied: the supervisor for mail to its Run, a worker for mail to its Dispatch. */
-  who: 'supervisor' | 'worker'
+  /**
+   * The supervisor only from an address known to be its (or the first chat of its Run to reply,
+   * learnSender); a worker only from one of its Run's workers' addresses; anyone else is other.
+   */
+  who: Replier
 }
 
-/** Mail from Orca, sorted: questions for the advisor, replies, what is Matriarch's own, and the rest. */
+/** Mail from Orca, sorted: questions for the advisor, replies in a known thread, threads to look up, and the rest. */
 export interface RoutedMail {
   questions: MailMessage[]
-  replies: MailReply[]
-  /** Replies in a thread this record does not know: looked up in Orca (findSent). */
+  threaded: { message: MailMessage; sent: SentMail }[]
+  /** Replies in a thread this record does not know: looked up in Orca (the supervisor Run's mailbox). */
   unknown: MailMessage[]
-  /** Neither: logged and dropped. */
+  /** Neither: logged and dropped, or (a reply naming a PR, from someone known) shown in its log. */
   other: MailMessage[]
 }
 
-const whoAnswers = (sent: SentMail): 'supervisor' | 'worker' => (sent.to.startsWith('dispatch:') ? 'worker' : 'supervisor')
-
 /** Sorts new mail. `address` is the mailbox being read; mail from any of Matriarch's own mailboxes is not anyone's reply. */
 export function routeMail(state: MailState, messages: readonly MailMessage[], address: string): RoutedMail {
-  const routed: RoutedMail = { questions: [], replies: [], unknown: [], other: [] }
+  const routed: RoutedMail = { questions: [], threaded: [], unknown: [], other: [] }
   for (const m of messages) {
     if (m.from && (m.from === address || state.own.includes(m.from))) continue
     if (ADVICE_SUBJECT.test(m.subject)) {
@@ -277,26 +285,73 @@ export function routeMail(state: MailState, messages: readonly MailMessage[], ad
       continue
     }
     const sent = m.threadId ? state.sent.find((s) => s.id === m.threadId) : undefined
-    if (sent) routed.replies.push({ message: m, sent, who: whoAnswers(sent) })
+    if (sent) routed.threaded.push({ message: m, sent })
     else if (m.threadId) routed.unknown.push(m)
     else routed.other.push(m)
   }
   return routed
 }
 
+/** The Run a message is filed under, as Orca names it: none for mail outside a Run. */
+export const runOf = (m: MailMessage): string | null => (m.runId && m.runId !== 'run_unbound' ? `run:${m.runId}` : null)
+
+const SESSION = 'orca_session_id:'
+
 /**
- * A reply in a thread Matriarch started with a supervisor's Run tells who that supervisor is: the
- * address Orca stored as its sender (a chat's `orca_session_id:<id>`, a terminal's handle). Only
- * mail Matriarch sent to `run:<id>` and a reply Orca filed under that Run count. This is an
- * address match, as every sender check is (SECURITY.md).
+ * Who the agents of a Run are, as addresses Orca stores for a sender. Orca does not authenticate
+ * senders and lets any caller reply to any message (Orca 1.4.259: `orchestration reply --id`
+ * works for any id, and the reply is filed under the original's Run), so a reply is the
+ * supervisor's only by its address.
+ */
+export interface MailIdentities {
+  /** The addresses known to be a Run's supervisor: its chat's launch session, its terminal, the handle the Run is bound to. */
+  supervisorsOf(run: string): Promise<readonly string[]>
+  /** The addresses of a Run's workers (their terminals, `dispatch:<id>`): never its supervisor. */
+  workersOf(run: string): ReadonlySet<string>
+}
+
+/** The supervisor addresses known for a Run: given, and learned from its replies before. */
+async function knownSupervisors(state: MailState, ids: MailIdentities, run: string): Promise<Set<string>> {
+  return new Set([...(await ids.supervisorsOf(run).catch(() => [])), ...learnedSenders(state, run)])
+}
+
+/**
+ * Who wrote a reply in a thread Matriarch started. To the supervisor's Run: the supervisor when
+ * its address is one known to be the supervisor's; or, while none is known for that Run, a chat
+ * session's address that is none of its workers', which is then learned (the first wins); a
+ * worker when it is one of its workers' addresses; anyone else otherwise. To a worker's Dispatch:
+ * the worker when it is one of that Run's workers' addresses. `stranger` marks a second chat
+ * replying once the supervisor is known, for the board.
+ */
+export async function whoReplied(state: MailState, ids: MailIdentities, message: MailMessage, sent: SentMail): Promise<{ who: Replier; learn: boolean; stranger: boolean }> {
+  const from = message.from
+  const run = runOf(message)
+  const none = { who: 'other' as const, learn: false, stranger: false }
+  if (!from || !run) return none
+  const workers = ids.workersOf(run)
+  if (sent.to.startsWith('run:')) {
+    // Filed under another Run than the one Matriarch wrote to: not an answer from this one's supervisor.
+    if (run !== sent.to) return none
+    const known = await knownSupervisors(state, ids, run)
+    if (known.has(from)) return { who: 'supervisor', learn: false, stranger: false }
+    if (workers.has(from)) return { who: 'worker', learn: false, stranger: false }
+    if (from.startsWith(SESSION)) return known.size === 0 ? { who: 'supervisor', learn: true, stranger: false } : { who: 'other', learn: false, stranger: true }
+    return none
+  }
+  return workers.has(from) ? { who: 'worker', learn: false, stranger: false } : none
+}
+
+/**
+ * Remembers a chat session as the supervisor of a Run, once: only when whoReplied said so, and
+ * only while no supervisor address is known for that Run (the first wins).
  */
 export function learnSender(state: MailState, reply: MailReply): MailState {
   const { message, sent } = reply
-  if (!sent.to.startsWith('run:') || !message.from) return state
-  if (message.runId && `run:${message.runId}` !== sent.to) return state
+  if (reply.who !== 'supervisor' || !message.from || !sent.to.startsWith('run:')) return state
+  if (learnedSenders(state, sent.to).some((who) => who !== message.from)) return state
   const known = state.senders[message.from]
-  if (known && known.run === sent.to && known.at >= message.at) return state
-  return { ...state, senders: { ...state.senders, [message.from]: { run: sent.to, at: Math.max(message.at, known?.at ?? 0) } } }
+  if (known && known.run === sent.to) return state
+  return { ...state, senders: { ...state.senders, [message.from]: { run: sent.to, at: message.at } } }
 }
 
 /** Who sends as the supervisor of a Run, as its replies showed. */
@@ -307,25 +362,31 @@ export function learnedSenders(state: MailState, run: string): string[] {
 /** One line of a reply, for a log line or a card: its first lines, spaces folded. */
 export const replyLine = (body: string, n: number): string => clip(body.replace(/\s+/g, ' ').trim() || '(no text)', n)
 
+/** A draft nudge is a routine question, not an escalation: a reply to it answers nothing. */
+const ROUTINE = (key: string): boolean => key.startsWith('draft:')
+
 /**
  * The escalation a reply answers: the key Matriarch kept when it sent it, or, for mail found in
  * Orca after the fact, the supervisor escalation whose reason that mail carried, raised when it
- * went. Null when none is current: one already sent on to the person, or newer than the reply.
+ * went. Only the supervisor's reply answers one, and only a current one: not one already sent on
+ * to the person, nor one newer than the reply. `shared` holds the project's repository-wide
+ * escalations (ledger.ts repoWide), answered once for every PR.
  */
-export function answeredEscalation(ledger: PrLedger, reply: MailReply): string | null {
-  if (reply.who !== 'supervisor') return null
+export function answeredEscalation(ledger: PrLedger, reply: MailReply, shared: Readonly<Record<string, Escalation>> = {}): string | null {
+  if (reply.who !== 'supervisor' || reply.sent.kind === 'draft') return null
   const { sent, message } = reply
+  const all = { ...ledger.escalations, ...shared }
   let key = sent.key ?? null
   if (!key && sent.text && sent.kind === 'escalate') {
     const text = sent.text
     key =
-      Object.entries(ledger.escalations).find(
+      Object.entries(all).find(
         ([k, e]) => k.endsWith(':supervisor') && e.to === 'supervisor' && text.includes(e.reason.slice(0, 120)) && Math.abs(e.at - sent.at) < 10 * 60_000
       )?.[0] ?? null
   }
-  if (!key || !key.endsWith(':supervisor')) return null
-  const esc = ledger.escalations[key]
-  const human = ledger.escalations[key.replace(/:supervisor$/, ':human')]
+  if (!key || !key.endsWith(':supervisor') || ROUTINE(key)) return null
+  const esc = all[key]
+  const human = all[key.replace(/:supervisor$/, ':human')]
   if (!esc || esc.to !== 'supervisor' || human) return null
   if (message.at > 0 && message.at < esc.at) return null
   return key
@@ -334,30 +395,51 @@ export function answeredEscalation(ledger: PrLedger, reply: MailReply): string |
 const MAX_NOTES = 5
 
 /**
- * A reply's mark on its PR: its note (the card shows the latest the supervisor wrote), and an
- * escalation it answers marked answered. The first answer starts the one more window the
- * supervisor gets (plan.ts escalate); later ones only bring its words up to date. Pure.
+ * A reply's mark on its PR: its note (the card shows the latest the supervisor or its worker
+ * wrote), and an escalation it answers marked answered, on the PR's ledger or, for one about the
+ * whole repository, in `shared`. The first answer starts the one more window the supervisor gets
+ * (plan.ts escalate); a later one brings its words up to date, unless it was written before the
+ * words already kept (a catch-up read can bring an older reply late). Pure.
  */
-export function applyReply(ledger: PrLedger, reply: MailReply, now: number): { ledger: PrLedger; entry: LogEntry; answered: string | null } {
+export function applyReply(
+  ledger: PrLedger,
+  reply: MailReply,
+  now: number,
+  shared: Readonly<Record<string, Escalation>> = {}
+): { ledger: PrLedger; shared: Record<string, Escalation>; entry: LogEntry; answered: string | null } {
   const { message, sent, who } = reply
   const at = message.at || now
-  const note: SupervisorNote = { at, from: who, subject: sent.subject, text: clip(message.body.trim(), NOTE_MAX) }
-  const notes = [...(ledger.notes ?? []).filter((n) => !(n.at === note.at && n.text === note.text)), note].sort((a, b) => a.at - b.at).slice(-MAX_NOTES)
-  const answered = answeredEscalation(ledger, reply)
+  const text = clip(message.body.trim(), NOTE_MAX)
+  const known = who === 'supervisor' || who === 'worker'
+  const notes = known
+    ? [...(ledger.notes ?? []).filter((n) => !(n.at === at && n.text === text)), { at, from: who, subject: sent.subject, text } satisfies SupervisorNote].sort((a, b) => a.at - b.at).slice(-MAX_NOTES)
+    : ledger.notes
+  const answered = answeredEscalation(ledger, reply, shared)
   const escalations = { ...ledger.escalations }
+  const nextShared = { ...shared }
   if (answered) {
-    const esc = escalations[answered]
-    escalations[answered] = { ...esc, answered: esc.answered ? { ...esc.answered, text: note.text, count: (esc.answered.count ?? 1) + 1 } : { at, text: note.text, count: 1 } }
+    const into = repoWide(answered) ? nextShared : escalations
+    const esc = into[answered]
+    const prior = esc.answered
+    into[answered] = {
+      ...esc,
+      answered: !prior
+        ? { at, text, textAt: at, count: 1 }
+        : at >= (prior.textAt ?? prior.at)
+          ? { ...prior, text, textAt: at, count: (prior.count ?? 1) + 1 }
+          : { ...prior, at: Math.min(prior.at, at), count: (prior.count ?? 1) + 1 }
+    }
   }
+  const by = who === 'other' ? `A reply from ${message.from ?? 'an unknown sender'}` : `The ${who} replied`
   const entry: LogEntry = {
     at,
     kind: 'reply',
-    text: `${answered ? `The ${who} answered the escalation` : `The ${who} replied`}: ${replyLine(message.body, 240)}`,
+    text: `${answered ? `The ${who} answered the escalation` : by}: ${replyLine(message.body, 240)}`,
     subject: sent.subject,
-    from: who,
+    ...(known ? { from: who } : {}),
     ...(message.body.trim().length > 240 ? { detail: clip(message.body.trim(), DETAIL_MAX) } : {})
   }
-  return { ledger: { ...ledger, notes, escalations }, entry, answered }
+  return { ledger: { ...ledger, ...(notes ? { notes } : {}), escalations }, shared: nextShared, entry, answered }
 }
 
 /** Reads a mailbox for the engine; each throws Orca's refusal (a mailbox that is gone, say). */
@@ -377,8 +459,8 @@ export interface MailReader {
  * `check` marks the oldest unread batch; `inbox --terminal --limit n` answers the newest n, read
  * or not, and nothing for a handle that is gone (`check` refuses one). None pages or filters by
  * time: the catch-up read reaches back RECENT_LIMIT messages. A Run's mailbox is the party
- * `run:<id>` (Orca resolves it like a terminal's); should that come back empty or be refused,
- * the newest mail across Orca is read instead, and what went to that Run kept.
+ * `run:<id>` (Orca resolves it like a terminal's); only should Orca refuse that is the newest
+ * mail across Orca read instead, and what went to that Run kept.
  */
 export function createMailReader(cli: OrcaCli): MailReader {
   const inbox = async (party: string | null): Promise<MailMessage[]> =>
@@ -388,8 +470,11 @@ export function createMailReader(cli: OrcaCli): MailReader {
     recent: (address) => inbox(address),
     markRead: async (address) => parseMail(await cli.run(['orchestration', 'check', '--terminal', address, '--full'])),
     runMail: async (run) => {
-      const own = await inbox(run).catch(() => [])
-      return own.length > 0 ? own : (await inbox(null)).filter((m) => m.to === run)
+      try {
+        return await inbox(run)
+      } catch {
+        return (await inbox(null)).filter((m) => m.to === run)
+      }
     }
   }
 }
@@ -402,32 +487,51 @@ export interface TakeMailInput {
   /** The project's mailbox. */
   address: string
   state: MailState
-  /** The supervisor's Run (`run:<id>`), to look up threads Matriarch started there before it kept a record. */
+  /** The supervisor's Run (`run:<id>`): the only Run whose mailbox is looked up for threads Matriarch started before it kept a record. */
   supervisor: string | null
+  ids: MailIdentities
   now: number
   log(message: string): void
 }
 
 export interface TakenMail {
+  /**
+   * The state to save once what was taken is acted on: each message recorded as handled, and
+   * each question kept as pending until the advisor has stored it (takenQuestions).
+   */
   state: MailState
-  questions: MailMessage[]
   replies: MailReply[]
-  /** Replies about a PR whose thread is not known: shown in its log, nothing more. */
-  loose: { message: MailMessage; number: number }[]
+  /** Replies about a PR whose thread is not known, from the supervisor or a worker: shown in its log, nothing more. */
+  loose: { message: MailMessage; number: number; who: 'supervisor' | 'worker' }[]
+  /** Chat sessions that replied as if the supervisor once another address was known to be it. */
+  strangers: string[]
   /** Orca said the mailbox is gone: nothing was read. */
   gone: boolean
 }
 
+const MAX_PENDING = 50
+
+/**
+ * The advisor stored these questions: they are no longer pending. Until then a question stays in
+ * the mail state, so a reload or a failure between reading it and the advisor's save loses nothing
+ * (the advisor keeps the ids it took, so one handed over twice is not taken twice).
+ */
+export function takenQuestions(state: MailState, ids: readonly string[]): MailState {
+  return ids.length ? { ...state, pending: state.pending.filter((q) => !ids.includes(q.id)) } : state
+}
+
 /**
  * One tick's mail: the unread, and every half hour the recent too; what is new sorted, threads
- * Matriarch started before it kept a record found in the Run's mailbox, the supervisor's address
- * learned from its replies, and then the unread marked read. Every message taken is recorded as
- * handled in the state answered; the caller saves it after acting on what it was given.
+ * Matriarch started before it kept a record found in the supervisor Run's mailbox, who wrote
+ * each reply told by its address (the supervisor learned from its first reply when none is
+ * known), and then the unread marked read. Every message taken is recorded as handled, and every
+ * question added to the pending ones, in the state answered; the caller saves it after acting on
+ * what it was given.
  */
 export async function takeMail(input: TakeMailInput): Promise<TakenMail> {
-  const { reader, address, now, log } = input
+  const { reader, address, now, log, ids } = input
   let state = input.state
-  const out: TakenMail = { state, questions: [], replies: [], loose: [], gone: false }
+  const out: TakenMail = { state, replies: [], loose: [], strangers: [], gone: false }
   let unread: MailMessage[]
   try {
     unread = await reader.unread(address)
@@ -446,38 +550,54 @@ export async function takeMail(input: TakeMailInput): Promise<TakenMail> {
     }
   }
 
-  const runMail = new Map<string, MailMessage[] | null>()
-  const lookUp = async (run: string): Promise<MailMessage[] | null> => {
-    if (!runMail.has(run)) runMail.set(run, await reader.runMail(run).catch(() => null))
-    return runMail.get(run) ?? null
+  let runMail: MailMessage[] | null | undefined
+  const lookUp = async (): Promise<MailMessage[] | null> => {
+    if (runMail === undefined) runMail = input.supervisor ? await reader.runMail(input.supervisor).catch(() => null) : null
+    return runMail
   }
   const take = async (batch: readonly MailMessage[]) => {
     const fresh = newMail(state, batch, now)
     if (fresh.length === 0) return
     const routed = routeMail(state, fresh, address)
-    const replies = [...routed.replies]
+    const threaded = [...routed.threaded]
     for (const m of routed.unknown) {
-      // Sent before Matriarch kept a record: Orca still has it, in the mailbox it went to.
-      const run = m.runId ? `run:${m.runId}` : input.supervisor
-      const found = run ? (await lookUp(run))?.find((o) => o.id === m.threadId && o.from !== null && (o.from === address || state.own.includes(o.from))) : undefined
-      if (found) {
-        const sent = sentFromOriginal(found)
-        state = { ...state, sent: [...state.sent, sent] }
-        replies.push({ message: m, sent, who: sent.to.startsWith('dispatch:') ? 'worker' : 'supervisor' })
-      } else routed.other.push(m)
+      // Sent before Matriarch kept a record: Orca still has it, in the supervisor Run's mailbox.
+      // Only that Run is looked up, and only for a reply Orca filed under it.
+      const found = input.supervisor && runOf(m) === input.supervisor
+        ? (await lookUp())?.find((o) => o.id === m.threadId && o.from !== null && (o.from === address || state.own.includes(o.from)))
+        : undefined
+      if (!found) {
+        routed.other.push(m)
+        continue
+      }
+      const sent = state.sent.find((s) => s.id === found.id) ?? sentFromOriginal(found)
+      if (!state.sent.some((s) => s.id === sent.id)) state = { ...state, sent: [...state.sent, sent] }
+      threaded.push({ message: m, sent })
     }
-    for (const r of replies) state = learnSender(state, r)
+    for (const t of threaded) {
+      const told = await whoReplied(state, ids, t.message, t.sent)
+      const reply: MailReply = { ...t, who: told.who }
+      if (told.learn) state = learnSender(state, reply)
+      if (told.stranger && t.message.from && !out.strangers.includes(t.message.from)) out.strangers.push(t.message.from)
+      out.replies.push(reply)
+    }
     for (const m of routed.other) {
-      // A reply whose thread is gone from Orca, about a PR its subject names: its log shows it.
+      // A reply whose thread Orca no longer has, about a PR its subject names: shown in its log,
+      // but only from the supervisor or a worker; anything else is dropped.
       const number = /^\s*re\s*:/i.test(m.subject) ? prOfSubject(m.subject) : null
-      if (number !== null) out.loose.push({ message: m, number })
-      else log(`a message in Matriarch's mailbox is no question and no reply to its mail, so it is dropped: "${clip(m.subject, 80)}" from ${m.from ?? 'an unknown sender'}`)
+      const run = input.supervisor
+      const who =
+        number === null || !m.from || !run ? null
+        : (await knownSupervisors(state, ids, run)).has(m.from) ? 'supervisor'
+        : ids.workersOf(run).has(m.from) ? 'worker'
+        : null
+      if (number !== null && who) out.loose.push({ message: m, number, who })
+      else log(`a message in Matriarch's mailbox is no question and no reply to its mail from the supervisor or a worker, so it is dropped: "${clip(m.subject, 80)}" from ${m.from ?? 'an unknown sender'}`)
     }
-    out.questions.push(...routed.questions)
-    out.replies.push(...replies)
+    const pending = [...state.pending, ...routed.questions.filter((q) => !state.pending.some((p) => p.id === q.id))]
     const handled = { ...state.handled }
     for (const m of fresh) handled[m.id] = m.at || now
-    state = { ...state, handled }
+    state = { ...state, handled, pending }
   }
 
   await take([...unread, ...recent])

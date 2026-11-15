@@ -156,6 +156,16 @@ export const RETARGET_TRIES = 3
 /** The wait after a refused move of the base: 5 minutes, then 10. */
 export const retargetBackoff = (failures: number): number => 5 * 60_000 * 2 ** Math.max(0, failures - 1)
 
+/** Minutes ago, as a person reads them. */
+const minAgo = (now: number, at: number): string => `${Math.max(1, Math.round((now - at) / 60_000))} min ago`
+
+/** The supervisor's answer as the person reads it: its latest words, with when it wrote those, and when it first answered if earlier. */
+function answeredWords(a: { at: number; text: string; textAt?: number; count?: number }, now: number): string {
+  const wrote = a.textAt ?? a.at
+  const first = (a.count ?? 1) > 1 && wrote !== a.at ? ` (it first answered ${minAgo(now, a.at)})` : ''
+  return `The supervisor wrote ${minAgo(now, wrote)}${first}: "${clip(a.text.replace(/\s+/g, ' ').trim(), 400)}"`
+}
+
 /**
  * Worker → supervisor → human. Each step happens once per problem key (which carries the commit,
  * so a new push starts over). The person hears of it once the supervisor has had
@@ -173,7 +183,7 @@ function escalate(input: PlanInput, problemKey: string, reason: string): { actio
     const since = sup.answered ? Math.max(sup.at, sup.answered.at) : sup.at
     if (now - since < config.escalation.humanAfterMinutes * 60_000) return { actions: [], toHuman: false }
   }
-  const answer = sup?.answered ? `. The supervisor answered ${Math.max(1, Math.round((now - sup.answered.at) / 60_000))} min ago, and it is still so: "${clip(sup.answered.text.replace(/\s+/g, ' ').trim(), 400)}"` : ''
+  const answer = sup?.answered ? `. ${answeredWords(sup.answered, now)}, and it is still so` : ''
   return { actions: [{ kind: 'escalate', to: 'human', key: humanKey, reason: `${reason}${answer}`, address: null }], toHuman: true }
 }
 

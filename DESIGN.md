@@ -250,8 +250,11 @@ round. When `maxRounds` is used up the PR escalates:
 3. **Human**: if nothing changes within `humanAfterMinutes`, Matriarch sends a desktop
    notification and puts the PR in `needs-you`. A supervisor that answered the escalation (a
    reply in its thread, [Mailbox](#mailbox)) gets `humanAfterMinutes` again from its first
-   answer; if the problem is still there after it, the person is told with that answer.
-   Later answers update its words, not its time.
+   answer; if the problem is still there after it, the person is told with its latest words and
+   when it wrote them. Later answers update its words, not its time; an older one read late does
+   not replace newer words. CI red on the base is one escalation for the repository, raised by
+   the first PR that meets it, kept once (`escalations:<repo>`) and read by every PR's plan, so
+   it is answered once and the person is told once.
 
 ## Review crew (phase 3, built)
 
@@ -532,22 +535,39 @@ there too.
 - **What Matriarch sent** is kept a week (`mail:<repo>`): each message's id (from the send's
   `{messageId}`), where it went, its subject, its PR and, for an escalation, its ledger key. Mail
   sent before Matriarch kept this, or whose record a racing write lost, is found in Orca: a reply
-  whose thread is unknown is looked up among the messages in the supervisor Run's mailbox
-  (`inbox --terminal run:<id>`) that came from one of Matriarch's own mailboxes; its PR is read
-  from its subject, and the escalation it raised from its text.
+  Orca filed under the supervisor's Run whose thread is unknown is looked up among the messages
+  in that Run's mailbox (`inbox --terminal run:<id>`) that came from one of Matriarch's own
+  mailboxes; its PR is read from its subject, and the escalation it raised from its text. No
+  other Run, and no mail outside a Run, is looked up. The record is written only when it
+  changed.
+- **Questions, kept until stored.** A question is recorded as handled and kept pending in the
+  mail record until the advisor's step has stored it (or answered that it cannot); only then is
+  it dropped from pending. A reload or a failure in between loses nothing: the next tick hands
+  it over again, and the advisor's own record of the ids it took keeps it from running twice.
+- **Who wrote a reply.** Orca does not authenticate senders, and lets any caller reply to any
+  message (Orca 1.4.259: `orchestration reply --id <any id>` works for any caller, the reply is
+  filed under the original's Run, `send --thread-id` is free, and `inbox` without `--terminal`
+  lists every message with its id). So a reply counts as the supervisor's only by its address:
+  one known to be the supervisor's (its chat's session from the launch receipt, the Run's
+  `coordinator_handle`, or one learned before), or, while none is known for that Run, a chat
+  session's address (`orca_session_id:`) that is none of the Run's workers' (their terminals and
+  `dispatch:<id>` from the worker list): the first such reply is learned, and a different chat
+  later is not (the board says another chat replied). A worker is one of its Run's workers'
+  addresses. Anyone else is "a reply from <address>": shown in the log, never a note on the
+  card, never an answer, never learned.
 - **Routed.** A question goes to the advisor. A reply in a thread Matriarch started goes to that
-  PR: a note on the ledger (the card shows the latest), a line in its activity log at the time it
-  came, and, from the supervisor to a current escalation, the escalation marked answered
-  ([Fix rounds and escalation](#fix-rounds-and-escalation)): not one already sent on to the
-  person, nor one newer than the reply. A reply whose thread Orca no longer has, with a PR in its
-  subject, is only shown in that PR's log. Anything else (mail from Matriarch's own mailboxes, a
-  message in no thread of Matriarch's) is logged and dropped: the mailbox is no way to hand
-  Matriarch work.
-- **The supervisor learned.** A reply in a thread Matriarch started with `run:<id>`, filed by Orca
-  under that Run, names the supervisor's address (a chat's `orca_session_id:<id>`); it joins the
-  addresses the advisor answers. An address match, as every sender check is.
+  PR: from the supervisor or a worker, a note on the ledger (the card shows the latest since the
+  PR's head commit was first seen); a line in its activity log at the time it came; and, from the
+  supervisor to a current escalation, the escalation marked answered ([Fix rounds and
+  escalation](#fix-rounds-and-escalation)): not one already sent on to the person, nor one newer
+  than the reply, nor a draft nudge (a routine question). A repository-wide escalation (CI red on
+  the base) is one record for the project, so its answer counts for every PR. A reply whose
+  thread Orca no longer has, with a PR in its subject, from the supervisor or a worker, is only
+  shown in that PR's log. Anything else (mail from Matriarch's own mailboxes, a message in no
+  thread of Matriarch's) is logged and dropped: the mailbox is no way to hand Matriarch work.
 - **Dry run.** Reading, the notes, the log lines and answered escalations happen in dry run too:
-  they only read. What sends waits for autopilot, as everywhere.
+  they only read. What sends waits for autopilot, as everywhere, except a question asked while
+  no advisor is set: it is answered at once that none is, a notice of how the advisor is set up.
 - **No new tab for reading.** Only a mailbox that already exists is read: mail can only have come
   to one Matriarch sent from. One Orca says is gone is forgotten, and the next send makes a new
   one (the advisor then tells the supervisor its new address).
@@ -892,8 +912,9 @@ can be changed and checked without Orca.
 ## Safety
 
 - Dry run is the default (`autopilot` setting off): the board shows what would happen. What still
-  runs in dry run (reads, a review you start, a worker-limit refusal, mail to the supervisor
-  when you save its settings) and what waits for autopilot are listed in the README's
+  runs in dry run (reads, including the mailbox; a review you start; a worker-limit refusal;
+  mail to the supervisor when you save its settings, and the answer that no advisor is set to a
+  question asked while none is) and what waits for autopilot are listed in the README's
   [Dry run and autopilot](README.md#dry-run-and-autopilot).
 - Per-repo opt-in: only repositories that commit `.orca/matriarch.json` are touched.
 - Only PRs whose head branch belongs to an Orca workspace and whose author is the signed-in

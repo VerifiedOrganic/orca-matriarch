@@ -25,9 +25,40 @@ export interface Escalation {
   reason: string
   /**
    * The supervisor answered it (a reply in its thread, mailbox.ts): when it first did, which
-   * starts the one more window it gets before the person is told, and what it said last.
+   * starts the one more window it gets before the person is told, and its latest words with when
+   * it wrote them.
    */
-  answered?: { at: number; text: string; count?: number }
+  answered?: { at: number; text: string; textAt?: number; count?: number }
+}
+
+/**
+ * An escalation that is one problem for the whole repository (CI red on the base branch): kept
+ * once for the project, not on each PR that meets it, so it is raised once, answered once, and
+ * sent on to the person once.
+ */
+export const repoWide = (key: string): boolean => key.startsWith('base-red:')
+
+export const repoEscalationsKey = (repo: string): string => `escalations:${repo}`
+
+/** A project's repository-wide escalations, as stored. */
+export function loadRepoEscalations(raw: unknown): Record<string, Escalation> {
+  const out: Record<string, Escalation> = {}
+  for (const [k, v] of Object.entries(rec(raw))) {
+    const e = rec(v) as Record<string, unknown>
+    if (repoWide(k) && (e.to === 'supervisor' || e.to === 'human') && typeof e.at === 'number' && typeof e.reason === 'string') out[k] = e as unknown as Escalation
+  }
+  return out
+}
+
+/** Repository-wide escalations raised within a week: an older one is about a base long since fixed. */
+export function pruneRepoEscalations(all: Record<string, Escalation>, now: number): Record<string, Escalation> {
+  return Object.fromEntries(Object.entries(all).filter(([, e]) => now - e.at < 7 * 24 * 3600_000))
+}
+
+/** The ledger as the planner reads it: the project's repository-wide escalations in place of the PR's own copies. */
+export function withRepoEscalations(ledger: PrLedger, shared: Record<string, Escalation>): PrLedger {
+  const own = Object.fromEntries(Object.entries(ledger.escalations).filter(([k]) => !repoWide(k)))
+  return { ...ledger, escalations: { ...own, ...shared } }
 }
 
 /** A reply to Matriarch's mail about this PR, as the card and the person's escalation show it. */

@@ -7,10 +7,11 @@ import { tick, type EngineDeps, type Workspace } from './engine.ts'
 import type { Executor } from './executor.ts'
 import type { GitHub, PrSnapshot } from './github.ts'
 import { emptyHistory, insertLog } from './history.ts'
-import { emptyLedger, ledgerKey, loadLedger, type PrLedger } from './ledger.ts'
+import { emptyLedger, ledgerKey, loadLedger, loadRepoEscalations, repoEscalationsKey, type PrLedger } from './ledger.ts'
 import {
-  applyReply, CATCH_UP_MS, createMailReader, emptyMailState, learnedSenders, loadMailState, MAIL_WINDOW_MS, mailKey, parseMail, prOfSubject,
-  recordSent, routeMail, takeMail, type MailMessage, type MailReader, type MailReply, type SentMail
+  applyReply, CATCH_UP_MS, createMailReader, emptyMailState, learnedSenders, learnSender, loadMailState, MAIL_WINDOW_MS, mailKey, newMail, parseMail,
+  prOfSubject, recordSent, routeMail, takeMail, takenQuestions, whoReplied, type MailIdentities, type MailMessage, type MailReader, type MailReply,
+  type MailState, type SentMail
 } from './mailbox.ts'
 import type { Action } from './plan.ts'
 import { plan } from './plan.ts'
@@ -44,6 +45,10 @@ function stored(id: string, over: Record<string, unknown> = {}): Record<string, 
   }
 }
 const msg = (id: string, over: Record<string, unknown> = {}): MailMessage => parseMail({ messages: [stored(id, over)] })[0]
+/** Who the agents of a Run are: the supervisor addresses Matriarch knows, and its workers'. */
+const known = (supervisors: string[] = [], workers: string[] = []): MailIdentities => ({ supervisorsOf: async () => supervisors, workersOf: () => new Set(workers) })
+const take = (box: { reader: MailReader }, state: MailState, over: { supervisor?: string | null; now?: number; ids?: MailIdentities; log?: (m: string) => void } = {}) =>
+  takeMail({ reader: box.reader, address: MAILBOX, state, supervisor: over.supervisor === undefined ? 'run:run_989bb853ebdd' : over.supervisor, ids: over.ids ?? known(), now: over.now ?? T0, log: over.log ?? (() => {}) })
 
 describe('reading the mailbox', () => {
   test('takes the full record Orca stores, and leaves out one whose words did not come', () => {
@@ -110,16 +115,17 @@ describe('taking mail', () => {
         stored('msg_other', { from_handle: 'orca_session_id:worker', to_handle: 'run:run_989bb853ebdd', thread_id: null })
       ]
     })
-    const taken = await takeMail({ reader: box.reader, address: MAILBOX, state: emptyMailState(), supervisor: 'run:run_989bb853ebdd', now: T0 + 120_000, log: () => {} })
+    const taken = await take(box, emptyMailState(), { now: T0 + 120_000 })
     assert.deepEqual(taken.replies.map((r) => [r.message.id, r.sent.number, r.sent.kind, r.who]), [['msg_r1', 4, 'escalate', 'supervisor'], ['msg_r2', 8, 'draft', 'supervisor']])
-    assert.deepEqual(learnedSenders(taken.state, 'run:run_989bb853ebdd'), [SUPERVISOR], 'the supervisor is known from its replies')
+    assert.deepEqual(learnedSenders(taken.state, 'run:run_989bb853ebdd'), [SUPERVISOR], 'the first chat to reply, with no supervisor known, is learned')
     assert.deepEqual(Object.keys(taken.state.handled).sort(), ['msg_r1', 'msg_r2'])
+    assert.equal(box.calls.filter((c) => c.startsWith('runMail')).length, 1, "the Run's mailbox is read once for both")
     assert.ok(!box.calls.includes('markRead'), 'nothing unread to mark')
     // The next tick, within the half hour: only the unread are read, and nothing is taken again.
-    const again = await takeMail({ reader: box.reader, address: MAILBOX, state: taken.state, supervisor: 'run:run_989bb853ebdd', now: T0 + 180_000, log: () => {} })
+    const again = await take(box, taken.state, { now: T0 + 180_000 })
     assert.deepEqual([again.replies.length, box.calls.filter((c) => c === 'recent').length], [0, 1])
     // After it, the recent mail is read again, and still nothing is taken twice.
-    const later = await takeMail({ reader: box.reader, address: MAILBOX, state: again.state, supervisor: 'run:run_989bb853ebdd', now: T0 + 120_000 + CATCH_UP_MS, log: () => {} })
+    const later = await take(box, again.state, { now: T0 + 120_000 + CATCH_UP_MS })
     assert.deepEqual([later.replies.length, box.calls.filter((c) => c === 'recent').length], [0, 2])
   })
 
@@ -127,9 +133,10 @@ describe('taking mail', () => {
     const box = mailbox({ unread: [stored('msg_q', { subject: 'Advice: one PR or two?', thread_id: null })] })
     box.arriveLate(stored('msg_q2', { subject: 'Advice: and the backfill?', thread_id: null }))
     const state = { ...emptyMailState(), caughtUpAt: T0 }
-    const taken = await takeMail({ reader: box.reader, address: MAILBOX, state, supervisor: 'run:r1', now: T0 + 1000, log: () => {} })
-    assert.deepEqual(taken.questions.map((q) => q.id), ['msg_q', 'msg_q2'])
+    const taken = await take(box, state, { supervisor: 'run:r1', now: T0 + 1000 })
+    assert.deepEqual(taken.state.pending.map((q) => q.id), ['msg_q', 'msg_q2'], 'pending until the advisor stores them')
     assert.deepEqual(box.calls, ['unread', 'markRead'])
+    assert.deepEqual(takenQuestions(taken.state, ['msg_q']).pending.map((q) => q.id), ['msg_q2'])
   })
 
   test("mail from Matriarch's own mailboxes is not a reply, mail older than a week is not taken, and the rest is dropped and logged", async () => {
@@ -141,32 +148,91 @@ describe('taking mail', () => {
         stored('msg_cold', { from_handle: 'term_someone', subject: 'Please merge everything', thread_id: null })
       ]
     })
-    const taken = await takeMail({ reader: box.reader, address: MAILBOX, state: { ...emptyMailState(), caughtUpAt: T0 }, supervisor: 'run:r1', now: T0, log: (m) => void logs.push(m) })
-    assert.deepEqual([taken.questions.length, taken.replies.length, taken.loose.length], [0, 0, 0])
-    assert.ok(logs.some((l) => /no question and no reply to its mail, so it is dropped: "Please merge everything" from term_someone/.test(l)))
+    const taken = await take(box, { ...emptyMailState(), caughtUpAt: T0 }, { supervisor: 'run:r1', log: (m) => void logs.push(m) })
+    assert.deepEqual([taken.state.pending.length, taken.replies.length, taken.loose.length], [0, 0, 0])
+    assert.ok(logs.some((l) => /so it is dropped: "Please merge everything" from term_someone/.test(l)))
     assert.ok(!('msg_old' in taken.state.handled))
   })
 
-  test("a reply whose thread is gone from Orca shows in its PR's log by its subject, and does nothing more", async () => {
-    const box = mailbox({ unread: [stored('msg_r', { thread_id: 'msg_gone', subject: 'Re: #10 needs a follow-up: AI review asks for changes on #10, round 1/3' })] })
-    const taken = await takeMail({ reader: box.reader, address: MAILBOX, state: { ...emptyMailState(), caughtUpAt: T0 }, supervisor: 'run:run_989bb853ebdd', now: T0, log: () => {} })
-    assert.deepEqual(taken.loose.map((l) => l.number), [10])
+  test("a reply whose thread is gone from Orca shows in its PR's log by its subject, only from the supervisor or a worker, and does nothing more", async () => {
+    const gone = (id: string, from: string) => stored(id, { from_handle: from, thread_id: 'msg_gone', subject: 'Re: #10 needs a follow-up: AI review asks for changes on #10, round 1/3' })
+    const box = mailbox({ unread: [gone('msg_s', SUPERVISOR), gone('msg_w', 'term_worker'), gone('msg_x', 'term_stranger')] })
+    const taken = await take(box, { ...emptyMailState(), caughtUpAt: T0 }, { ids: known([SUPERVISOR], ['term_worker']) })
+    assert.deepEqual(taken.loose.map((l) => [l.message.id, l.number, l.who]), [['msg_s', 10, 'supervisor'], ['msg_w', 10, 'worker']])
     assert.deepEqual(taken.replies, [])
     assert.deepEqual(learnedSenders(taken.state, 'run:run_989bb853ebdd'), [], 'no thread of its own: no sender learned')
   })
 
+  test('a reply filed under no Run, or another Run than the supervisor\'s, is not looked up in Orca; a thread found twice is kept once', async () => {
+    const box = mailbox({
+      unread: [stored('msg_u', { run_id: 'run_unbound', thread_id: 'msg_x' }), stored('msg_o', { run_id: 'run_other', thread_id: 'msg_x' })],
+      run: [stored('msg_esc4', { from_handle: MAILBOX, to_handle: 'run:run_989bb853ebdd', thread_id: null })]
+    })
+    await take(box, { ...emptyMailState(), caughtUpAt: T0 })
+    assert.ok(!box.calls.some((c) => c.startsWith('runMail')), 'no read of other mail for them')
+    const twice = mailbox({
+      unread: [stored('msg_a', { thread_id: 'msg_esc4' }), stored('msg_b', { thread_id: 'msg_esc4', created_at: iso(T0 + 1000) })],
+      run: [stored('msg_esc4', { from_handle: MAILBOX, to_handle: 'run:run_989bb853ebdd', thread_id: null })]
+    })
+    const taken = await take(twice, { ...emptyMailState(), caughtUpAt: T0 }, { now: T0 + 2000 })
+    assert.equal(taken.replies.length, 2)
+    assert.deepEqual(taken.state.sent.map((s) => s.id), ['msg_esc4'])
+  })
+
+  test('unread and catch-up bringing the same message in one tick take it once; the week\'s edge is kept, older not', () => {
+    const state = emptyMailState()
+    const m = msg('m1')
+    assert.deepEqual(newMail(state, [m, m, msg('m1')], T0).map((x) => x.id), ['m1'])
+    const edge = msg('edge', { created_at: iso(T0 - MAIL_WINDOW_MS) })
+    const past = msg('past', { created_at: iso(T0 - MAIL_WINDOW_MS - 1000) })
+    assert.deepEqual(newMail(state, [edge, past], T0).map((x) => x.id), ['edge'])
+  })
+
   test('a mailbox Orca says is gone is reported, and nothing is taken', async () => {
-    const taken = await takeMail({ reader: mailbox({ gone: true }).reader, address: MAILBOX, state: emptyMailState(), supervisor: null, now: T0, log: () => {} })
+    const taken = await take(mailbox({ gone: true }), emptyMailState(), { supervisor: null })
     assert.equal(taken.gone, true)
   })
 
-  test('a reply in a thread Matriarch recorded is matched without asking Orca, and Matriarch learns the supervisor only from mail to its Run', async () => {
+  test('a reply in a thread Matriarch recorded is matched without asking Orca', async () => {
     const state = loadMailState({ ...emptyMailState(), sent: [{ id: 'msg_1', at: T0, to: 'run:run_989bb853ebdd', subject: 'x', kind: 'escalate', number: 12, key: 'ci:abc:supervisor' }, { id: 'msg_2', at: T0, to: 'dispatch:d1', subject: 'CI failed on #12', kind: 'send-ci-failure', number: 12 }] })
-    const routed = routeMail(state, [msg('r1', { thread_id: 'msg_1' }), msg('r2', { thread_id: 'msg_2', from_handle: 'orca_session_id:worker', run_id: 'run_989bb853ebdd' })], MAILBOX)
-    assert.deepEqual(routed.replies.map((r) => [r.message.id, r.who, r.sent.key ?? null]), [['r1', 'supervisor', 'ci:abc:supervisor'], ['r2', 'worker', null]])
+    const routed = routeMail(state, [msg('r1', { thread_id: 'msg_1' }), msg('r2', { thread_id: 'msg_2', from_handle: 'term_worker' })], MAILBOX)
+    assert.deepEqual(routed.threaded.map((r) => [r.message.id, r.sent.key ?? null]), [['r1', 'ci:abc:supervisor'], ['r2', null]])
     const store = new Map<string, unknown>()
     await recordSent({ get: async (k) => store.get(k) ?? null, set: async (k, v) => void store.set(k, v) }, 'acme/app', { id: 'msg_9', from: MAILBOX }, { at: T0, to: 'run:r1', subject: 's', kind: 'settings' })
     assert.deepEqual(loadMailState(store.get(mailKey('acme/app'))).own, [MAILBOX], 'its own mailbox is known, so its own mail is never a reply')
+  })
+})
+
+describe('who replied', () => {
+  const toRun: SentMail = { id: 'msg_esc', at: T0, to: 'run:run_989bb853ebdd', subject: 'Escalation: …', kind: 'escalate', number: 12, key: `orphan-ci:${SHA}:supervisor` }
+  const toWorker: SentMail = { id: 'msg_ci', at: T0, to: 'dispatch:d1', subject: 'CI failed on #12', kind: 'send-ci-failure', number: 12 }
+  const reply = (from: string, over: Record<string, unknown> = {}) => msg('r', { from_handle: from, thread_id: 'msg_esc', ...over })
+
+  test("a worker's terminal replying in a thread to the supervisor's Run is a worker, never learned as the supervisor", async () => {
+    // Orca lets any caller reply to any message, filed under the original's Run.
+    const told = await whoReplied(emptyMailState(), known([], ['term_worker_d1']), reply('term_worker_d1'), toRun)
+    assert.deepEqual(told, { who: 'worker', learn: false, stranger: false })
+    const state = learnSender(emptyMailState(), { message: reply('term_worker_d1'), sent: toRun, who: told.who })
+    assert.deepEqual(learnedSenders(state, 'run:run_989bb853ebdd'), [])
+    // A terminal that is nobody known is no one's: not the supervisor, and not learned.
+    assert.deepEqual(await whoReplied(emptyMailState(), known(), reply('term_someone'), toRun), { who: 'other', learn: false, stranger: false })
+  })
+
+  test('the supervisor is a known address, or the first chat to reply while none is known; a second chat is not, and is pointed out', async () => {
+    assert.deepEqual(await whoReplied(emptyMailState(), known([SUPERVISOR]), reply(SUPERVISOR), toRun), { who: 'supervisor', learn: false, stranger: false })
+    assert.deepEqual(await whoReplied(emptyMailState(), known(), reply(SUPERVISOR), toRun), { who: 'supervisor', learn: true, stranger: false })
+    assert.deepEqual(await whoReplied(emptyMailState(), known([SUPERVISOR]), reply('orca_session_id:claude_other'), toRun), { who: 'other', learn: false, stranger: true })
+    const learned = learnSender(emptyMailState(), { message: reply(SUPERVISOR), sent: toRun, who: 'supervisor' })
+    assert.deepEqual(await whoReplied(learned, known(), reply('orca_session_id:claude_other'), toRun), { who: 'other', learn: false, stranger: true }, 'the first wins')
+    // A chat session that is one of its workers is never the supervisor.
+    assert.deepEqual(await whoReplied(emptyMailState(), known([], ['orca_session_id:claude_w']), reply('orca_session_id:claude_w'), toRun), { who: 'worker', learn: false, stranger: false })
+    // Filed under another Run than the one Matriarch wrote to.
+    assert.deepEqual(await whoReplied(emptyMailState(), known([SUPERVISOR]), reply(SUPERVISOR, { run_id: 'run_other' }), toRun), { who: 'other', learn: false, stranger: false })
+  })
+
+  test("a reply in a worker's thread is the worker only from its Run's workers' addresses", async () => {
+    assert.equal((await whoReplied(emptyMailState(), known([], ['term_w']), reply('term_w', { thread_id: 'msg_ci' }), toWorker)).who, 'worker')
+    assert.equal((await whoReplied(emptyMailState(), known([], ['term_w']), reply('term_x', { thread_id: 'msg_ci' }), toWorker)).who, 'other')
   })
 })
 
@@ -178,12 +244,38 @@ describe('a reply on its PR', () => {
   test('answers its escalation, is its latest note, and reads as a line in its log', () => {
     const out = applyReply(escalated(), reply('A fixer is on it: dispatch ctx_4e8.'), T0 + 90_000)
     assert.equal(out.answered, `orphan-ci:${SHA}:supervisor`)
-    assert.deepEqual(out.ledger.escalations[`orphan-ci:${SHA}:supervisor`].answered, { at: T0 + 60_000, text: 'A fixer is on it: dispatch ctx_4e8.', count: 1 })
+    assert.deepEqual(out.ledger.escalations[`orphan-ci:${SHA}:supervisor`].answered, { at: T0 + 60_000, text: 'A fixer is on it: dispatch ctx_4e8.', textAt: T0 + 60_000, count: 1 })
     assert.deepEqual(out.ledger.notes?.map((n) => [n.from, n.text]), [['supervisor', 'A fixer is on it: dispatch ctx_4e8.']])
     assert.deepEqual([out.entry.at, out.entry.kind, out.entry.text, out.entry.subject], [T0 + 60_000, 'reply', 'The supervisor answered the escalation: A fixer is on it: dispatch ctx_4e8.', sent.subject])
     // A second answer brings its words up to date; the window still runs from the first.
     const twice = applyReply(out.ledger, reply('Still on it.', T0 + 120_000), T0 + 130_000)
-    assert.deepEqual(twice.ledger.escalations[`orphan-ci:${SHA}:supervisor`].answered, { at: T0 + 60_000, text: 'Still on it.', count: 2 })
+    assert.deepEqual(twice.ledger.escalations[`orphan-ci:${SHA}:supervisor`].answered, { at: T0 + 60_000, text: 'Still on it.', textAt: T0 + 120_000, count: 2 })
+    // An older reply a catch-up read brings late does not overwrite the newer words.
+    const late = applyReply(twice.ledger, reply('first thoughts', T0 + 30_000), T0 + 140_000)
+    assert.deepEqual(late.ledger.escalations[`orphan-ci:${SHA}:supervisor`].answered, { at: T0 + 30_000, text: 'Still on it.', textAt: T0 + 120_000, count: 3 })
+  })
+
+  test('a reply to a draft nudge, or from anyone but the supervisor, answers nothing; one from someone unknown is no note', () => {
+    const draft: SentMail = { ...sent, kind: 'draft', key: `draft:${SHA}:supervisor`, subject: 'acme/app #12 is still a draft' }
+    const ledger = escalated({ escalations: { ...escalated().escalations, [`draft:${SHA}:supervisor`]: { to: 'supervisor', at: T0, reason: 'draft' } } })
+    const d = applyReply(ledger, { ...reply('Leaving it as a draft: it waits on the gate.'), sent: draft }, T0 + 90_000)
+    assert.equal(d.answered, null)
+    assert.equal(d.entry.text, 'The supervisor replied: Leaving it as a draft: it waits on the gate.')
+    const other = applyReply(escalated(), { ...reply('done'), who: 'other' }, T0 + 90_000)
+    assert.equal(other.answered, null)
+    assert.equal(other.entry.text, `A reply from ${SUPERVISOR}: done`)
+    assert.equal(other.ledger.notes, undefined)
+    const worker = applyReply(escalated(), { ...reply('fixed'), who: 'worker' }, T0 + 90_000)
+    assert.equal(worker.answered, null)
+  })
+
+  test('a repository-wide escalation is answered in the shared record, not on the PR', () => {
+    const key = 'base-red:base1:supervisor'
+    const shared = { [key]: { to: 'supervisor' as const, at: T0, reason: 'merge train paused' } }
+    const out = applyReply(emptyLedger(), { ...reply('Reverting the bad commit.'), sent: { ...sent, key } }, T0 + 90_000, shared)
+    assert.equal(out.answered, key)
+    assert.equal(out.shared[key].answered?.text, 'Reverting the bad commit.')
+    assert.equal(out.ledger.escalations[key], undefined)
   })
 
   test('does not answer one already sent on to the person, or newer than the reply', () => {
@@ -226,7 +318,10 @@ describe('an answered escalation', () => {
     assert.equal(toPerson(planAt(T0 + 31 * 60_000, answered).actions), undefined, 'not at the first window')
     const late = toPerson(planAt(T0 + 51 * 60_000, answered).actions)
     assert.ok(late && late.kind === 'escalate')
-    assert.match(late.reason, /The supervisor answered 31 min ago, and it is still so: "A fixer is on it\."/)
+    assert.match(late.reason, /The supervisor wrote 31 min ago: "A fixer is on it\.", and it is still so/)
+    // Its latest words, with when it wrote them, and when it first answered.
+    const twice = ledger({ at: T0 + 20 * 60_000, text: 'Still on it.', textAt: T0 + 40 * 60_000, count: 2 } as { at: number; text: string })
+    assert.match(toPerson(planAt(T0 + 51 * 60_000, twice).actions)!.kind === 'escalate' ? (toPerson(planAt(T0 + 51 * 60_000, twice).actions) as { reason: string }).reason : '', /The supervisor wrote 11 min ago \(it first answered 31 min ago\): "Still on it\."/)
   })
 })
 
@@ -302,18 +397,120 @@ describe('the engine and its mailbox', () => {
     e.advance(10 * 60_000)
     await tick(e.deps, { autopilot: true })
     const human = e.executed.find((a) => a.kind === 'escalate' && a.to === 'human')
-    assert.ok(human && human.kind === 'escalate' && /The supervisor answered 3\d min ago, and it is still so: "Handled: a fixer is on it/.test(human.reason))
+    assert.ok(human && human.kind === 'escalate' && /The supervisor wrote 3\d min ago: "Handled: a fixer is on it/.test(human.reason))
+    // Exactly once.
+    e.advance(5 * 60_000)
+    await tick(e.deps, { autopilot: true })
+    assert.equal(e.executed.filter((a) => a.kind === 'escalate' && a.to === 'human').length, 1)
     assert.equal(loadLedger(e.store.get(ledgerKey('acme/app', 12))).notes?.length, 1, 'the reply is kept once')
   })
 
   test('in dry run the mail is read and replies are logged, and nothing is sent', async () => {
     const e = engine([failing])
-    e.box.arrive(stored('msg_x', { thread_id: 'msg_gone', subject: 'Re: #12 needs a follow-up: CI failed on #12', body: 'On it.' }))
+    e.deps.supervisorSenders = async () => [SUPERVISOR]
+    e.box.arrive(stored('msg_x', { thread_id: 'msg_gone', run_id: 'r1', subject: 'Re: #12 needs a follow-up: CI failed on #12', body: 'On it.' }))
     const board = await tick(e.deps, { autopilot: false })
     assert.deepEqual(e.executed, [])
     const card = board.tracks.find((t) => t.pr?.number === 12)!
     const log = (e.store.get(`track:${card.key}`) as { log: LogEntry[] }).log
-    assert.ok(log.some((l) => l.kind === 'reply' && l.text === 'A reply about this PR came in: On it.'))
+    assert.ok(log.some((l) => l.kind === 'reply' && l.text === 'The supervisor wrote about this PR: On it.'))
+  })
+
+  test('nothing new: the mail record is not written again', async () => {
+    const e = engine([failing])
+    await tick(e.deps, { autopilot: false })
+    let writes = 0
+    const set = e.deps.store.set
+    e.deps.store.set = async (k, v) => (k === mailKey('acme/app') && writes++, set(k, v))
+    e.advance(60_000)
+    await tick(e.deps, { autopilot: false })
+    assert.equal(writes, 0)
+  })
+
+  test("a reply read while the forge's list fails lands in the log the card opens, the worktree's", async () => {
+    const e = engine([failing])
+    e.deps.workers = async () => [{ dispatchId: 'd1', worktreeId: 'ws-login', taskId: 't', runId: 'r1', agent: 'codex', model: null, state: null, terminal: 'term_w' }]
+    e.store.set(mailKey('acme/app'), { ...emptyMailState(), sent: [{ id: 'msg_ci', at: T0, to: 'dispatch:d1', subject: 'CI failed on #12 (a1b2c3d), round 1/3', kind: 'send-ci-failure', number: 12 }] })
+    const first = await tick(e.deps, { autopilot: false })
+    const key = first.tracks.find((t) => t.pr?.number === 12)!.key
+    assert.equal(key, 'ws-login')
+    const listOpen = e.deps.github.listOpen
+    e.deps.github.listOpen = async () => {
+      throw new Error('API rate limit exceeded')
+    }
+    e.advance(60_000)
+    e.box.arrive(stored('msg_w', { from_handle: 'term_w', run_id: 'r1', thread_id: 'msg_ci', subject: 'Re: CI failed on #12 (a1b2c3d), round 1/3', body: 'Fixed in the next push.', created_at: iso(e.now()) }))
+    await tick(e.deps, { autopilot: false })
+    e.deps.github.listOpen = listOpen
+    e.advance(60_000)
+    await tick(e.deps, { autopilot: false })
+    const log = (e.store.get(`track:${key}`) as { log: LogEntry[] }).log
+    assert.ok(log.some((l) => l.kind === 'reply' && l.text === 'The worker replied: Fixed in the next push.'))
+  })
+
+  test("a question survives a failure between reading it and the advisor's save, and is handed over until the advisor stored it", async () => {
+    const e = engine([failing])
+    const handed: string[][] = []
+    let fail = true
+    e.deps.advisor = {
+      step: async (input) => {
+        handed.push((input.questions ?? []).map((q) => q.id))
+        if (fail) throw new Error('storage write failed')
+        return null
+      }
+    }
+    e.box.arrive(stored('msg_q', { subject: 'Advice: one PR or two?', thread_id: null }))
+    await tick(e.deps, { autopilot: true })
+    assert.deepEqual(loadMailState(e.store.get(mailKey('acme/app'))).pending.map((q) => q.id), ['msg_q'], 'still pending: the advisor did not store it')
+    fail = false
+    e.advance(60_000)
+    await tick(e.deps, { autopilot: true })
+    e.advance(60_000)
+    await tick(e.deps, { autopilot: true })
+    assert.deepEqual(handed, [['msg_q'], ['msg_q'], []])
+    assert.deepEqual(loadMailState(e.store.get(mailKey('acme/app'))).pending, [])
+  })
+
+  test('the card shows only a reply since the PR\'s current head', async () => {
+    const e = engine([failing])
+    e.store.set(ledgerKey('acme/app', 12), { ...emptyLedger(), heads: { [SHA]: T0 }, notes: [{ at: T0 - 3600_000, from: 'supervisor', subject: 's', text: 'about an older commit' }] })
+    const board = await tick(e.deps, { autopilot: false })
+    assert.equal(board.tracks.find((t) => t.pr?.number === 12)!.pr?.note, undefined)
+  })
+
+  test('CI red on the base with two ready PRs: one escalation, answered once for both, and the person told once after its time', async () => {
+    const a = pr({ number: 12 })
+    const b = pr({ number: 13, headRef: 'feature/b', headSha: 'b'.repeat(40) })
+    const e = engine([a, b])
+    e.deps.workspaces = async () => [
+      { id: 'ws-login', kind: 'worktree', name: 'login', path: '/r/wt/login', branch: 'feature/login', hostId: null },
+      { id: 'ws-b', kind: 'worktree', name: 'b', path: '/r/wt/b', branch: 'feature/b', hostId: null }
+    ]
+    e.deps.readConfig = async () => validateConfig({ review: { enabled: false }, merge: { mode: 'auto' } })
+    const list = e.deps.github.listOpen
+    e.deps.github.listOpen = async (...args) => ({ ...(await list(...args)), base: { name: 'main', sha: 'base1', rollup: 'FAILURE' } })
+    e.store.set(ledgerKey('acme/app', 12), { heads: { [SHA]: 0 } })
+    e.store.set(ledgerKey('acme/app', 13), { heads: { ['b'.repeat(40)]: 0 } })
+    await tick(e.deps, { autopilot: true })
+    const toSupervisor = e.executed.filter((x) => x.kind === 'escalate' && x.to === 'supervisor')
+    assert.equal(toSupervisor.length, 1, 'one problem, raised once')
+    e.advance(10 * 60_000)
+    e.box.arrive(stored('msg_reply', { run_id: 'r1', thread_id: 'msg_1', subject: 'Re: Escalation: Matriarch needs a decision on acme/app #12', body: 'Reverting the bad commit now.', created_at: iso(e.now()) }))
+    await tick(e.deps, { autopilot: true })
+    const shared = loadRepoEscalations(e.store.get(repoEscalationsKey('acme/app')))
+    assert.equal(shared['base-red:base1:supervisor'].answered?.text, 'Reverting the bad commit now.')
+    // Past the first window, inside the answered one: neither PR goes to the person.
+    e.advance(21 * 60_000)
+    await tick(e.deps, { autopilot: true })
+    assert.equal(e.executed.filter((x) => x.kind === 'escalate' && x.to === 'human').length, 0)
+    // Its time ran out with the base still red: the person hears once, with the answer.
+    e.advance(10 * 60_000)
+    await tick(e.deps, { autopilot: true })
+    e.advance(60_000)
+    await tick(e.deps, { autopilot: true })
+    const human = e.executed.filter((x) => x.kind === 'escalate' && x.to === 'human')
+    assert.equal(human.length, 1)
+    assert.match((human[0] as { reason: string }).reason, /Reverting the bad commit now/)
   })
 
   test('a project with no mailbox gets none made for reading', async () => {

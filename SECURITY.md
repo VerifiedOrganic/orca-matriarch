@@ -28,15 +28,18 @@ Not vulnerabilities in Matriarch:
 - a supervisor going over its worker limits: they keep cost and disk in hand and are not a
   security boundary (the refusal before a start works only for Claude Code in a terminal);
 - what the advisor advises: it only reads, and the supervisor weighs its answer;
-- another agent on your machine posing as the supervisor to the advisor. The check is an address
-  match: a question is answered only when Orca stored it as sent from the supervisor's chat
-  session, its terminal, the handle its Run is bound to, or the sender of a reply in a thread
-  Matriarch started with that Run (Orca gives a reply the id of the message it answers, which
-  only the Run's coordinator received). Orca does not authenticate senders, so an agent that
-  learned one of those addresses can send as it. What that allows is limited:
-  the advisor runs read-only, so the cost is one agent session per question, and the text it
-  writes reaches the supervisor framed as a second opinion, which the supervisor weighs and does
-  not obey.
+- another agent on your machine posing as the supervisor. Every sender check is an address
+  match, and Orca does not authenticate senders: any caller can reply to any message, and its
+  reply is filed under that message's Run. Matriarch takes a message as the supervisor's only
+  from an address known to be the supervisor's: its chat's session from the launch, the handle
+  its Run is bound to, or the first chat session (not one of the Run's workers) that replied to
+  Matriarch's mail to that Run while no supervisor address was known. Learning that first
+  address trusts that the supervisor answers Matriarch before another chat does; a different
+  chat replying later is not learned, and the board says so. An agent that learned a supervisor
+  address can send as it. What that allows is limited: the advisor runs read-only, so the cost
+  is one agent session per question, and its text reaches the supervisor framed as a second
+  opinion, which the supervisor weighs and does not obey; a reply posing as the supervisor can
+  give an escalation one more window before it reaches you, and then reaches you all the same.
 
 ## Reporting a vulnerability
 

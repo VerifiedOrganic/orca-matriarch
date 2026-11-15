@@ -112,7 +112,8 @@ Matriarch manages only PRs you opened from a branch that belongs to an Orca work
   review, needs you, ready, merged. Dots mark pushes, messages, reviews, escalations and merges.
   Worktrees with no PR and nothing running fold into one line.
 - **Board:** cards by state with the agent and model, CI, comments and rounds used, the
-  supervisor's latest reply about the PR, and in dry run what Matriarch would do next. **Run AI
+  supervisor's latest reply about the PR since its last push, and in dry run what Matriarch
+  would do next. **Run AI
   review now** on any card runs the crew on that commit, in dry run too.
 - **What Matriarch did:** click a timeline row, or open **What Matriarch did** on a card, for
   that PR's log, newest first: each lane it entered and why, new commits, finished reviews, and
@@ -149,12 +150,15 @@ sees only what the supervisor sends it.
   unless you mark it **Run it without the read-only lockdown**.
 - **One at a time:** one question per project, up to 10 waiting. One that gets no answer (quiet
   for 30 minutes, or running over 2 hours) is ended, and the supervisor is told.
-- **Who may ask:** only the supervisor. Matriarch knows it as the chat it opened with **Open
-  supervisor chat**, and from the supervisor's replies to Matriarch's own mail to its Run, so a
-  supervisor opened earlier, or by hand, can ask once it has answered any of that mail. A question
-  from anyone else is dropped, and the board counts what was dropped. Until Matriarch knows the
-  supervisor, it is not offered the advisor, and the board says so. A follow-up is a new
-  `Advice:` message; a reply to an answer is not answered again.
+- **Who may ask:** only the supervisor, told by the address Orca stores for a sender: an address
+  match, since Orca does not authenticate senders. Matriarch knows the supervisor as the chat it
+  opened with **Open supervisor chat**, by the handle its Run is bound to, or, while it knows
+  neither, as the first chat session (not one of the Run's workers) to reply to Matriarch's own
+  mail to that Run, so a supervisor opened earlier, or by hand, can ask once it has answered any
+  of that mail. A different chat replying later is not taken as the supervisor; the board says
+  so. A question from anyone else is dropped, and the board counts what was dropped. Until
+  Matriarch knows the supervisor, it is not offered the advisor, and the board says so. A
+  follow-up is a new `Advice:` message; a reply to an answer is not answered again.
 - **None set:** a question sent while no advisor is set (or one Matriarch cannot start) gets an
   answer saying so, at once.
 - **When:** answers only with autopilot on. In dry run questions wait, and the board says so.

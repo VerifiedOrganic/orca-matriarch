@@ -16,11 +16,11 @@ import { forgeKind, forgeTerms, type FailureDetails, type FileMoves, type ForgeK
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { followIssues } from './issues.ts'
 import { addLog, addMark, historyKey, insertLog, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
-import { checkKey, keepChecks, ledgerKey, loadLedger, record, recordRefusedRerun, recordRefusedRetarget, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
+import { checkKey, keepChecks, ledgerKey, loadLedger, loadRepoEscalations, pruneRepoEscalations, record, recordRefusedRerun, recordRefusedRetarget, repoEscalationsKey, repoWide, roundsUsed, withRepoEscalations, type Escalation, type PrLedger, type StackParent, type SupervisorNote } from './ledger.ts'
 import { countStarts, dayOf, isWorking, loadPendingStops, loadStarts, overLimitStarts, STOP_RETRY_MS, stoppedMessage, type LimitState, type PendingStop } from './limits.ts'
 import { LOCK_LABEL } from './lockdown.ts'
 import type { SentReceipt, WorkerRow } from './orca-cli.ts'
-import { applyReply, loadMailState, mailKey, recordSent, replyLine, takeMail, type MailMessage, type MailReader } from './mailbox.ts'
+import { applyReply, loadMailState, mailKey, recordSent, replyLine, takeMail, takenQuestions, type MailIdentities, type MailMessage, type MailReader } from './mailbox.ts'
 import { lightPaths, MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner, type Plan } from './plan.ts'
 import { supervisorTagPrefix } from './supervisor.ts'
 import type { AdvisorView, Board, LogEntry, Mark, RepoView, TrackView } from './protocol.ts'
@@ -564,8 +564,10 @@ interface ProjectTick {
   whyNot: string | null
   acting: boolean
   byBranch: Map<string, Workspace>
+  /** The project's repository-wide escalations (ledger.ts repoWide): one record every PR's plan reads. */
+  repoEscalations: Record<string, Escalation>
   // readMail
-  /** Questions for the advisor that came this tick. */
+  /** Questions for the advisor not stored by it yet: this tick's, and any a failure kept pending. */
   questions: MailMessage[]
   /** Replies to Matriarch's mail, by the PR they are about: for that PR's log this tick. */
   mailLog: Map<number, LogEntry[]>
@@ -828,6 +830,7 @@ async function openProject(t: TickContext, repoKey: string, info: RepoInfo, repo
   }
   return {
     t, info, repoKey, repoWorkspaces, cfg, config, kind, terms, forge, supervisor, pending, view, free, limits, lowDisk, whyNot, acting, byBranch,
+    repoEscalations: pruneRepoEscalations(loadRepoEscalations(await deps.store.get(repoEscalationsKey(repoKey))), now),
     questions: [], mailLog: new Map(),
     live: 0, startsToday: 0, stoppedWorktrees: {},
     summaries: [], viewer: '', listed: false, base: null, truncatedList: false, detailAge: t.maxAge, follows: () => false, unknownWs: new Set(),
@@ -846,39 +849,55 @@ async function openProject(t: TickContext, repoKey: string, info: RepoInfo, repo
  * reads, so it happens in dry run too. Adds questions, mailLog.
  */
 async function readMail(proj: ProjectTick): Promise<void> {
-  const { deps, now } = proj.t
+  const { deps, now, workers } = proj.t
   const { repoKey, supervisor, view } = proj
   if (!deps.mail || !deps.mailbox) return
   const address = await deps.mailbox(repoKey).catch(() => null)
   if (!address) return
   const key = mailKey(repoKey)
   const before = loadMailState(await deps.store.get(key))
-  const taken = await takeMail({ reader: deps.mail, address, state: before, supervisor, now, log: (m) => deps.log(`${repoKey}: ${m}`) })
+  // Who a Run's agents are, by the addresses Orca stores for a sender: its supervisor as Matriarch
+  // knows it, and its workers from Orca's worker list.
+  const ids: MailIdentities = {
+    supervisorsOf: async (run) => (deps.supervisorSenders ? deps.supervisorSenders(repoKey, run) : []),
+    workersOf: (run) =>
+      new Set(workers.filter((w) => w.runId !== null && `run:${w.runId}` === run).flatMap((w) => [`dispatch:${w.dispatchId}`, ...(w.terminal ? [w.terminal] : [])]))
+  }
+  const taken = await takeMail({ reader: deps.mail, address, state: before, supervisor, ids, now, log: (m) => deps.log(`${repoKey}: ${m}`) })
   if (taken.gone) {
     // Closed, or lost in a restart: the next send makes a new one, and the supervisor is told.
     deps.mailboxGone?.(repoKey, address)
     return
   }
-  proj.questions.push(...taken.questions)
+  // Every question not yet stored by the advisor: this tick's, and any a failure kept pending.
+  proj.questions = [...taken.state.pending]
+  for (const who of taken.strangers) {
+    view.warnings.push(`Another chat (${who}) replied to Matriarch's mail to the supervisor's Run. It is not taken as the supervisor: its replies are logged, and answer no escalation.`)
+  }
   const byPr = new Map<number, LogEntry[]>()
   const note = (number: number, entry: LogEntry) => byPr.set(number, [...(byPr.get(number) ?? []), entry])
+  let shared = proj.repoEscalations
   for (const reply of taken.replies) {
     const { sent, message, who } = reply
     if (sent.number === undefined) {
-      deps.log(`${repoKey}: the ${who} replied to "${sent.subject}": ${replyLine(message.body, 200)}`)
+      deps.log(`${repoKey}: ${who === 'other' ? `${message.from ?? 'someone'}` : `the ${who}`} replied to "${sent.subject}": ${replyLine(message.body, 200)}`)
       continue
     }
     const lk = ledgerKey(repoKey, sent.number)
-    const out = applyReply(loadLedger(await deps.store.get(lk)), reply, now)
-    await deps.store.set(lk, out.ledger as unknown as JsonValue)
+    const ledger = loadLedger(await deps.store.get(lk))
+    const out = applyReply(ledger, reply, now, shared)
+    if (JSON.stringify(out.ledger) !== JSON.stringify(ledger)) await deps.store.set(lk, out.ledger as unknown as JsonValue)
+    shared = out.shared
     if (out.answered) deps.log(`${repoKey} #${sent.number}: the supervisor answered the escalation ${out.answered}`)
     note(sent.number, out.entry)
   }
-  for (const { message, number } of taken.loose) {
+  for (const { message, number, who } of taken.loose) {
     // Its thread is gone from Orca: shown where it belongs, and nothing more is made of it.
-    note(number, { at: message.at || now, kind: 'reply', text: `A reply about this PR came in: ${replyLine(message.body, 240)}`, subject: message.subject })
+    note(number, { at: message.at || now, kind: 'reply', from: who, text: `The ${who} wrote about this PR: ${replyLine(message.body, 240)}`, subject: message.subject })
   }
+  if (JSON.stringify(shared) !== JSON.stringify(proj.repoEscalations)) await saveRepoEscalations(proj, shared)
   proj.mailLog = byPr
+  if (JSON.stringify(taken.state) === JSON.stringify(before)) return
   try {
     await deps.store.set(key, taken.state as unknown as JsonValue)
   } catch (error) {
@@ -886,11 +905,27 @@ async function readMail(proj: ProjectTick): Promise<void> {
   }
 }
 
-/** Replies about a PR that is not on the board this tick: they go to its own log. */
+/** The project's repository-wide escalations, kept and saved. */
+async function saveRepoEscalations(proj: ProjectTick, next: Record<string, Escalation>): Promise<void> {
+  proj.repoEscalations = next
+  await proj.t.deps.store.set(repoEscalationsKey(proj.repoKey), next as unknown as JsonValue)
+}
+
+/**
+ * Replies about a PR that is not on the board this tick (the forge's list failed, say): they go to
+ * its log where its card reads it, the worktree's history when that is the PR's, else its own.
+ */
 async function logLeftoverReplies(proj: ProjectTick): Promise<void> {
   const { deps } = proj.t
   for (const [number, entries] of proj.mailLog) {
-    const key = historyKey(`pr:${proj.repoKey}#${number}`)
+    let owner: string | null = null
+    for (const ws of proj.repoWorkspaces) {
+      if (loadHistory(await deps.store.get(historyKey(ws.id))).pr === number) {
+        owner = ws.id
+        break
+      }
+    }
+    const key = historyKey(owner ?? `pr:${proj.repoKey}#${number}`)
     let history = loadHistory(await deps.store.get(key))
     for (const e of entries) history = insertLog(history, e)
     await deps.store.set(key, history as unknown as JsonValue)
@@ -898,8 +933,17 @@ async function logLeftoverReplies(proj: ProjectTick): Promise<void> {
   proj.mailLog.clear()
 }
 
+/**
+ * The reply the card shows: the latest one since the PR's head commit was first seen, so a week-old
+ * answer about an earlier state of the PR does not sit on it; without that time, a day's worth.
+ */
+function currentNote(ledger: PrLedger, headSha: string, now: number): SupervisorNote | null {
+  const since = ledger.heads[headSha] ?? now - 24 * 3600_000
+  return ledger.notes?.filter((n) => n.at >= since).at(-1) ?? null
+}
+
 /** A reply as the card shows it: who, when, and its first lines. */
-function noteView(n: { at: number; from: 'supervisor' | 'worker'; text: string }): { at: number; from: 'supervisor' | 'worker'; text: string } {
+function noteView(n: SupervisorNote): { at: number; from: 'supervisor' | 'worker'; text: string } {
   return { at: n.at, from: n.from, text: replyLine(n.text, 300) }
 }
 
@@ -1129,6 +1173,15 @@ async function stepAdvisor(proj: ProjectTick): Promise<void> {
         view.advisor = advisor
         const needs = advisorAttention(repoKey, advisor)
         if (needs) board.attention.push(needs)
+      }
+      // The advisor stored them (or answered that it cannot): no longer pending. A step that threw
+      // leaves them pending for the next tick, and the advisor's own record keeps one taken twice
+      // from running twice.
+      if (proj.questions.length > 0) {
+        const key = mailKey(repoKey)
+        const state = loadMailState(await deps.store.get(key))
+        const next = takenQuestions(state, proj.questions.map((q) => q.id))
+        if (next.pending.length !== state.pending.length) await deps.store.set(key, next as unknown as JsonValue)
       }
     } catch (error) {
       view.errors.push(`Advisor: ${(error as Error).message}`)
@@ -1443,7 +1496,8 @@ async function planFor(proj: ProjectTick, item: TickItem, owner: Owner | null): 
   const p = plan({
     pr: snap,
     owner,
-    ledger: item.ledger,
+    // A red base is one problem for the whole repository: every PR reads its one escalation.
+    ledger: withRepoEscalations(item.ledger, proj.repoEscalations),
     config,
     supervisor,
     mergeSlotFree: !mergeBusy.has(snap.baseRef),
@@ -1492,19 +1546,22 @@ async function act(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Pl
       return { ok: false, error: (error as Error).message }
     }
   }
+  /** Records a step done: on the PR's ledger, or, for a repository-wide escalation, once for the project. */
+  const remember = async (a: Action, l: PrLedger): Promise<PrLedger> => {
+    if (a.kind !== 'escalate' || !repoWide(a.key)) return record(l, a, now)
+    await saveRepoEscalations(proj, { ...proj.repoEscalations, [a.key]: { to: a.to, at: now, reason: a.reason } })
+    return l
+  }
   for (const action of p.actions) {
     if (action.kind === 'merge') mergeBusy.add(snap.baseRef)
     if (action.kind === 'start-review') proj.runningReviews++
     if (!acting) continue
     // The pause switch is honoured between actions, not only between ticks.
     if (opts.stillOn && !(await opts.stillOn().catch(() => false))) break
-    // A red base is one problem per repository: escalate it once, not once per ready PR.
-    const escKey = action.kind === 'escalate' ? action.key : null
-    const baseRedKey = escKey?.startsWith('base-red:') ? `base-red:${repoKey}` : null
-    if (baseRedKey && (await deps.store.get(baseRedKey)) === escKey) {
-      ledger = record(ledger, action, now)
-      continue
-    }
+    // A red base is one problem for the whole repository: escalated once, by the first PR that
+    // meets it, and kept once for all of them (ledger.ts repoWide).
+    const shared = action.kind === 'escalate' && repoWide(action.key)
+    if (shared && proj.repoEscalations[action.key]) continue
     const outcome = await run1(action)
     if (outcome.ok) {
       // What went to an agent is kept with its id, so a reply in its thread finds this PR (mailbox.ts).
@@ -1514,12 +1571,11 @@ async function act(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Pl
           number: snap.number, ...(action.kind === 'escalate' ? { key: action.key } : {})
         }).catch(() => {})
       }
-      ledger = record(ledger, action, now)
+      ledger = await remember(action, ledger)
       marks.push(markFor(action, now, kind))
       logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
       // Saved after each success, so a later failure in this tick cannot make it run twice.
       await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
-      if (baseRedKey && escKey) await deps.store.set(baseRedKey, escKey)
       continue
     }
     if (outcome.skipped) continue
@@ -1542,7 +1598,7 @@ async function act(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Pl
       const human: Action = { kind: 'escalate', to: 'human', key: action.key.replace(/:supervisor$/, ':human'), reason: `${action.reason} (the supervisor could not be reached)`, address: null }
       const told = await run1(human)
       if (told.ok) {
-        ledger = record(record(ledger, action, now), human, now)
+        ledger = await remember(human, await remember(action, ledger))
         marks.push(markFor(human, now, kind))
         logged.push(logEntry(human, told, now, kind, describe(human, kind)))
         await deps.store.set(ledgerKey(repoKey, snap.number), ledger as unknown as JsonValue)
@@ -1614,7 +1670,7 @@ async function writeTrack(proj: ProjectTick, item: TickItem, owner: Owner | null
       failing: snap.checks.filter((c) => c.state === 'failure').map((c) => c.name),
       openThreads: actionableThreads(snap).length,
       ...(ledger.stack && snap.state === 'OPEN' && snap.baseRef === ledger.stack.headRef ? { stackedOn: ledger.stack.number } : {}),
-      ...(ledger.notes?.length ? { note: noteView(ledger.notes[ledger.notes.length - 1]) } : {})
+      ...(currentNote(ledger, snap.headSha, now) ? { note: noteView(currentNote(ledger, snap.headSha, now)!) } : {})
     },
     owner: owner ? { agent: owner.agent, model: owner.model, activity: owner.activity, supervised: owner.address !== null } : null,
     lane: p.lane,
