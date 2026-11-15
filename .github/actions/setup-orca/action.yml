@@ -33,7 +33,14 @@ runs:
             sha512=$(node -p "require('./package.json').config.orcaDebSha512")
             ;;
           newest)
-            version=$(gh release view --repo stablyai/orca --json tagName --jq '.tagName | ltrimstr("v")')
+            # The newest desktop release: Orca's repository also publishes mobile releases, whose
+            # tags are not vX.Y.Z and whose assets hold no .deb.
+            version=$(gh release list --repo stablyai/orca --exclude-pre-releases --exclude-drafts --limit 30 --json tagName \
+              --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tagName | ltrimstr("v")')
+            if [ -z "$version" ]; then
+              echo "::error::no vX.Y.Z release of Orca among the newest 30"
+              exit 1
+            fi
             # A release that is not out yet cannot be pinned: its hash comes from the release's own
             # latest-linux.yml, which catches a broken download, not a changed release.
             sha512=$(gh release download "v$version" --repo stablyai/orca --pattern latest-linux.yml --output - |

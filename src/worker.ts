@@ -135,7 +135,7 @@ import { createLockdown } from './lockdown.ts'
 
 const DISK_FULL = 'The disk is full:'
 /** The Orca release Matriarch is built and tested against (package.json's config.orcaVersion). */
-export const TESTED_ORCA = '1.4.257'
+export const TESTED_ORCA = '1.4.259'
 export const PLUGIN_VERSION = '0.1.0'
 
 let stop: (() => void) | null = null

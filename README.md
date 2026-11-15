@@ -41,7 +41,7 @@ never answers an agent's permission prompt for you: those show as **Needs you**.
 
 ## Requirements
 
-- Orca **1.4.257** or newer, with orchestration turned on (Settings → Experimental), so the
+- Orca **1.4.259** or newer, with orchestration turned on (Settings → Experimental), so the
   supervisor can start and message workers.
 - For projects on GitHub: the GitHub CLI, `gh`, signed in. Only github.com (not GitHub Enterprise).
 - **Experimental:** for projects on GitLab, gitlab.com or self-hosted: the GitLab CLI, `glab`,
@@ -525,10 +525,12 @@ with it. No issue text is stored.
     (which needs one recent enough to have the GraphQL fields Matriarch reads; DESIGN.md lists
     them). Nor have the GitLab calls of the options above: the issue list and label checks,
     merge request diffs, moving a merge request's target branch, job retries and merge bases.
-- The [options](#options) and the [worker and disk limits](#worker-and-disk-limits) are new: so
-  far they have run only in Matriarch's tests, against stand-ins for Orca, GitHub and GitLab, not
-  on a real project or a live Orca. The mailbox's shapes (each message's sender, its thread, the
-  id a send answers) were read from a live Orca 1.4.257.
+- Not all of the new [options](#options) have run on a real project yet. On Orca 1.4.259 and a
+  real GitHub project, Matriarch has read its mailbox and acted on the supervisor's replies,
+  offered the advisor, kept each PR's activity log, and sent away alerts (to a local test
+  receiver). Not yet seen live: the advisor answering a question, stacked PRs, flaky re-runs,
+  light review, issues as objectives, and a worker stopped or refused over a limit. Everything on
+  GitLab is untested on a real instance. DESIGN.md lists exactly what ran where.
 - Mail sent to Matriarch's mailbox while its terminal is closed is lost: Orca keeps it, but
   answers nothing for a terminal that is gone. Matriarch makes a new mailbox and tells the
   supervisor the new address; a reply to a message sent from the old one is lost the same way.
@@ -540,7 +542,7 @@ with it. No issue text is stored.
 - Read-only reviewers and advisor on Claude Code and Codex only.
 - The worker-start refusal works only for Claude Code in a terminal; every other case relies on
   stopping the worker after it started.
-- It relies on Orca's orchestration behaving as it does in 1.4.257, and on the files above.
+- It relies on Orca's orchestration behaving as it does in 1.4.259, and on the files above.
   Settings says when you run a different Orca.
 - Orca tells plugins only a workspace's name and branch, so when two projects' own checkouts are
   both "main" with no terminal open, the panel asks you to pick the project.

@@ -13,9 +13,10 @@ It can run unattended.
 
 Status: the engine, timeline, review crew and supervisor have run on a real project (see
 [Tuned after the first long run](#tuned-after-the-first-long-run-on-a-real-project-2026-11-12)).
-What came after that run (stacked PRs, flaky re-runs, light review, the activity log, away
-alerts, worker limits, issues as objectives and the advisor) is built and tested offline only.
-See [Roadmap](#roadmap).
+Of what came after that run, the mailbox, the activity log and away alerts have run live too;
+stacked PRs, flaky re-runs, light review, worker limits, issues as objectives and the advisor
+answering are built and tested offline only. See [Run live, and not
+yet](#run-live-and-not-yet) and [Roadmap](#roadmap).
 
 ## Goals
 
@@ -1110,31 +1111,41 @@ lockdown was checked live (2026-11-10, Claude Code 2.1.322, Codex 0.167.0):
   minutes.
 - GitLab has no such free check: see [Forges](#forges-github-and-gitlab).
 
-### Not yet run live
+### Run live, and not yet
 
-Everything below is built and covered by tests against stand-ins for Orca, GitHub and GitLab,
-but has not run on a real project or a live Orca yet:
+Run live on Orca 1.4.259 against a real GitHub project (seaway, 2026-11-14 and 15), from the
+plugin's worker:
 
-- **The mailbox.** Read live on Orca 1.4.257 (2026-11-14), from a shell: `check --terminal
-  <mailbox> --peek --full --json` answers `{messages: [{id, run_id, from_handle, to_handle,
-  subject, body, type, thread_id, created_at, …}]}`; `--all` answers the newest 100, read or
-  not; a chat supervisor's replies carry `from_handle: orca_session_id:claude_<id>`, its Run's
-  `run_id` and the answered message's id as `thread_id`; `send --from <mailbox>` answers
-  `{messageId}`; a send with no sender terminal is refused (`no_active_sender_terminal`). Not yet
-  run from the plugin's worker: the reading itself, `inbox --terminal <mailbox>` and `inbox
-  --terminal run:<id>`, a plain `check --full` marking a terminal mailbox's batch read, the
-  learned supervisor answering the advisor end to end, and whether the chat's session id equals
-  the one its launch receipt gave, still after `/clear`.
+- **The mailbox.** `check --terminal <mailbox> --peek --full --json` answers `{messages: [{id,
+  run_id, from_handle, to_handle, subject, body, type, thread_id, created_at, …}]}`, and a plain
+  `check --full` marks that batch read. `inbox --terminal <mailbox>` and `inbox --terminal
+  run:<id>` gave the backfill: fourteen replies the supervisor had written before this build
+  landed on PRs #2, #3, #4, #8, #9 and #10 with their own times, and #4's escalation counted as
+  answered. A chat supervisor's replies carry `from_handle: orca_session_id:claude_<id>`, its
+  Run's `run_id` and the answered message's id as `thread_id`; `send --from <mailbox>` answers
+  `{messageId}`; a send with no sender terminal is refused (`no_active_sender_terminal`).
+  Matriarch learned the supervisor's address from its replies and told it the advisor was
+  available.
+- **Away alerts.** `secrets.protection` is `os-keyring` on macOS; saving a webhook keeps the URL
+  in Orca's secrets and shows only its host; the test alert arrived as JSON and as ntfy plain
+  text (at a local receiver), a `user:pass@` URL arrived as a Basic `Authorization` header, and
+  neither the URL nor the password reached the plugin log.
+- **The activity log, the crew and merges.** PRs #12 to #16 each logged the review round, its
+  verdict, the merge of exactly the reviewed commit and the worktree's cleanup.
+- **GitHub reads.** The list, detail and label-event GraphQL queries and `compare` (ahead,
+  identical, and a commit GitHub does not know).
+
+Not yet run live:
+
+- **The advisor answering** a question end to end, and whether a chat's session id stays the
+  same after `/clear`.
 - **Worker limits.** That `agent.tool.before` never fires for a supervisor in a chat (read from
   Orca's source, above), and that `worker-stop` on a live dispatch stops it and keeps its
   worktree.
-- **Away alerts.** Orca's `secrets` with `secrets.protection` set to `os-keyring`, and a real
-  post to each format.
 - **Stacked PRs, flaky checks, light review and issues** against a real repository: the GitHub
-  calls each makes (`gh pr edit --base`, the job and workflow re-runs, check-run annotations,
-  compare, the issue list and label events, the collaborator permission, issue comments; only the
-  GraphQL queries were run, read-only, against github.com), and the GitLab calls listed under
-  [Forges](#gitlab-through-glab).
+  writes each makes (`gh pr edit --base`, the job and workflow re-runs, issue comments) and the
+  reads not listed above (check-run annotations, the issue list, the collaborator permission),
+  and every GitLab call listed under [Forges](#gitlab-through-glab).
 - **The activity log and the Alerts page** on screen inside Orca, rather than in the preview.
 
 ## Roadmap
@@ -1147,12 +1158,13 @@ but has not run on a real project or a live Orca yet:
    verdict parsing, aggregation by policy, publishing, prompt detection, on-demand rounds, and
    reviewers locked down at launch by their own agent. Not built yet: the arbiter.
 4. **Supervisor (built, live):** the brief, finding its Run, escalations, worker settings and
-   limits told to a running supervisor. Built, offline only: the advisor, issues as objectives,
-   and worker limits.
+   limits told to a running supervisor, and its replies read from Matriarch's mailbox. Built,
+   offline only: the advisor answering, issues as objectives, and stopping or refusing a worker
+   over a limit.
 5. **Merge train (built):** auto merge pinned to the reviewed commit, branch updates, the
    base-red pause, cleanup after a merge, and stacked PRs (offline only). Next: merge queues, and
    `onBaseRed: "revert"` opening the revert PR itself.
-6. **Seeing the work (built):** timeline, board, Needs you, the activity log and away alerts (the
-   last two offline only).
+6. **Seeing the work (built, live):** timeline, board, Needs you, the activity log and away
+   alerts.
 7. **Next:** run every offline-only part on a real project and a live Orca, then publish to the
    community catalog.
