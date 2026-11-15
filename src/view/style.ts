@@ -61,6 +61,7 @@ a:hover { text-decoration: underline; }
 .sup { border: 1px solid var(--orca-border); border-radius: var(--orca-radius, 6px); padding: 6px 8px; background: var(--orca-card); display: flex; flex-direction: column; gap: 4px; }
 .sup-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .sup-head .spacer { flex: 1; }
+.sup-actions { display: inline-flex; gap: 6px; margin-left: auto; }
 .sup summary { cursor: pointer; color: var(--m-blue); }
 .sup-hint { color: var(--m-fixing); font-size: 11px; min-height: 0; }
 .sup-advisor { font-size: 11px; overflow-wrap: anywhere; }
@@ -78,6 +79,8 @@ a:hover { text-decoration: underline; }
 .projects { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; border-bottom: 1px solid var(--orca-border); padding-bottom: 8px; }
 .project-chip { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 2px 10px; }
 .project-chip .muted { font-size: 11px; }
+/* A button that shows a status dot before its label, spaced as a project chip's. */
+.with-dot { display: inline-flex; align-items: center; gap: 5px; }
 .project-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
 .project-head .spacer { flex: 1; }
 .path { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

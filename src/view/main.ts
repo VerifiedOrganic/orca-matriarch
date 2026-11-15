@@ -257,7 +257,7 @@ function projectBar(b: Board, page: Page): HTMLElement {
       : null,
     el('button', { class: page.kind === 'add' ? 'project-chip' : 'ghost', 'aria-pressed': page.kind === 'add' ? 'true' : 'false', onclick: () => go({ kind: 'add' }) }, '+ Add project'),
     el('button', {
-      class: page.kind === 'alerts' ? 'project-chip' : 'ghost',
+      class: page.kind === 'alerts' ? 'project-chip' : 'ghost with-dot',
       'aria-pressed': page.kind === 'alerts' ? 'true' : 'false',
       title: state.alertsOn ? `Away alerts go to ${state.alertsOn}` : 'Send what needs you to Slack, Discord, ntfy or a webhook, for when you are away',
       onclick: () => go({ kind: 'alerts' })
@@ -647,8 +647,7 @@ export function issuesLine(r: RepoView): string | null {
   const refused = i?.refused ?? []
   if (!i || (i.taken.length === 0 && i.waiting.length === 0 && refused.length === 0)) return null
   const list = (ns: number[]) => ns.map((n) => `#${n}`).join(', ')
-  return [
-    `Issues labeled ${i.label}:`,
+  return `Issues labeled ${i.label}: ` + [
     i.taken.length ? `${i.taken.length} taken (${list(i.taken)})` : null,
     i.waiting.length ? `${i.waiting.length} waiting (${list(i.waiting)})` : null,
     i.held ? `holding ${list(i.next)}: ${i.held}` : i.next.length ? `would hand ${list(i.next)} to the supervisor` : null,
@@ -710,20 +709,21 @@ function supervisorCard(r: RepoView): HTMLElement {
       el('b', {}, 'Supervisor'),
       el('span', { class: `badge badge-${phase}` }, badge),
       el('span', { class: 'muted' }, who),
-      phase === 'running' ? el('span', { class: 'muted', title: `${s.workers} worker${s.workers === 1 ? '' : 's'} in its Run in all` }, `· ${workerCount(s)}`) : null,
       el('span', { class: 'spacer' }),
-      phase === 'idle'
-        ? el('button', { class: 'primary', disabled: state.busy || r.empty === true, title: r.empty ? `Push a first commit to ${forgeOf(r)} first` : 'Opens a briefed chat; nothing starts until you agree a plan there', onclick: openChat }, 'Open supervisor chat')
-        : el('button', { class: 'primary', onclick: reopen }, 'Open'),
-      phase === 'idle' ? null : el('button', { class: 'ghost', disabled: state.busy, title: 'Start a fresh supervisor chat; Matriarch links the new one instead', onclick: openChat }, 'New chat')),
+      // The buttons wrap together, so a narrow sidebar never leaves one alone on a line.
+      el('span', { class: 'sup-actions' },
+        phase === 'idle'
+          ? el('button', { class: 'primary', disabled: state.busy || r.empty === true, title: r.empty ? `Push a first commit to ${forgeOf(r)} first` : 'Opens a briefed chat; nothing starts until you agree a plan there', onclick: openChat }, 'Open supervisor chat')
+          : el('button', { class: 'primary', onclick: reopen }, 'Open'),
+        phase === 'idle' ? null : el('button', { class: 'ghost', disabled: state.busy, title: 'Start a fresh supervisor chat; Matriarch links the new one instead', onclick: openChat }, 'New chat'))),
     el('div', { class: 'muted' },
       r.empty
-        ? `This project has no commits on ${forgeOf(r)} yet. Push a first commit to main, then start the supervisor.`
+        ? `This project has no commits on ${forgeOf(r)} yet. Push a first commit to its default branch, then start the supervisor.`
         : phase === 'idle'
           ? 'Tell it what to build in its chat. It proposes a plan and starts workers only after you agree. Each worker opens a PR, and Matriarch takes it from there.'
           : phase === 'starting'
             ? 'Talk to it in its chat. Matriarch links it here once you agree a plan and it creates its orchestration Run.'
-            : `Running in ${s.run}. Its workers show below as worktrees, then as PRs.`),
+            : el('span', {}, `Running in ${s.run}: `, el('span', { title: `${s.workers} worker${s.workers === 1 ? '' : 's'} in its Run in all` }, workerCount(s)), '. Its workers show below as worktrees, then as PRs.')),
     issuesLine(r) ? el('div', { class: 'muted sup-issues' }, issuesLine(r)) : null,
     r.advisor ? advisorLine(r.advisor) : null,
     error ? el('div', { class: 'sup-hint' }, error) : null

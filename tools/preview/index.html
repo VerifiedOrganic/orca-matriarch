@@ -96,10 +96,12 @@
     escalation: { supervisorFirst: true, humanAfterMinutes: 30 }, limits: { maxConcurrentReviews: 2, maxWorkers: 4, maxWorkerStartsPerDay: 0, minFreeDiskGB: 10 },
     issues: { enabled: true, label: 'matriarch', comment: false }
   }
+  // Model names as Orca lists them for each agent, as Settings shows them.
+  const NAMES = { 'claude-opus-5-5': 'Claude Opus 5.5', 'claude-sonnet-5-5': 'Claude Sonnet 5.5', 'claude-haiku-5-5': 'Claude Haiku 5.5', 'claude-fable-5-2': 'Claude Fable 5.2', 'gpt-6-astra': 'GPT-6 Astra' }
   const agent = (id, label, installed, lockable, models, efforts) => ({ id, label, installed, lockable, takesModel: true, efforts, defaultModel: models[0] ?? null, defaultEffort: null,
-    models: models.map((m) => ({ id: m, label: m, efforts })) })
+    models: models.map((m) => ({ id: m, label: NAMES[m] ?? m, efforts })) })
   const agents = [
-    agent('claude', 'Claude Code', true, true, ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'], ['low', 'medium', 'high', 'xhigh', 'max']),
+    agent('claude', 'Claude Code', true, true, ['claude-opus-5-5', 'claude-fable-5-2', 'claude-sonnet-5-5', 'claude-haiku-5-5'], ['low', 'medium', 'high', 'xhigh', 'max']),
     agent('codex', 'Codex', true, true, ['gpt-6-astra'], ['low', 'medium', 'high', 'xhigh']),
     { id: 'opencode', label: 'OpenCode', installed: true, lockable: false, takesModel: true, efforts: [], defaultModel: null, defaultEffort: null,
       models: [
@@ -113,7 +115,7 @@
   const projects = [
     { root: '/src/app', name: 'app', repo: 'acme/app', enabled: true, problem: null },
     { root: '/src/infra', name: 'infra', repo: 'acme/infra', enabled: true, problem: null },
-    { root: '/src/docs', name: 'docs', repo: 'acme/docs', enabled: false, problem: 'It has no commits yet. Commit and push a first version to main before starting a supervisor.' },
+    { root: '/src/docs', name: 'docs', repo: 'acme/docs', enabled: false, problem: 'It has no commits yet. Commit and push a first version to its default branch before starting a supervisor.' },
     { root: '/src/notes', name: 'notes', repo: null, enabled: false, problem: 'Its origin is not on GitHub, so Matriarch cannot follow its pull requests.' }
   ]
   // ?clean=1: no sample warnings, and the focused project is known (for screenshots).
@@ -167,9 +169,12 @@
   if (params.get('page') === 'settings' || params.get('page') === 'picker') setTimeout(() => click('Settings'), 200)
   if (params.get('page') === 'picker') setTimeout(() => {
     const select = [...document.querySelectorAll('.role select')].find((x) => x.value === 'codex')
+    const card = select.closest('.role')
     select.value = 'opencode'; select.dispatchEvent(new Event('change'))
     setTimeout(() => {
-      document.querySelectorAll('.picker-button')[1]?.click()
+      // Settings redraws on the change: find the same card again by its agent.
+      const again = [...document.querySelectorAll('.role')].find((r) => [...r.querySelectorAll('select')].some((x) => x.value === 'opencode')) ?? card
+      again.querySelector('.picker-button')?.click()
       setTimeout(() => { const q = document.querySelector('.picker-search'); if (q && params.get('q')) { q.value = params.get('q'); q.dispatchEvent(new Event('input')) } }, 100)
     }, 100)
   }, 400)

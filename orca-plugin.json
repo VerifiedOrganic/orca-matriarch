@@ -17,17 +17,17 @@
   "screenshots": [
     {
       "path": "assets/screenshot-1.png",
-      "alt": "The timeline across two projects: a row per worktree or PR, colored by state, under a strip counting what ran at once.",
-      "caption": "Every PR from first commit to merge, across your projects, on one timeline."
+      "alt": "The timeline across two projects, with one PR's log open: each lane it entered and why, each message, and the supervisor's reply.",
+      "caption": "Every PR on one timeline, and for each one, what Matriarch did and why."
     },
     {
       "path": "assets/screenshot-2.png",
-      "alt": "The board: PR cards grouped by state, with the agent and model on each, CI, rounds used, and what dry run would do next.",
+      "alt": "The board: PR cards grouped by state, with the agent and model, CI, rounds used, the supervisor's latest reply, and what dry run would do next.",
       "caption": "The board shows what each PR waits on, and in dry run what Matriarch would do next."
     },
     {
       "path": "assets/screenshot-3.png",
-      "alt": "The sidebar beside its settings: supervisor, workers and a review crew, each with its own agent, model and effort.",
+      "alt": "The sidebar beside its settings: supervisor, advisor, workers and a review crew, each with its own agent, model and effort.",
       "caption": "Pick each role's agent, model and effort in Settings: no config files to edit."
     }
   ],

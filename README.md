@@ -104,7 +104,7 @@ Matriarch manages only PRs you opened from a branch that belongs to an Orca work
 
 ## What you see
 
-![The board: PR cards grouped by state, each with its agent and model, CI, rounds used, and what dry run would do next.](docs/board.png)
+![The timeline across two projects, with one PR's log open: each lane it entered and why, each message, and the supervisor's reply.](docs/timeline.png)
 
 - **Projects:** a chip per project, **All** for every project on one timeline, and **+ Add
   project**. The panel follows the workspace you focus in Orca.
@@ -113,14 +113,14 @@ Matriarch manages only PRs you opened from a branch that belongs to an Orca work
   Worktrees with no PR and nothing running fold into one line.
 - **Board:** cards by state with the agent and model, CI, comments and rounds used, the
   supervisor's latest reply about the PR since its last push, and in dry run what Matriarch
-  would do next. **Run AI
-  review now** on any card runs the crew on that commit, in dry run too.
+  would do next. **Run AI review now** on any card runs the crew on that commit, in dry run too.
 - **What Matriarch did:** click a timeline row, or open **What Matriarch did** on a card, for
-  that PR's log, newest first: each lane it entered and why, new commits, finished reviews, and
+  that PR's log, newest first: each lane it entered and why, new commits, finished reviews,
   every message it sent (to the worker, the supervisor or you, with its subject) and each reply
-  to one, branch update, merge and cleanup, including what failed and why. It holds only what Matriarch did; dry run's
-  plans stay in **Would do next**. An action that fails on every poll is one line with a count
-  (`×12, last 14:05`), and each PR keeps its own log. Kept for a week.
+  to one, branch updates, the merge and the cleanup, including what failed and why. It holds
+  only what Matriarch did; dry run's plans stay in **Would do next**. An action that fails on
+  every poll is one line with a count (`×12, last 14:05`), and each PR keeps its own log. Kept
+  for a week.
 - **Supervisor:** each project's chat, with the Run it coordinates, how many of its workers are
   running against the project's limit, the labeled issues it took or that wait, and its advisor:
   the question it is answering, or the last one it answered.
@@ -130,6 +130,8 @@ Matriarch manages only PRs you opened from a branch that belongs to an Orca work
   same at a glance. Each also reaches you as an Orca notification, and by
   [away alert](#away-alerts) when you set one: once while it stands, under autopilot.
 - **Full tab:** tab bar **+** → **Matriarch board**.
+
+![The board: PR cards grouped by state, each with its agent and model, CI, rounds used, the supervisor's latest reply, and what dry run would do next.](docs/board.png)
 
 ## Options
 
@@ -586,11 +588,21 @@ is, a listed version never changes, and its tag cannot be moved.
 
 ### Screenshots and listing art
 
-`docs/*.png` and `assets/screenshot-1.png`, `-2.png` are the panel drawn by `pnpm preview` with
-`?clean=1` (no sample warnings): `?width=400` for the sidebar, `?view=board`, `?page=all`,
-`?page=settings`. `assets/icon.png` (256×256), `assets/cover.png` (1600×1000) and
-`assets/screenshot-3.png` (1280×800) are drawn from `art/*.html`: open each at that size and save
-it as PNG. The plugin page shows only the middle band of the cover (about y 380 to 620), so the
+`docs/*.png` and `assets/screenshot-1.png`, `-2.png` are the panel drawn by `pnpm preview`, always
+with `?clean=1` (no sample warnings):
+
+| Image | Query | Window |
+| --- | --- | --- |
+| `docs/timeline.png`, `assets/screenshot-1.png` | `&page=all&log=1` | 1280×800 |
+| `docs/board.png` | `&view=board` | 1280×780 |
+| `assets/screenshot-2.png` | `&view=board` | 1280×800 |
+| `docs/sidebar.png` | `&width=400` | 400×712 at 2× |
+| `docs/settings.png` | `&width=400&page=settings` | 400×1060 at 2× |
+| `docs/picker.png` | `&width=400&page=picker&q=deep` | 400×1400 at 2×, cropped to 800×1240 from y 1020 |
+
+`assets/icon.png` (256×256), `assets/cover.png` (1600×1000) and `assets/screenshot-3.png`
+(1280×800) are drawn from `art/*.html` (the cover and `screenshot-3` show `docs/sidebar.png` and
+`docs/settings.png`, so take those first): open each at that size and save it as PNG. The plugin page shows only the middle band of the cover (about y 380 to 620), so the
 name and tagline stay inside it.
 
 ## License
