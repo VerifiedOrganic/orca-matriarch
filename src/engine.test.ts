@@ -4,8 +4,10 @@ import { ATTENTION_CLEAR_MS, diskAttention, FINISHED_GRACE_MS, SHOW_CLOSED_MS, t
 import type { Executor } from './executor.ts'
 import type { GitHub, PrSnapshot } from './github.ts'
 import { ledgerKey } from './ledger.ts'
+import type { WorkerRow } from './orca-cli.ts'
 import type { Action } from './plan.ts'
 import { check, pr, SHA } from './testing/fixtures.ts'
+import { ActivityTracker } from './worker.ts'
 
 const T0 = 1_800_000_000_000
 
@@ -228,6 +230,72 @@ describe('what counts as needing you before a PR', () => {
   test('a prompt needs you only once nobody answered it for a while', async () => {
     assert.equal(await lanes('blocked', 30_000, true), 'building')
     assert.equal(await lanes('blocked', 10 * 60_000, true), 'needs-you')
+  })
+})
+
+describe('an agent whose worker Orca saw exit', () => {
+  // Seen live: a worker stopped over a limit never said it was done, so its pane read "working"
+  // for a day, and the PR a later worker opened and finished in the same worktree sat in Working.
+  const row = (dispatchId: string, terminal: string, over: Partial<WorkerRow> = {}): WorkerRow =>
+    ({ dispatchId, worktreeId: 'ws-login', taskId: 't1', runId: 'r1', agent: 'codex', model: null, state: 'running', live: true, liveness: 'live', terminal, ...over })
+  const exited = (state: string): Partial<WorkerRow> => ({ state, live: false, liveness: 'exited' })
+  /** The engine with the worker's own ActivityTracker behind `activity`. */
+  const setup = (prs: PrSnapshot[], workers: () => WorkerRow[], workspaces?: Workspace[]) => {
+    const h = harness(prs, { workspaces })
+    const panes = new ActivityTracker()
+    const asked: (ReadonlySet<string> | undefined)[] = []
+    h.deps.activity = (id, path, gone) => (asked.push(gone), panes.forWorkspace(id, h.deps.now(), path, gone))
+    h.deps.workers = async () => workers()
+    return { h, panes, asked }
+  }
+  const track = async (deps: EngineDeps, key: string, autopilot = false) => (await tick(deps, { autopilot })).tracks.find((t) => t.key === key)!
+
+  test('no longer holds the PR a later worker finished in the same worktree', async () => {
+    let rows = [row('d-stopped', 'term_stopped')]
+    const { h, panes } = setup([pr({ number: 19 })], () => rows)
+    panes.note('pane-1', 'ws-login', 'working', T0 - 30 * 60_000, 'term_stopped')
+    assert.equal((await track(h.deps, 'ws-login')).lane, 'working', 'while it runs, its turn holds the PR')
+    // Stopped, it never says it is done; the supervisor starts another worker there, which finishes.
+    panes.note('pane-2', 'ws-login', 'working', T0 - 20 * 60_000, 'term_next')
+    panes.note('pane-2', 'ws-login', 'done', T0 - 5 * 60_000, 'term_next')
+    rows = [row('d-next', 'term_next', exited('succeeded')), row('d-stopped', 'term_stopped', exited('stopped'))]
+    const t = await track(h.deps, 'ws-login')
+    assert.equal(t.lane, 'ready')
+    assert.equal(t.owner?.activity, 'done')
+  })
+
+  test('still counts while a worker Orca does not call exited runs in that terminal', async () => {
+    for (const liveness of ['live', 'unverifiable', null]) {
+      const rows = [row('d-again', 'term_shared', { liveness, live: liveness !== 'unverifiable' }), row('d-before', 'term_shared', exited('succeeded'))]
+      const { h, panes } = setup([pr({ number: 19 })], () => rows)
+      panes.note('pane-1', 'ws-login', 'working', T0 - 60_000, 'term_shared')
+      assert.equal((await track(h.deps, 'ws-login')).lane, 'working', `a worker ${liveness ?? 'Orca says nothing of'} runs there`)
+    }
+  })
+
+  test("takes each agent at its word while Orca's worker list cannot be read", async () => {
+    const { h, panes, asked } = setup([pr({ number: 19 })], () => {
+      throw new Error('runtime_unavailable')
+    })
+    panes.note('pane-1', 'ws-login', 'working', T0 - 60_000, 'term_stopped')
+    assert.equal((await track(h.deps, 'ws-login')).lane, 'working')
+    assert.ok(asked.length > 0 && asked.every((gone) => gone === undefined))
+  })
+
+  test('leaves a worktree with no PR idle, so its cleanup goes ahead', async () => {
+    const gate: Workspace = { id: 'ws-gate', kind: 'worktree', name: 'gate', path: '/r/wt/gate', branch: null, hostId: null }
+    let rows = [row('d-gate', 'term_gate', { worktreeId: 'ws-gate' })]
+    const { h, panes } = setup([], () => rows, [gate])
+    const removed: string[] = []
+    h.deps.removeWorktree = async (path) => (removed.push(path), { removed: true })
+    panes.note('pane-1', 'ws-gate', 'working', T0 - 60_000, 'term_gate')
+    assert.equal((await track(h.deps, 'ws-gate', true)).lane, 'building')
+    // Its agent crashed mid-turn: Orca saw it exit, and its pane still says working.
+    rows = [row('d-gate', 'term_gate', { worktreeId: 'ws-gate', ...exited('failed') })]
+    assert.equal((await track(h.deps, 'ws-gate', true)).lane, 'idle')
+    h.advance(FINISHED_GRACE_MS)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(removed, ['/r/wt/gate'])
   })
 })
 

@@ -537,11 +537,11 @@ with it. No issue text is stored.
     merge request diffs, moving a merge request's target branch, job retries and merge bases.
 - Not all of the new [options](#options) have run on a real project yet. On Orca 1.4.259 and a
   real GitHub project, Matriarch has read its mailbox and acted on the supervisor's replies,
-  had the advisor answer the supervisor, stopped workers started over the disk floor, kept each
-  PR's activity log, and sent away alerts (to a local test receiver). Not yet seen live: stacked
-  PRs, flaky re-runs, light review, issues as objectives, and a worker start refused before it
-  runs. Everything on GitLab is untested on a real instance. DESIGN.md lists exactly what ran
-  where.
+  had the advisor answer the supervisor, stopped workers started over the disk floor, moved and
+  rebased a stacked PR once its parent merged, kept each PR's activity log, and sent away alerts
+  (to a local test receiver). Not yet seen live: flaky re-runs, light review, issues as
+  objectives, and a worker start refused before it runs. Everything on GitLab is untested on a
+  real instance. DESIGN.md lists exactly what ran where.
 - Mail sent to Matriarch's mailbox while its terminal is closed is lost: Orca keeps it, but
   answers nothing for a terminal that is gone. Matriarch makes a new mailbox and tells the
   supervisor the new address; a reply to a message sent from the old one is lost the same way.

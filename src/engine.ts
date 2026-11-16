@@ -69,8 +69,11 @@ export interface EngineDeps {
   /** Reads projects on GitLab; absent where there are none (tests of GitHub). */
   gitlab?: ForgeReader | null
   workers(): Promise<WorkerRow[]>
-  /** What agents in a workspace are doing; `path` also matches Orca's `<repoId>::<path>` ids. */
-  activity(workspaceId: string, path?: string): ActivityInfo | null
+  /**
+   * What agents in a workspace are doing; `path` also matches Orca's `<repoId>::<path>` ids. An
+   * agent in one of the `exited` terminals (exitedTerminals) is done, whatever it last said.
+   */
+  activity(workspaceId: string, path?: string, exited?: ReadonlySet<string>): ActivityInfo | null
   /** The supervisor's Run mailbox for a repository (`run:<id>`), if one is known. */
   supervisor(repo: string): Promise<string | null>
   /** The id of the orchestration Run whose objective carries this tag. */
@@ -723,6 +726,29 @@ async function indexWorkers(deps: EngineDeps, board: Board): Promise<Pick<TickCo
   return { workers, ownersKnown, workersAt, byWorktree }
 }
 
+/**
+ * The terminals of workers Orca saw exit that no other worker it lists still runs in (a handle
+ * may be handed on). An agent that was stopped or crashed never says it is done, so its pane's
+ * last "working" would stand for a day, holding its worktree's PR in Working even after a later
+ * worker there finished. Read from the rows as they stand: a worker stopped this tick is exited.
+ */
+function exitedTerminals(workers: readonly WorkerRow[]): Set<string> {
+  const exited = new Set<string>()
+  const running = new Set<string>()
+  // Only Orca's word counts: a worker it cannot vouch for (`unverifiable`, or not said) may still run.
+  for (const w of workers) if (w.terminal) (w.liveness === 'exited' ? exited : running).add(w.terminal)
+  for (const t of running) exited.delete(t)
+  return exited
+}
+
+/**
+ * What the agents in a worktree are doing, an agent of a worker Orca saw exit being done. While the
+ * worker list could not be read, each agent is taken at its word.
+ */
+function activityOf(t: TickContext, ws: Workspace): ActivityInfo | null {
+  return t.deps.activity(ws.id, ws.path, t.ownersKnown ? exitedTerminals(t.workers) : undefined)
+}
+
 /** One project's whole part of the tick, in order. */
 async function tickProject(t: TickContext, repoKey: string, info: RepoInfo, repoWorkspaces: Workspace[]): Promise<void> {
   const cfg = await readProjectConfig(t, repoKey, info)
@@ -1372,7 +1398,7 @@ async function cleanupMergedWorktrees(proj: ProjectTick): Promise<void> {
       const ws = repoWorkspaces.find((w) => w.path === c.path)
       if (!ws || ws.path === info.root || now - c.at > CLEANUP_GIVE_UP_MS) continue
       const owner = byWorktree.get(ws)
-      const act = deps.activity(ws.id, ws.path)
+      const act = activityOf(proj.t, ws)
       if ((owner && owner.live !== false) || agentBusy(act)) {
         still.push({ ...c, kept: 'an agent is still running there' })
         continue
@@ -1413,7 +1439,7 @@ async function cleanupFinishedWorktrees(proj: ProjectTick): Promise<void> {
       if (ws.path === info.root || merging.has(ws.path) || prBranches.has(branchName(ws.branch) ?? '') || stoppedWorktrees[ws.path]) continue
       const row = byWorktree.get(ws)
       if (!row?.runId || `run:${row.runId}` !== supervisor || row.live !== false) continue
-      const act = deps.activity(ws.id, ws.path)
+      const act = activityOf(proj.t, ws)
       if (agentBusy(act)) continue
       const since = seen[ws.path] ?? now
       if (now - since < FINISHED_GRACE_MS) {
@@ -1460,9 +1486,9 @@ type CrewRun = Awaited<ReturnType<Crew['get']>>
 
 /** One PR's turn: its ledger brought up to date, planned, acted on under autopilot, and its track written. */
 async function planAndAct(proj: ProjectTick, item: TickItem): Promise<void> {
-  const { deps, byWorktree } = proj.t
+  const { byWorktree } = proj.t
   const ws = item.ws
-  const owner = ws ? ownerFor(ws, byWorktree.get(ws), deps.activity(ws.id, ws.path)) : null
+  const owner = ws ? ownerFor(ws, byWorktree.get(ws), activityOf(proj.t, ws)) : null
   await refreshLedger(proj, item, owner)
   const { p, run } = await planFor(proj, item, owner)
   const done = await act(proj, item, owner, p)
@@ -1855,7 +1881,7 @@ async function worktreeTracks(proj: ProjectTick): Promise<void> {
       })
       continue
     }
-    const act = deps.activity(ws.id, ws.path)
+    const act = activityOf(proj.t, ws)
     const worker = byWorktree.get(ws)
     // Who answers this agent: the supervisor answers its workers, and the supervisor itself (in
     // the project's own checkout) waits between turns by design. So waiting there is not

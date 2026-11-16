@@ -1001,7 +1001,9 @@ documented API, and should be checked again on each new Orca:
   sees a supervisor in a chat.
 - A tool event's `terminalId` is Orca's terminal handle (`getTerminalHandleForPaneKey`), and
   `worker-list --full` rows carry `agentTerminalHandle`: that is how the limits tell the
-  supervisor's and its workers' calls from the person's.
+  supervisor's and its workers' calls from the person's. A status event's `terminalId` is that
+  handle too (the workspace terminal holding its pane; read in Orca 1.4.259's bundle), which is
+  how an agent is tied to a worker Orca saw exit.
 - A message's sender is stored as its caller's address (`from_handle`): `orca_session_id:<id>` for
   a chat, the terminal handle for a terminal agent; `check` takes `--full` like every
   orchestration command (`withFullRecordFlag`).
@@ -1117,6 +1119,20 @@ lockdown was checked live (2026-11-10, Claude Code 2.1.322, Codex 0.167.0):
   `~` to the home folder (Claude's own `Read(./**)` still refused it); now such a path, and an
   absolute or climbing Glob pattern, is refused. A test now checks that every command Claude's
   allowlist lets through passes the guard too.
+- **A parent's branch outlives its merge while PRs are based on it.** Matriarch merged #18 with
+  `gh pr merge --delete-branch`, and GitHub closed #20, which was stacked on it, before Matriarch
+  could move it (its events: `base_ref_deleted`, then `closed`). The branch now stays while any
+  open PR is based on it, and goes once they have moved off it (see [Stacked PRs](#stacked-prs)).
+  #20 was recovered by restoring the branch at #18's head and reopening it; Matriarch then moved
+  it to main, had its worker rebase it, and merged it.
+- **An agent whose worker exited is done.** What a worker was doing came only from its agent's
+  status events, and an agent that is stopped or crashes never sends a last "done". A worker
+  Matriarch stopped over a limit read "working" for a day after, so PR #19, which a later worker
+  opened and finished in the same worktree, sat in Working and its review never started. Each
+  pane now keeps the terminal its events name, and an agent in the terminal of a worker
+  `worker-list` calls `exited` counts as done, unless a worker Orca does not call exited runs in
+  that terminal. While the list cannot be read, and for a pane whose events named no terminal,
+  its last word stands. This holds for PRs, worktrees with no PR and the worktree cleanups alike.
 
 ### Orca 1.4.257 orchestration rules (found on that run, 2026-11-12)
 
@@ -1180,7 +1196,6 @@ plugin's worker:
   verdict, the merge of exactly the reviewed commit and the worktree's cleanup.
 - **GitHub reads.** The list, detail and label-event GraphQL queries and `compare` (ahead,
   identical, and a commit GitHub does not know).
-
 - **The advisor answering.** The supervisor asked about a CI plan; the advisor (Claude on
   Fable 5.2, xhigh) ran read-only (`--permission-mode dontAsk` with the allowlists, `--setting-sources
   user --strict-mcp-config`, no bypass flag) in a throwaway worktree, answered in eight minutes,
@@ -1189,6 +1204,15 @@ plugin's worker:
   the supervisor started next were stopped on the next poll with `worker-stop`, and their
   worktrees kept for their tasks. Told so, the supervisor had space freed, started both again in
   their kept worktrees, and replied; the reply showed in the log.
+- **CI as the gate.** #18, the first seaway PR with checks, waited in `awaiting-ci` until its
+  check passed, and went to review only then; so did each push after a review round.
+- **Stacked PRs.** #20, based on #18's branch, went through CI and review and then waited
+  ("stacked on #18; merges after it") while #18 was open. Once #18 merged (squashed), and after
+  the closed #20 was recovered (see the tuned section above), Matriarch moved it to main with
+  `gh pr edit --base`, `compare` said main lacked the commit #20 was built on, and its worker was
+  asked once to rebase off #18's commits; it pushed only its own two commits, was reviewed again
+  and merged. Deleting a kept branch was run by hand with the calls Matriarch now makes (`gh api
+  …/git/ref/heads/<branch>`, then `-X DELETE …/git/refs/heads/<branch>`), on the restored branch.
 
 Not yet run live:
 
@@ -1198,10 +1222,12 @@ Not yet run live:
 - **The read-back of a long tool output** by a reviewer or the advisor: the live advisor showed
   the guard refusing it; the fix has run only in tests, and a scratch Claude in `dontAsk` mode
   read its own saved output with no permission prompt.
-- **Stacked PRs, flaky checks, light review and issues** against a real repository: the GitHub
-  writes each makes (`gh pr edit --base`, the job and workflow re-runs, issue comments) and the
-  reads not listed above (check-run annotations, the issue list, the collaborator permission),
-  and every GitLab call listed under [Forges](#gitlab-through-glab).
+- **Matriarch keeping and then deleting a parent's branch** by itself, and an agent whose
+  worker exited counting as done: both fixed after that run, and so far run only in tests.
+- **Flaky checks, light review and issues** against a real repository: the GitHub writes each
+  makes (the job and workflow re-runs, issue comments) and the reads not listed above (check-run
+  annotations, the issue list, the collaborator permission), and every GitLab call listed under
+  [Forges](#gitlab-through-glab).
 - **The activity log and the Alerts page** on screen inside Orca, rather than in the preview.
 
 ## Roadmap

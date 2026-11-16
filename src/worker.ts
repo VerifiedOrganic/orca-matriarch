@@ -154,44 +154,71 @@ export function serial(): <T>(fn: () => Promise<T>) => Promise<T> {
 /** Activity older than this is not trusted after a restart: the agent may have moved on. */
 export const ACTIVITY_TRUST_MS = 30 * 60_000
 
+/** What an agent pane last said, as saved across restarts. */
+export interface PaneActivity {
+  workspaceId: string
+  state: Activity
+  at: number
+  /**
+   * The terminal handle its agent runs in (`term_…`), the one `worker-list --full` gives a worker;
+   * absent when no event named it, and in state saved before panes kept it.
+   */
+  terminal?: string
+}
+
 /** Per agent pane state, folded into one activity per workspace. */
 export class ActivityTracker {
-  private panes = new Map<string, { workspaceId: string; state: Activity; at: number; restored?: boolean }>()
+  private panes = new Map<string, PaneActivity & { restored?: boolean }>()
 
-  /** True when something changed (so it is worth saving). */
-  note(paneKey: string, workspaceId: string | null, state: Activity, at: number): boolean {
+  /**
+   * True when something changed (so it is worth saving). An event that names no terminal keeps
+   * the one the pane was heard in before.
+   */
+  note(paneKey: string, workspaceId: string | null, state: Activity, at: number, terminal?: string): boolean {
     if (!workspaceId) return false
     const prev = this.panes.get(paneKey)
-    if (prev && prev.state === state && prev.workspaceId === workspaceId && !prev.restored) return false
-    this.panes.set(paneKey, { workspaceId, state, at })
+    const known = terminal || (prev?.workspaceId === workspaceId ? prev.terminal : undefined)
+    const same = prev !== undefined && prev.state === state && prev.workspaceId === workspaceId && !prev.restored
+    if (same && prev.terminal === known) return false
+    // A state heard again that only names its terminal still began when it was first heard.
+    this.panes.set(paneKey, { workspaceId, state, at: same ? prev.at : at, ...(known ? { terminal: known } : {}) })
     // Panes nobody has heard from in a day are gone.
     for (const [k, p] of this.panes) if (at - p.at > 24 * 3600_000) this.panes.delete(k)
     return true
   }
 
-  serialize(): Record<string, { workspaceId: string; state: Activity; at: number }> {
-    return Object.fromEntries(this.panes)
+  serialize(): Record<string, PaneActivity> {
+    return Object.fromEntries(
+      [...this.panes].map(([k, p]) => [k, { workspaceId: p.workspaceId, state: p.state, at: p.at, ...(p.terminal ? { terminal: p.terminal } : {}) }])
+    )
   }
 
   /** Fills in what an earlier run saw, keeping anything heard since and dropping stale entries. */
   restore(saved: unknown, now: number, trustMs = ACTIVITY_TRUST_MS): void {
     if (typeof saved !== 'object' || saved === null) return
-    for (const [paneKey, v] of Object.entries(saved as Record<string, { workspaceId?: unknown; state?: unknown; at?: unknown }>)) {
+    for (const [paneKey, v] of Object.entries(saved as Record<string, { workspaceId?: unknown; state?: unknown; at?: unknown; terminal?: unknown }>)) {
       if (this.panes.has(paneKey) || typeof v?.workspaceId !== 'string' || typeof v.at !== 'number') continue
       if (now - v.at > trustMs) continue
       if (!['working', 'waiting', 'blocked', 'done', 'unknown'].includes(String(v.state))) continue
-      this.panes.set(paneKey, { workspaceId: v.workspaceId, state: v.state as Activity, at: v.at, restored: true })
+      // State saved before panes kept their terminal has none, and is judged as it was then.
+      const terminal = typeof v.terminal === 'string' && v.terminal ? { terminal: v.terminal } : {}
+      this.panes.set(paneKey, { workspaceId: v.workspaceId, state: v.state as Activity, at: v.at, ...terminal, restored: true })
     }
   }
 
   /**
    * One activity for a workspace. A state restored after a restart is trusted only for a while:
-   * its agent may have finished while the plugin was down, and that "done" was never heard.
+   * its agent may have finished while the plugin was down, and that "done" was never heard. An
+   * agent in one of the `exited` terminals is done, whatever it last said: one that was stopped
+   * or crashed never says so, and its last "working" would stand for a day.
    */
-  forWorkspace(workspaceId: string, now = Date.now(), path?: string): ActivityInfo | null {
+  forWorkspace(workspaceId: string, now = Date.now(), path?: string, exited?: ReadonlySet<string>): ActivityInfo | null {
     // Agent events name a worktree `<repoId>::<path>`; Orca's workspace list may name it by identity.
     const ours = (id: string) => id === workspaceId || (path !== undefined && id.endsWith(`::${path}`))
-    const mine = [...this.panes.values()].filter((p) => ours(p.workspaceId) && !(p.restored && now - p.at > ACTIVITY_TRUST_MS))
+    const gone = (p: PaneActivity) => p.terminal !== undefined && exited?.has(p.terminal) === true
+    const mine = [...this.panes.values()]
+      .filter((p) => ours(p.workspaceId) && !(p.restored && now - p.at > ACTIVITY_TRUST_MS))
+      .map((p) => (gone(p) ? { ...p, state: 'done' as const } : p))
     if (mine.length === 0) return null
     const pick = (s: Activity) => mine.filter((p) => p.state === s).sort((a, b) => a.at - b.at)[0]
     const chosen = pick('working') ?? pick('waiting') ?? pick('blocked') ?? mine.sort((a, b) => b.at - a.at)[0]
@@ -448,7 +475,7 @@ export function createWorker(options: WorkerOptions = {}) {
     void orca.storage.get('activity').then((saved) => activity.restore(saved, now()), () => {})
 
     orca.events.on('agent.status.changed', (e) => {
-      if (activity.note(e.paneKey, e.workspaceId, e.state, e.receivedAt)) saveActivity()
+      if (activity.note(e.paneKey, e.workspaceId, e.state, e.receivedAt, e.terminalId)) saveActivity()
       // A worker that just finished a turn may have pushed: look soon, not at the next poll.
       if (e.state !== 'working') schedule(3_000)
     })
@@ -484,7 +511,7 @@ export function createWorker(options: WorkerOptions = {}) {
       gitlab,
       // Failures surface to the engine, which then sends nothing to workers rather than guess.
       workers: () => listWorkers(cli),
-      activity: (id, path) => activity.forWorkspace(id, now(), path),
+      activity: (id, path, exited) => activity.forWorkspace(id, now(), path, exited),
       supervisor: async (repo) => {
         const v = await orca.storage.get(`supervisor:${repo}`)
         return typeof v === 'string' && v ? v : null
