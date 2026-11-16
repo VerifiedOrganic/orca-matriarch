@@ -259,10 +259,11 @@ and **Send a test**. It applies to every project, on this machine; **Remove** tu
 
 - **Where:** a Slack incoming webhook, a Discord channel webhook, ntfy (ntfy.sh, or your own
   server: pick **ntfy** by hand), or any URL that takes a JSON POST with `kind`, `title`, `body`,
-  `repo`, `number` and `url`. Slack, Discord and ntfy.sh are told apart by their address. A server
-  that wants a password can take it in the URL (`https://user:pass@ntfy.example.com/topic`): it is
-  sent as a Basic `Authorization` header and never shown. `http://` is accepted for a server on
-  your network.
+  `repo`, `number` and `url` (the last three null when an alert is not about one: `repo` for a
+  disk several projects share, `number` and `url` for one not about a PR). Slack, Discord and
+  ntfy.sh are told apart by their address. A server that wants a password can take it in the URL
+  (`https://user:pass@ntfy.example.com/topic`): it is sent as a Basic `Authorization` header and
+  never shown. `http://` is accepted for a server on your network.
 - **What:** **Needs you** (everything under **Needs you** on the board: an escalation that
   reached you, a reviewer or advisor stuck on a prompt, a PR that needs your merge or is blocked,
   a nearly full disk, a supervisor over its limits, labeled issues waiting for a supervisor, a
@@ -529,10 +530,11 @@ with it. No issue text is stored.
     merge request diffs, moving a merge request's target branch, job retries and merge bases.
 - Not all of the new [options](#options) have run on a real project yet. On Orca 1.4.259 and a
   real GitHub project, Matriarch has read its mailbox and acted on the supervisor's replies,
-  offered the advisor, kept each PR's activity log, and sent away alerts (to a local test
-  receiver). Not yet seen live: the advisor answering a question, stacked PRs, flaky re-runs,
-  light review, issues as objectives, and a worker stopped or refused over a limit. Everything on
-  GitLab is untested on a real instance. DESIGN.md lists exactly what ran where.
+  had the advisor answer the supervisor, stopped workers started over the disk floor, kept each
+  PR's activity log, and sent away alerts (to a local test receiver). Not yet seen live: stacked
+  PRs, flaky re-runs, light review, issues as objectives, and a worker start refused before it
+  runs. Everything on GitLab is untested on a real instance. DESIGN.md lists exactly what ran
+  where.
 - Mail sent to Matriarch's mailbox while its terminal is closed is lost: Orca keeps it, but
   answers nothing for a terminal that is gone. Matriarch makes a new mailbox and tells the
   supervisor the new address; a reply to a message sent from the old one is lost the same way.

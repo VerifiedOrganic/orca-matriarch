@@ -3,7 +3,7 @@
 // the top picks one (or all of them, or adding a new one), and each project shows its
 // supervisor, its settings and its own work as a swimlane timeline or a board by lane.
 import type { MatriarchConfig } from '../config.ts'
-import type { AdvisorView, Board, LogEntry, ProjectInfo, RepoView, TrackView } from '../protocol.ts'
+import type { AdvisorView, Attention, Board, LogEntry, ProjectInfo, RepoView, TrackView } from '../protocol.ts'
 import { alertsForm, alertsSave, alertsState, type AlertsState } from './alerts.ts'
 import { el, sv } from './dom.ts'
 import { ago, bars, byGroup, concurrency, GROUPS, LANES, marksIn, scale, summary, ticks, type Group } from './layout.ts'
@@ -135,9 +135,12 @@ function go(page: Page): void {
 /** The most useful page when none was picked: a project that needs you, else the first. */
 function defaultPage(b: Board): Page {
   if (b.repos.length === 0) return { kind: 'add' }
-  const urgent = b.attention.find((a) => a.repo)?.repo
+  const urgent = b.attention.map((a) => a.repo ?? a.repos?.[0]).find(Boolean)
   return { kind: 'project', repo: urgent ?? b.repos[0].repo }
 }
+
+/** Whether a Needs-you item is about `repo`: its own, or one it shares with others (a disk). */
+const concerns = (a: Attention, repo: string): boolean => a.repo === repo || (a.repos?.includes(repo) ?? false)
 
 /** The page to show: the one picked, while it still exists. */
 function currentPage(b: Board): Page {
@@ -234,7 +237,7 @@ function focusNote(page: Page): HTMLElement | null {
 /** The project switcher: each project, all of them, and adding one. */
 function projectBar(b: Board, page: Page): HTMLElement {
   const needs = (repo: string) =>
-    b.attention.some((a) => a.repo === repo) || b.tracks.some((t) => t.repo === repo && t.lane === 'needs-you') || (b.repos.find((r) => r.repo === repo)?.errors.length ?? 0) > 0
+    b.attention.some((a) => concerns(a, repo)) || b.tracks.some((t) => t.repo === repo && t.lane === 'needs-you') || (b.repos.find((r) => r.repo === repo)?.errors.length ?? 0) > 0
   return el(
     'div',
     { class: 'projects' },
@@ -294,7 +297,7 @@ function focusTerminal(handle: string): void {
 
 /** What only a person can settle, each with a button that goes there. */
 function attention(b: Board, repo: string | null): HTMLElement | null {
-  const items = (b.attention ?? []).filter((a) => repo === null || a.repo === repo)
+  const items = (b.attention ?? []).filter((a) => repo === null || concerns(a, repo))
   if (items.length === 0) return null
   return el(
     'div',

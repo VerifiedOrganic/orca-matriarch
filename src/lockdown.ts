@@ -37,6 +37,7 @@ export const CLAUDE_ALLOW: readonly string[] = [
   'Bash(git diff *)', 'Bash(git diff)', 'Bash(git log *)', 'Bash(git log)', 'Bash(git show *)', 'Bash(git show)',
   'Bash(git status *)', 'Bash(git status)', 'Bash(git ls-files *)', 'Bash(git ls-files)',
   'Bash(git blame *)', 'Bash(git rev-parse *)', 'Bash(git merge-base *)', 'Bash(git cat-file *)', 'Bash(git ls-tree *)',
+  'Bash(git check-ignore *)',
   'Bash(cat *)', 'Bash(head *)', 'Bash(tail *)', 'Bash(wc *)', 'Bash(ls *)', 'Bash(ls)', 'Bash(grep *)',
   'Bash(pwd)', 'Bash(mkdir -p .matriarch/review/*)',
   'Bash(shasum *)', 'Bash(sha256sum *)', 'Bash(sha512sum *)', 'Bash(md5sum *)', 'Bash(md5 *)', 'Bash(b2sum *)', 'Bash(cksum *)'

@@ -279,11 +279,21 @@ describe('each tick', () => {
     assert.equal(board.repos[0].supervisor.startsToday, 2)
   })
 
+  test('a nearly full disk comes first under Needs you, ahead of a supervisor over its limit', async () => {
+    const rows = [row('d1'), row('d2')]
+    const e = engine(rows, { disk: async () => ({ id: 'd1', free: 3 * GB }) })
+    await tick(e.deps, { autopilot: true })
+    rows.push(row('d3'), row('d4'))
+    e.advance(60_000)
+    const board = await tick(e.deps, { autopilot: true })
+    assert.deepEqual(board.attention.map((a) => a.key), ['disk:d1', 'limits:acme/app'])
+  })
+
   test('warns of a nearly full disk at the floor the project sets, or not at all', async () => {
-    const low = engine([], { freeSpace: async () => 15 * GB, readConfig: async () => validateConfig({ review: { enabled: false }, limits: { minFreeDiskGB: 20 } }) })
-    assert.ok((await tick(low.deps, { autopilot: false })).attention.some((a) => a.key === 'disk'))
-    const off = engine([], { freeSpace: async () => 1 * GB, readConfig: async () => validateConfig({ review: { enabled: false }, limits: { minFreeDiskGB: 0 } }) })
-    assert.ok(!(await tick(off.deps, { autopilot: false })).attention.some((a) => a.key === 'disk'))
+    const low = engine([], { disk: async () => ({ id: 'd1', free: 15 * GB }), readConfig: async () => validateConfig({ review: { enabled: false }, limits: { minFreeDiskGB: 20 } }) })
+    assert.ok((await tick(low.deps, { autopilot: false })).attention.some((a) => a.key === 'disk:d1'))
+    const off = engine([], { disk: async () => ({ id: 'd1', free: 1 * GB }), readConfig: async () => validateConfig({ review: { enabled: false }, limits: { minFreeDiskGB: 0 } }) })
+    assert.ok(!(await tick(off.deps, { autopilot: false })).attention.some((a) => a.key === 'disk:d1'))
   })
 
   test('hands nothing to the hook while it cannot see the workers, and forgets nothing while it cannot see the workspaces', async () => {

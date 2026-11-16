@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import { assert, describe, test } from 'orca/testing'
+import { isReadOnlyShell } from './guard.ts'
 import { CLAUDE_ALLOW, CLAUDE_DENY, createLockdown, lockdownCommand, shellWords } from './lockdown.ts'
 
 const PROMPT = `You are the "correctness" reviewer on PR #51 "Don't --dangerously-skip-permissions"\nStep 1: git diff origin/main...HEAD`
@@ -163,4 +164,17 @@ describe('a Claude reviewer gets no command whose flags run a program', () => {
       assert.ok(CLAUDE_DENY.includes(rule), rule)
     }
   })
+})
+
+test('git check-ignore only reads ignore rules, so a Claude reviewer may run it', () => {
+  // The live advisor checked that its answer file is ignored, and was refused.
+  assert.ok(CLAUDE_ALLOW.includes('Bash(git check-ignore *)'))
+})
+
+test("every command Claude's allowlist lets a reviewer run, the guard lets it run too", () => {
+  // The two layers agree: a command the first allows is not refused by the second.
+  for (const rule of CLAUDE_ALLOW.filter((r) => r.startsWith('Bash('))) {
+    const command = rule.slice(5, -1).replace(/\*/g, 'x')
+    assert.ok(isReadOnlyShell(command, '/wt/review-51'), `${rule} → ${command}`)
+  }
 })

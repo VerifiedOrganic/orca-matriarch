@@ -23,7 +23,7 @@ import type { SentReceipt, WorkerRow } from './orca-cli.ts'
 import { applyReply, loadMailState, mailKey, recordSent, replyLine, takeMail, takenQuestions, type MailIdentities, type MailMessage, type MailReader } from './mailbox.ts'
 import { lightPaths, MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner, type Plan } from './plan.ts'
 import { supervisorTagPrefix } from './supervisor.ts'
-import type { AdvisorView, Board, LogEntry, Mark, RepoView, TrackView } from './protocol.ts'
+import type { AdvisorView, Attention, Board, LogEntry, Mark, RepoView, TrackView } from './protocol.ts'
 
 export interface Workspace {
   id: string
@@ -95,8 +95,8 @@ export interface EngineDeps {
    * refused) otherwise. Absent where nothing is removed (tests of other parts).
    */
   removeWorktree?: (path: string, options?: { keepBranch?: boolean }) => Promise<{ removed: boolean; reason?: string }>
-  /** Bytes free on the disk holding a path; null when it cannot tell. */
-  freeSpace?: (path: string) => Promise<number | null>
+  /** The disk holding a path: the same id for every path on it, and the bytes free there; null when it cannot tell. */
+  disk?: (path: string) => Promise<{ id: string; free: number } | null>
   /** Each project's workers and disk against its limits, for the hook that refuses a worker start. */
   onLimits?: (state: LimitState) => void
   /** The opted-in projects a tick saw, once it could read Orca's workspaces (not called otherwise). */
@@ -477,13 +477,29 @@ async function alertAttention(deps: EngineDeps, board: Board, now: number, actin
   for (const [k, a] of standing) {
     if (after[k] || !acting) continue
     try {
-      await deps.notifyPerson({ kind: 'needs-you', title: `Matriarch: ${a.repo ?? 'a project'} needs you`, body: a.message, ...(a.repo ? { repo: a.repo } : {}) })
+      await deps.notifyPerson({ kind: 'needs-you', title: a.repo ? `Matriarch: ${a.repo} needs you` : 'Matriarch needs you', body: a.message, ...(a.repo ? { repo: a.repo } : {}) })
       after[k] = { at: now }
     } catch (error) {
       deps.log(`could not tell you about ${k}: ${(error as Error).message}`)
     }
   }
   if (JSON.stringify(after) !== JSON.stringify(before)) await deps.store.set(key, after as unknown as JsonValue)
+}
+
+/**
+ * A nearly full disk on the board: one item for the disk, naming each project on it whose floor
+ * it is under, so a project that shares the disk is not left out and a second disk is not hidden
+ * behind the first. Keyed by the disk, so a changing free figure does not alert again.
+ */
+export function diskAttention(id: string, free: number, repos: readonly string[]): Attention {
+  const names = [...repos].sort()
+  const named = names.length < 2 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`
+  return {
+    key: `disk:${id}`,
+    ...(names.length === 1 ? { repo: names[0] } : { repos: names }),
+    alert: true,
+    message: `Only ${gb(free)} free on the disk with ${named}. Agents' builds, Orca and Matriarch stop saving once it is full: free some space to keep the pod moving.`
+  }
 }
 
 /** A failed read of a PR's file moves is tried again after this; an answer is kept for the commit. */
@@ -535,6 +551,8 @@ interface TickContext {
   byWorktree: { get(ws: Workspace): WorkerRow | undefined }
   /** Projects whose advisor this tick stepped or stopped; the others are polled after the loop. */
   advised: Set<string>
+  /** Each disk under some project's floor, by its id: the least seen free on it, and those projects. */
+  lowDisks: Map<string, { free: number; repos: string[] }>
 }
 
 /** A PR this tick plans for: its snapshot, its ledger, and its worktree when it has one here. */
@@ -610,7 +628,7 @@ export async function tick(deps: EngineDeps, opts: TickOptions): Promise<Board> 
   const workspaces = await listWorkspaces(deps, board)
   if (!workspaces) return board
   const repos = await groupByProject(deps, workspaces)
-  const t: TickContext = { deps, opts, board, now, since, maxAge: opts.detailMaxAgeMs ?? 10 * 60_000, crewMarks, ...(await indexWorkers(deps, board)), advised: new Set() }
+  const t: TickContext = { deps, opts, board, now, since, maxAge: opts.detailMaxAgeMs ?? 10 * 60_000, crewMarks, ...(await indexWorkers(deps, board)), advised: new Set(), lowDisks: new Map() }
   for (const [repoKey, { info, workspaces: repoWorkspaces }] of repos) await tickProject(t, repoKey, info, repoWorkspaces)
   await afterProjects(t, workspaces)
   board.tracks.sort(
@@ -807,17 +825,15 @@ async function openProject(t: TickContext, repoKey: string, info: RepoInfo, repo
   }
   board.repos.push(view)
   // A nearly full disk stalls builds, Orca's saves and Matriarch's own, with nothing on screen:
-  // say so once per board, before it fills. The same floor stops the supervisor starting workers.
-  const free = deps.freeSpace ? await deps.freeSpace(info.root).catch(() => null) : null
+  // one notice per disk once every project had its turn (diskAttention). The same floor stops
+  // the supervisor starting workers.
+  const disk = deps.disk ? await deps.disk(info.root).catch(() => null) : null
+  const free = disk?.free ?? null
   const limits = config.limits
-  const lowDisk = free !== null && limits.minFreeDiskGB > 0 && free < limits.minFreeDiskGB * 1024 ** 3
-  if (lowDisk && !board.attention.some((a) => a.key === 'disk')) {
-    board.attention.push({
-      key: 'disk',
-      repo: repoKey,
-      alert: true,
-      message: `Only ${gb(free)} free on the disk with ${repoKey}. Agents' builds, Orca and Matriarch stop saving once it is full: free some space to keep the pod moving.`
-    })
+  const lowDisk = disk !== null && limits.minFreeDiskGB > 0 && disk.free < limits.minFreeDiskGB * 1024 ** 3
+  if (lowDisk) {
+    const low = t.lowDisks.get(disk.id)
+    t.lowDisks.set(disk.id, { free: Math.min(low?.free ?? disk.free, disk.free), repos: [...(low?.repos ?? []), repoKey] })
   }
   // A config with errors may have lost a guard (a protected path, a reviewer): watch only.
   const whyNot = notActing(opts.autopilot, deps, cfg.errors)
@@ -1805,6 +1821,8 @@ async function worktreeTracks(proj: ProjectTick): Promise<void> {
 async function afterProjects(t: TickContext, workspaces: readonly Workspace[]): Promise<void> {
   const { deps, opts, board, now, advised } = t
   deps.onProjects?.(board.repos.map((r) => r.repo))
+  // First on the board: a full disk stalls everything else on it (and the status bar shows the first).
+  board.attention.unshift(...[...t.lowDisks].map(([id, low]) => diskAttention(id, low.free, low.repos)))
   // An advisor at work for a project no tick sees now (its workspaces closed) still times out,
   // is checked for prompts and unlocked resumes, and has its worktree removed and its mail sent.
   if (deps.advisor?.poll) {

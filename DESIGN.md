@@ -288,9 +288,15 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   - After each launch the crew checks the hook really rewrote it. A reviewer started without
     the lockdown (the hook timed out, say) has its terminal closed and counts as failed.
   - The `agent.tool.before` guard stays on as a second layer for Claude: an allowlist of
-    read-only commands, writes only to the verdict file, and reads only inside the worktree. It
-    resolves real paths: it follows `cd`, and it skips search patterns (a `'/// doc'` grep
-    pattern is not an absolute path).
+    read-only commands, writes only to the verdict file, and reads only inside the worktree. The
+    one read outside it is Claude's own copy of a long tool output, which Claude saves in its
+    config folder and has the agent read back: with the Read tool only, at
+    `<config folder>/projects/<the worktree's folder name>/<session>/tool-results/<file>`, where
+    the config folder is `~/.claude`, `$CLAUDE_CONFIG_DIR` or an Orca profile's `home`. It reads
+    paths as text, as Claude would expand them (a leading `~`, surrounding spaces), without
+    following symlinks; it follows `cd`, and it skips search patterns (a `'/// doc'` grep pattern
+    is not an absolute path). A refused command names the part refused, so the agent runs the
+    rest without it.
   - Neither layer allows a flag that runs a program or writes a file (`rg --pre`, `git grep -O`,
     `fd -x`, `sort -o`, `git -c`, sed's `e` and `w`, awk's pipes), and the guard refuses what
     could disguise one: an escape or `$'…'` quoting, `{a,b}` expansion, a `$VAR` given to such a
@@ -1072,6 +1078,33 @@ lockdown was checked live (2026-11-10, Claude Code 2.1.322, Codex 0.167.0):
   become a PR (gates, audits, spikes) once their result is recorded; Matriarch removes PR
   worktrees on merge.
 
+### Tuned on the seaway dogfood run (2026-11-15)
+
+- **One disk, one notice.** The notice named the first project on a nearly full disk and no
+  other, so seaway's page said nothing while its new workers were being stopped for lack of
+  space; and a second low disk would have been hidden behind the first. Now there is one notice
+  per disk (by its device), naming every project on it under its own floor, shown on each of
+  their pages, keyed by the disk so a changing free figure does not alert again.
+- **The advisor's refusals.** Its first live question showed three. Claude saves an output too
+  long to show and has the agent read it back from its config folder, outside the worktree, and
+  the guard refused that read, so the advisor never saw the full output of commands it was
+  allowed to run. `git check-ignore` was refused though it only reads (now allowed by the guard
+  and in Claude's allowlist). And a refusal named no part of the command, so the advisor sent
+  the same command again; it now names the part (`buf --version` was refused, run the rest
+  without it). Its version probes (`buf --version`, `just --version`) were rightly refused: each
+  runs the program.
+- **Three older holes in the guard**, found by the reviews of those fixes. It took any `>&` for a
+  stream (`2>&1`), but `cat a >&/path` writes both streams to that file in bash and zsh, and
+  Claude's deny rules for absolute paths need a space before the `/`; now only a number, `-` or
+  a number and `-` after `>&` copies, closes or moves a stream, and anything else is a redirect
+  like `>`. A redirect's target ran on past a `>` or `<`, so `>.matriarch/review/x.json>../../out`
+  folded into one verdict path while the shell writes both files; a target now ends where the
+  shell ends it, and one with a stray quote is refused. And a Read, Grep or Glob path
+  starting with `~` or a space resolved inside the worktree, though Claude trims it and expands
+  `~` to the home folder (Claude's own `Read(./**)` still refused it); now such a path, and an
+  absolute or climbing Glob pattern, is refused. A test now checks that every command Claude's
+  allowlist lets through passes the guard too.
+
 ### Orca 1.4.257 orchestration rules (found on that run, 2026-11-12)
 
 - **A sender needs a terminal.** `orchestration send` from no terminal is refused
@@ -1135,13 +1168,23 @@ plugin's worker:
 - **GitHub reads.** The list, detail and label-event GraphQL queries and `compare` (ahead,
   identical, and a commit GitHub does not know).
 
+- **The advisor answering.** The supervisor asked about a CI plan; the advisor (Claude on
+  Fable 5.2, xhigh) ran read-only (`--permission-mode dontAsk` with the allowlists, `--setting-sources
+  user --strict-mcp-config`, no bypass flag) in a throwaway worktree, answered in eight minutes,
+  and its worktree was removed.
+- **A worker stopped over a limit.** With the disk under seaway's 10 GB floor, the two workers
+  the supervisor started next were stopped on the next poll with `worker-stop`, and their
+  worktrees kept for their tasks. Told so, the supervisor had space freed, started both again in
+  their kept worktrees, and replied; the reply showed in the log.
+
 Not yet run live:
 
-- **The advisor answering** a question end to end, and whether a chat's session id stays the
-  same after `/clear`.
+- Whether a chat's session id stays the same after `/clear`.
 - **Worker limits.** That `agent.tool.before` never fires for a supervisor in a chat (read from
-  Orca's source, above), and that `worker-stop` on a live dispatch stops it and keeps its
-  worktree.
+  Orca's source, above).
+- **The read-back of a long tool output** by a reviewer or the advisor: the live advisor showed
+  the guard refusing it; the fix has run only in tests, and a scratch Claude in `dontAsk` mode
+  read its own saved output with no permission prompt.
 - **Stacked PRs, flaky checks, light review and issues** against a real repository: the GitHub
   writes each makes (`gh pr edit --base`, the job and workflow re-runs, issue comments) and the
   reads not listed above (check-run annotations, the issue list, the collaborator permission),

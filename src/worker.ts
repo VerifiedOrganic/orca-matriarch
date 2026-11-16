@@ -1,11 +1,12 @@
 // Matriarch's engine host. The status bar item keeps this worker running while the plugin is
 // enabled, so it polls on its own. Everything durable lives in orca.storage.
-import { access, mkdir, readFile, rename, writeFile, statfs } from 'node:fs/promises'
+import { access, mkdir, readFile, rename, stat, writeFile, statfs } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import type { JsonValue } from 'orca/host'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { AGENT_CATALOG, agentOptions, MODEL_LISTERS, parseModelList, type LiveModel } from './agents.ts'
-import { readModelCatalog, readOrcaProfile } from './orca-profile.ts'
+import { orcaDataDir, readModelCatalog, readOrcaProfile } from './orca-profile.ts'
 import { createAdvisor, type Advisor } from './advisor.ts'
 import { advisorUsable, CONFIG_OFF_PATH, CONFIG_PATH, defaultConfig, forgeSettingOf, parseConfig, validateConfig, type ForgeSetting, type MatriarchConfig } from './config.ts'
 import { createCrew, launchedSession, launchedTerminal, type Crew } from './crew.ts'
@@ -42,7 +43,7 @@ export interface WorkerOptions {
 
 // The read-only guard lives in guard.ts; re-exported for the tests and callers that used it here.
 export { reviewGuard } from './guard.ts'
-import { reviewGuard, type Guard } from './guard.ts'
+import { reviewGuard, type ClaudeHomes, type Guard } from './guard.ts'
 import { createLimitsGuard, limitsChanged, limitsMessage } from './limits.ts'
 
 /**
@@ -394,7 +395,12 @@ export function createWorker(options: WorkerOptions = {}) {
         }
       })
     void advisor.load()
-    const readOnlyGuard = () => joinGuards(crew.guard(), advisor.guard())
+    // Where Claude Code keeps the long tool outputs a reviewer or the advisor reads back.
+    const claudeHomes: ClaudeHomes = {
+      dirs: [join(homedir(), '.claude'), ...(process.env.CLAUDE_CONFIG_DIR ? [process.env.CLAUDE_CONFIG_DIR] : [])],
+      profiles: join(options.orcaDataDir ?? orcaDataDir(), 'claude-profiles')
+    }
+    const readOnlyGuard = (): Guard => ({ ...joinGuards(crew.guard(), advisor.guard()), claude: claudeHomes })
     // The supervisor's worker starts are held to each project's limits (limits.ts). Orca waits on
     // this hook only for Claude Code; for another agent the refusal is ignored and the board says so.
     // Kept in storage, so a restart starts from the last counts rather than from none.
@@ -509,9 +515,10 @@ export function createWorker(options: WorkerOptions = {}) {
         alerter.send(a)
       },
       supervisorSenders: (repo, run) => supervisorSenders(cli, orca.storage, repo, run),
-      freeSpace: async (path) => {
-        const s = await statfs(path)
-        return Number(s.bavail) * Number(s.bsize)
+      // A disk is its device: projects on one share its free space, and its notice.
+      disk: async (path) => {
+        const [fs, file] = await Promise.all([statfs(path), stat(path)])
+        return { id: String(file.dev), free: Number(fs.bavail) * Number(fs.bsize) }
       },
       onLimits: (state) => limitsGuard.update(state),
       onProjects: (repos) => limitsGuard.keep(new Set(repos)),

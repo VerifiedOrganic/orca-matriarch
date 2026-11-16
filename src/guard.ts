@@ -2,13 +2,16 @@
 // so a deny here stops the tool call). It allows what is known to be read-only and refuses the
 // rest: an allowlist, not a denylist. Pure and synchronous: Orca gives a hook 2 s, and nothing
 // here may await.
-import { isAbsolute, normalize, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, normalize, resolve } from 'node:path'
+import { clip } from './values.ts'
 
 export interface Guard {
   ids: ReadonlySet<string>
   paths: readonly string[]
   /** Workspace id → its review worktree path, when known. */
   pathOf?: ReadonlyMap<string, string>
+  /** Claude Code's config folders, where it keeps the long tool outputs an agent reads back. */
+  claude?: ClaudeHomes
 }
 
 export interface ToolEvent {
@@ -21,9 +24,25 @@ const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 const READ_TOOLS = new Set(['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'])
 const VERDICT_DIR = '.matriarch/review/'
 // Read by a reviewer or the advisor, whichever runs in the worktree: each was told its own file.
-const DENY_WRITE = 'This worktree is read-only (a Matriarch reviewer or advisor): write only the JSON file your brief names, under .matriarch/review/.'
-const DENY_SHELL = 'This worktree is read-only (a Matriarch reviewer or advisor): only read-only commands (git diff/log/show, grep, cat, ls, gh pr view/diff, glab mr view/diff) are allowed here.'
-const DENY_OUTSIDE = 'This worktree is read-only (a Matriarch reviewer or advisor), and only it may be read: use paths relative to it (no absolute paths, ~, $HOME or .. out of it).'
+const READ_ONLY_HERE = 'This worktree is read-only (a Matriarch reviewer or advisor)'
+const SHELL_RULE = 'Read-only commands such as git diff/log/show, grep, cat, ls, gh pr view/diff and glab mr view/diff are allowed'
+const DENY_WRITE = `${READ_ONLY_HERE}: write only the JSON file your brief names, under .matriarch/review/.`
+const DENY_OUTSIDE = `${READ_ONLY_HERE}, and only it may be read: use paths relative to it (no absolute paths, ~, $HOME or .. out of it).`
+const DENY_UNREADABLE = `${READ_ONLY_HERE}: Matriarch could not tell what this command runs (it has a backslash or {…} outside quotes, $'…', $(…), <(…), backticks, a heredoc, a & that is not && or an unclosed quote), so it was refused. Write it plainly. ${SHELL_RULE}.`
+/** Names the part refused, so the agent runs the rest without it instead of sending the same command again. */
+const denyShell = (part: string): string =>
+  `${READ_ONLY_HERE}: ${part} was refused, as Matriarch could not tell that it only reads (an option that writes a file or runs a program, or a $VARIABLE where one could go, is refused too). ${SHELL_RULE}. Run the rest without it.`
+const denyRedirect = (target: string): string =>
+  `${READ_ONLY_HERE}: the redirect to ${target} was refused: output may go only to the JSON file your brief names, under .matriarch/review/, or to /dev/null. Run the rest without it.`
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/** Where Claude Code keeps its config, and so the tool outputs it saves: folders it may use. */
+export interface ClaudeHomes {
+  /** Config folders by their path: `~/.claude`, and `$CLAUDE_CONFIG_DIR` when set. */
+  dirs: readonly string[]
+  /** The folder of Orca's Claude profiles; each profile's config folder is `<it>/<uuid>/home`. */
+  profiles: string | null
+}
 
 /** Is `file` (absolute or relative to `root`) a verdict file inside the review worktree `root`? */
 export function isVerdictFile(root: string, file: string): boolean {
@@ -36,6 +55,45 @@ const inside = (root: string, file: string): boolean => {
   const full = resolve(root, file)
   const base = resolve(root)
   return full === base || full.startsWith(`${base}/`)
+}
+
+/** Is `dir` one of Claude Code's config folders: a known one, or an Orca profile's `home`? */
+function isClaudeHome(dir: string, homes: ClaudeHomes): boolean {
+  if (homes.dirs.some((d) => resolve(d) === dir)) return true
+  const profile = dirname(dir)
+  return homes.profiles !== null && basename(dir) === 'home' && UUID.test(basename(profile)) && dirname(profile) === resolve(homes.profiles)
+}
+
+/**
+ * The folder name Claude Code gives a working directory under `projects/`: each character but
+ * letters and digits a dash; a name over 200 characters is cut there and given a hash, which
+ * Matriarch cannot work out, so it takes any lowercase letters and digits after the cut.
+ */
+function isProjectFolder(name: string, root: string): boolean {
+  const full = resolve(root).replace(/[^A-Za-z0-9]/g, '-')
+  if (full.length <= 200) return name === full
+  return name.startsWith(`${full.slice(0, 200)}-`) && /^[a-z0-9]+$/.test(name.slice(201))
+}
+
+/**
+ * Is `file` a tool output Claude Code kept for a session in the worktree `root`? It writes an
+ * output too long to show into its config folder, then has the agent read it back:
+ * `<config folder>/projects/<root's folder name>/<session>/tool-results/<file>`. The config folder
+ * must be one Claude uses (`homes`), and the rest exactly that shape.
+ */
+export function isOwnToolOutput(root: string, file: string, homes: ClaudeHomes): boolean {
+  if (!isAbsolute(file)) return false
+  const parts = normalize(file).split('/')
+  if (parts.length < 7) return false
+  const [projects, project, session, folder, name] = parts.slice(-5)
+  return (
+    projects === 'projects' &&
+    isProjectFolder(project, root) &&
+    UUID.test(session) &&
+    folder === 'tool-results' &&
+    /^[A-Za-z0-9_-]+\.[A-Za-z0-9]+$/.test(name) &&
+    isClaudeHome(parts.slice(0, -5).join('/'), homes)
+  )
 }
 
 /** Splits a shell command on unquoted ; && || | and newlines; null when it hides a command. */
@@ -69,17 +127,27 @@ export function shellSegments(command: string): { segments: string[]; redirects:
     if (c === '<' && next === '<') return null // heredocs: write files with the Write tool instead
     if (c === '>') {
       // A redirect: allowed only into the verdict folder, or to /dev/null and between streams.
+      // `>>` appends and `>|` (zsh `>>|`) overrides noclobber: the same writes. A stream number
+      // just before it (`2>`) is part of the redirect, not a word of the command.
+      cur = cur.replace(/(^|\s)\d+$/, '$1')
       let j = i + 1
       if (command[j] === '>') j++
-      if (command[j] === '&') {
-        i = j + 1
-        continue
-      }
+      if (command[j] === '|') j++
+      const copy = command[j] === '&'
+      if (copy) j++
       while (command[j] === ' ') j++
+      // The target ends where the shell ends it, a `<` or `>` included: `>a.json>../x` is two
+      // redirects, and the second writes.
       let target = ''
-      while (j < command.length && !/[\s;&|]/.test(command[j])) target += command[j++]
-      redirects.push(target.replace(/^['"]|['"]$/g, ''))
+      while (j < command.length && !/[\s;&|<>]/.test(command[j])) target += command[j++]
       i = j - 1
+      // `2>&1`, `>&2`, `>&-` and `2>&1-` copy, close or move a stream. Any other word after `>&`
+      // is a file both streams are written to (bash and zsh `>&file`, zsh `>>&file`).
+      if (copy && /^(?:\d+-?|-)$/.test(target)) continue
+      // One pair of quotes around it at most; any other quote would make it another word.
+      const bare = /^(['"])(.*)\1$/.exec(target)?.[2] ?? target
+      if (/['"]/.test(bare)) return null
+      redirects.push(bare)
       continue
     }
     if (c === ';' || c === '\n' || c === '|' || c === '&') {
@@ -106,7 +174,7 @@ const READ_ONLY = new Set([
   'shasum', 'sha1sum', 'sha256sum', 'sha512sum', 'md5', 'md5sum', 'b2sum', 'cksum', 'xxd'
 ])
 const GIT_READ = new Set([
-  'diff', 'log', 'show', 'status', 'grep', 'ls-files', 'ls-tree', 'rev-parse', 'blame', 'cat-file', 'merge-base',
+  'diff', 'log', 'show', 'status', 'grep', 'ls-files', 'ls-tree', 'rev-parse', 'blame', 'cat-file', 'merge-base', 'check-ignore',
   'shortlog', 'describe', 'name-rev', 'rev-list', 'whatchanged', 'for-each-ref', 'show-ref', 'count-objects'
 ])
 
@@ -339,12 +407,14 @@ export function isReadOnlyShell(command: string, root: string | null): boolean {
 /** Null when the command only reads inside the worktree; else the reason to refuse it. */
 function shellDecision(command: string, root: string | null): string | null {
   const parsed = shellSegments(command)
-  if (!parsed) return DENY_SHELL
+  if (!parsed) return DENY_UNREADABLE
+  const shown = (s: string) => `\`${clip(s, 120)}\``
   for (const target of parsed.redirects) {
     if (target === '/dev/null') continue
-    if (root === null || !isVerdictFile(root, target)) return DENY_SHELL
+    if (root === null || !isVerdictFile(root, target)) return denyRedirect(shown(target))
   }
-  if (!parsed.segments.every((s) => segmentAllowed(s, root))) return DENY_SHELL
+  const refused = parsed.segments.find((s) => !segmentAllowed(s, root))
+  if (refused !== undefined) return denyShell(shown(refused))
   if (!staysInside(parsed.segments, root)) return DENY_OUTSIDE
   return null
 }
@@ -376,10 +446,16 @@ export function reviewGuard(event: ToolEvent, guard: Guard): { deny: string } | 
     const reason = shellDecision(typeof input.command === 'string' ? input.command : '', root)
     return reason ? { deny: reason } : null
   }
-  // Reading and searching stay inside the worktree too.
+  // Reading and searching stay inside the worktree too, but for reading back the agent's own
+  // tool output that Claude Code kept for it. Claude trims a path and expands a leading ~ to the
+  // home folder; a Glob pattern can be a path of its own.
   if (READ_TOOLS.has(event.tool)) {
-    const target = typeof input.file_path === 'string' ? input.file_path : typeof input.path === 'string' ? input.path : null
-    if (target !== null && !inside(root, target)) return { deny: DENY_OUTSIDE }
+    const raw = typeof input.file_path === 'string' ? input.file_path : typeof input.path === 'string' ? input.path : null
+    const target = raw?.trim() ?? null
+    const own = (t: string) => event.tool === 'Read' && guard.claude !== undefined && isOwnToolOutput(root, t, guard.claude)
+    if (target !== null && (target.startsWith('~') || (!inside(root, target) && !own(target)))) return { deny: DENY_OUTSIDE }
+    const pattern = event.tool === 'Glob' && typeof input.pattern === 'string' ? input.pattern.trim() : null
+    if (pattern !== null && (pattern.startsWith('~') || isAbsolute(pattern) || pattern.split('/').includes('..'))) return { deny: DENY_OUTSIDE }
   }
   return null
 }

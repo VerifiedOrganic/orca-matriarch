@@ -1,6 +1,6 @@
 import { assert, describe, test } from 'orca/testing'
 import { validateConfig } from './config.ts'
-import { ATTENTION_CLEAR_MS, FINISHED_GRACE_MS, SHOW_CLOSED_MS, tick, type EngineDeps, type Workspace } from './engine.ts'
+import { ATTENTION_CLEAR_MS, diskAttention, FINISHED_GRACE_MS, SHOW_CLOSED_MS, tick, type EngineDeps, type Workspace } from './engine.ts'
 import type { Executor } from './executor.ts'
 import type { GitHub, PrSnapshot } from './github.ts'
 import { ledgerKey } from './ledger.ts'
@@ -288,17 +288,74 @@ describe('the worktree of a merged PR', () => {
 })
 
 describe('a nearly full disk', () => {
-  test('needs the person, once per board', async () => {
+  const GB = 1024 ** 3
+  test('needs the person, once per disk', async () => {
     const h = harness([pr({ number: 12 })])
-    h.deps.freeSpace = async () => 3 * 1024 ** 3
+    h.deps.disk = async () => ({ id: 'd1', free: 3 * GB })
     const low = await tick(h.deps, { autopilot: false })
-    const disk = low.attention.filter((a) => a.key === 'disk')
+    const disk = low.attention.filter((a) => a.key.startsWith('disk:'))
     assert.equal(disk.length, 1)
+    assert.equal(disk[0].repo, 'acme/app')
     assert.ok(disk[0].message.startsWith('Only 3.0 GB free on the disk with acme/app.'))
-    h.deps.freeSpace = async () => 50 * 1024 ** 3
-    assert.equal((await tick(h.deps, { autopilot: false })).attention.some((a) => a.key === 'disk'), false)
-    h.deps.freeSpace = async () => null
-    assert.equal((await tick(h.deps, { autopilot: false })).attention.some((a) => a.key === 'disk'), false, 'unknown is not low')
+    h.deps.disk = async () => ({ id: 'd1', free: 50 * GB })
+    assert.equal((await tick(h.deps, { autopilot: false })).attention.some((a) => a.key.startsWith('disk:')), false)
+    h.deps.disk = async () => null
+    assert.equal((await tick(h.deps, { autopilot: false })).attention.some((a) => a.key.startsWith('disk:')), false, 'unknown is not low')
+  })
+
+  // Two projects, each with a worktree; which disk each is on, and its floor, set per test.
+  const twoProjects = (disks: Record<string, { id: string; free: number }>, floors: Record<string, number> = {}) => {
+    const h = harness([], {
+      workspaces: [
+        { id: 'ws-a', kind: 'worktree', name: 'a', path: '/r/wt/a', branch: 'feature/a', hostId: null },
+        { id: 'ws-b', kind: 'worktree', name: 'b', path: '/s/wt/b', branch: 'feature/b', hostId: null }
+      ]
+    })
+    h.deps.repoOf = async (path) =>
+      path.startsWith('/s') ? { ref: { owner: 'acme', name: 'web' }, key: 'acme/web', root: '/s' } : { ref: { owner: 'acme', name: 'app' }, key: 'acme/app', root: '/r' }
+    h.deps.readConfig = async (root) => validateConfig({ review: { enabled: false }, limits: { minFreeDiskGB: floors[root] ?? 10 } })
+    h.deps.disk = async (path) => disks[path] ?? null
+    return h
+  }
+
+  test('one notice for a disk two projects share, naming both, on both their pages', async () => {
+    // Seen live: the notice named only the first project, though the second's workers were held too.
+    const h = twoProjects({ '/r': { id: 'd1', free: 4.2 * GB }, '/s': { id: 'd1', free: 4.0 * GB } })
+    const disk = (await tick(h.deps, { autopilot: false })).attention.filter((a) => a.key.startsWith('disk:'))
+    assert.equal(disk.length, 1)
+    assert.match(disk[0].message, /^Only 4\.0 GB free on the disk with acme\/app and acme\/web\./, 'the lower reading, and both projects')
+    assert.deepEqual(disk[0].repos, ['acme/app', 'acme/web'])
+    assert.equal(disk[0].repo, undefined)
+  })
+
+  test('a project on the disk above its own floor is not named', async () => {
+    const h = twoProjects({ '/r': { id: 'd1', free: 4 * GB }, '/s': { id: 'd1', free: 4 * GB } }, { '/s': 2 })
+    const disk = (await tick(h.deps, { autopilot: false })).attention.filter((a) => a.key.startsWith('disk:'))
+    assert.equal(disk.length, 1)
+    assert.equal(disk[0].repo, 'acme/app')
+    assert.match(disk[0].message, /on the disk with acme\/app\. /)
+  })
+
+  test('a second low disk gets its own notice, not hidden behind the first', async () => {
+    const h = twoProjects({ '/r': { id: 'd1', free: 3 * GB }, '/s': { id: 'd2', free: 1 * GB } })
+    const disk = (await tick(h.deps, { autopilot: false })).attention.filter((a) => a.key.startsWith('disk:'))
+    assert.deepEqual(disk.map((a) => [a.key, a.repo]), [['disk:d1', 'acme/app'], ['disk:d2', 'acme/web']])
+  })
+
+  test('three projects are named in order, in one sentence', () => {
+    const a = diskAttention('d1', 3 * GB, ['acme/web', 'acme/api', 'acme/app'])
+    assert.match(a.message, /^Only 3\.0 GB free on the disk with acme\/api, acme\/app and acme\/web\. /)
+    assert.deepEqual(a.repos, ['acme/api', 'acme/app', 'acme/web'])
+  })
+
+  test('a shared notice reaches you once, titled for Matriarch rather than one project', async () => {
+    const h = twoProjects({ '/r': { id: 'd1', free: 3 * GB }, '/s': { id: 'd1', free: 3 * GB } })
+    const told: string[] = []
+    h.deps.notifyPerson = async (a) => void told.push(`${a.title} | ${a.repo ?? '-'}`)
+    await tick(h.deps, { autopilot: true })
+    h.deps.disk = async () => ({ id: 'd1', free: 2 * GB })
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(told, ['Matriarch needs you | -'], 'once, though the figure changed')
   })
 })
 
@@ -391,7 +448,7 @@ describe('Needs you that nothing else tells you about', () => {
     const h = harness([])
     let free = 2 * 1024 ** 3
     const told: string[] = []
-    h.deps.freeSpace = async () => free
+    h.deps.disk = async () => ({ id: 'd1', free })
     h.deps.notifyPerson = async (a) => void told.push(`${a.kind}: ${a.body}`)
     return { h, told, setFree: (gb: number) => (free = gb * 1024 ** 3) }
   }
@@ -399,7 +456,7 @@ describe('Needs you that nothing else tells you about', () => {
   test('reaches you once while it stands, and again only after it cleared for a while', async () => {
     const { h, told, setFree } = setup()
     const board = await tick(h.deps, { autopilot: true })
-    assert.equal(board.attention.find((a) => a.key === 'disk')?.alert, true)
+    assert.equal(board.attention.find((a) => a.key === 'disk:d1')?.alert, true)
     assert.equal(told.length, 1)
     assert.match(told[0], /^needs-you: Only 2\.0 GB free on the disk with acme\/app/)
     await tick(h.deps, { autopilot: true })

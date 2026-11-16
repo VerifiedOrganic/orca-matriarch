@@ -86,6 +86,8 @@ export interface Attention {
   key: string
   /** The project (`owner/name`, or `<host>/<path>` on GitLab) it belongs to. */
   repo?: string
+  /** The projects it belongs to, when it is about more than one (a disk they share): each shows it. */
+  repos?: string[]
   message: string
   /** Terminal handle to open (`orca terminal switch`). */
   terminal?: string
