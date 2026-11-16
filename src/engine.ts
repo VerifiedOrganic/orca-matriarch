@@ -12,7 +12,7 @@ import { REVIEW_BRANCH_PREFIX, type Crew } from './crew.ts'
 import { collectGarbage, type GcStore } from './gc.ts'
 import type { Executor } from './executor.ts'
 import { flakyReason } from './flaky.ts'
-import { forgeKind, forgeTerms, type FailureDetails, type FileMoves, type ForgeKind, type ForgeReader, type Outcome } from './forge.ts'
+import { forgeKind, forgeTerms, stackableBranch, type FailureDetails, type FileMoves, type ForgeKind, type ForgeReader, type Outcome } from './forge.ts'
 import { actionableThreads, type GitHub, type PrSnapshot, type PrSummary, type RepoRef } from './github.ts'
 import { followIssues } from './issues.ts'
 import { addLog, addMark, historyKey, insertLog, loadHistory, noteLane, prune, windowed, type TrackHistory } from './history.ts'
@@ -232,7 +232,7 @@ export function describe(action: Action, forge: ForgeKind = 'github'): string {
     case 'publish-review':
       return forge === 'gitlab' ? 'post the AI review on the merge request as a note' : 'post the AI review to GitHub as a comment review'
     case 'merge':
-      return `merge ${shortSha(action.sha)} (${action.method})${action.keepBranch ? `, keeping its branch while ${action.keepBranch}` : ''}`
+      return `merge ${shortSha(action.sha)} (${action.method})`
     case 'escalate':
       return `escalate to ${action.to === 'human' ? 'you' : 'the supervisor'}: ${action.reason}`
     case 'notify':
@@ -335,17 +335,6 @@ interface StackCandidate {
   headRef: string
   headSha: string
   baseRef: string
-}
-
-/**
- * Branches that live on after their PRs merge (a release or integration branch), by name. A PR
- * from one is a release or a back-merge, never a parent that PRs into that branch wait for.
- */
-export const LONG_LIVED_BRANCH = /^(?:main|master|trunk|develop|development|dev|staging|stage|production|prod|stable|next|releases?(?:[/-].+)?|v?\d+(?:\.(?:\d+|x))*)$/i
-
-/** A branch a PR can be stacked on: a short-lived one, not the default branch or a long-lived one. */
-export function stackableBranch(branch: string, defaultBranch: string | null): boolean {
-  return branch !== '' && branch !== defaultBranch && !LONG_LIVED_BRANCH.test(branch)
 }
 
 /**
@@ -1553,12 +1542,6 @@ async function planFor(proj: ProjectTick, item: TickItem, owner: Owner | null): 
     // A cut-short list may leave out the PR whose branch this one merges into.
     unlistedBase:
       truncatedList && snap.state === 'OPEN' && !item.ledger.stack && byBranch.has(snap.baseRef) && stackableBranch(snap.baseRef, base?.name ?? null),
-    // Deleting its branch as it merges would close these (plan.ts keptBranchReason); a list cut
-    // short, or one without every PR's base, may leave one out.
-    basedOnIt:
-      truncatedList || proj.summaries.some((o) => !o.baseRef)
-        ? null
-        : proj.summaries.filter((o) => o.baseRef === snap.headRef && o.number !== snap.number).map((o) => o.number).sort((a, b) => a - b),
     now
   })
 
@@ -1576,77 +1559,120 @@ async function planFor(proj: ProjectTick, item: TickItem, owner: Owner | null): 
   return { p, run }
 }
 
-/** A merged PR's branch kept for the PRs based on it (plan.ts keptBranchReason), until it can go. */
+/** A merged PR's branch kept for the PRs based on it (executor.ts branchAtMerge), until it can go. */
 export interface KeptBranch {
   /** The merged head: the branch is deleted only while it still points here. */
   sha: string
   /** The PR that merged from it. */
   number: number
   at: number
-  /** When deleting it last failed: it is tried again after KEPT_RETRY_MS. */
-  failedAt?: number
+  /** Its PR was read as merged: not asked again. */
+  merged?: boolean
+  /** Deleting it failed this many times in a row; the last error, logged once; when to try again. */
+  failures?: number
+  error?: string
+  retryAt?: number
 }
 
 /** Where a project's kept branches are recorded, by branch name. */
 export const keptBranchesKey = (repo: string): string => `kept-branches:${repo}`
-/** How long a kept branch waits for the PRs based on it to move off it; then it is left as it is. */
+/** How long Matriarch tries to delete a kept branch; then it is left as it is, and forgotten. */
 export const KEPT_BRANCH_MS = 30 * 24 * 3600_000
-/** A deletion that failed is tried again after this. */
+/** A deletion that failed is tried again after this, doubling with each failure, up to a day. */
 export const KEPT_RETRY_MS = 10 * 60_000
 
-function loadKeptBranches(raw: unknown): Record<string, KeptBranch> {
-  const out: Record<string, KeptBranch> = {}
+/** The kept branches as stored: a Map, as a branch may be named anything (`__proto__`, say). */
+function loadKeptBranches(raw: unknown): Map<string, KeptBranch> {
+  const out = new Map<string, KeptBranch>()
   for (const [branch, v] of Object.entries(obj(raw))) {
     const k = obj(v)
     if (typeof k.sha !== 'string' || typeof k.number !== 'number' || typeof k.at !== 'number') continue
-    out[branch] = { sha: k.sha, number: k.number, at: k.at, ...(typeof k.failedAt === 'number' ? { failedAt: k.failedAt } : {}) }
+    out.set(branch, {
+      sha: k.sha,
+      number: k.number,
+      at: k.at,
+      ...(k.merged === true ? { merged: true } : {}),
+      ...(typeof k.failures === 'number' ? { failures: k.failures } : {}),
+      ...(typeof k.error === 'string' ? { error: k.error } : {}),
+      ...(typeof k.retryAt === 'number' ? { retryAt: k.retryAt } : {})
+    })
   }
   return out
 }
 
+const saveKeptBranches = (deps: EngineDeps, repo: string, kept: Map<string, KeptBranch>): Promise<void> =>
+  deps.store.set(keptBranchesKey(repo), Object.fromEntries(kept) as unknown as JsonValue)
+
 async function keepBranch(deps: EngineDeps, repo: string, branch: string, kept: KeptBranch): Promise<void> {
   const all = loadKeptBranches(await deps.store.get(keptBranchesKey(repo)))
-  await deps.store.set(keptBranchesKey(repo), { ...all, [branch]: kept } as unknown as JsonValue)
+  all.set(branch, kept)
+  await saveKeptBranches(deps, repo, all)
 }
 
 /**
- * Deletes the branches kept when their PRs merged, each once no open PR is based on it or comes
- * from it, if it still points at the merged commit (one with commits since is left). Only with
- * autopilot on, the project still deleting merged branches, and a full list of open PRs: a list
- * cut short may leave out a PR the deletion would close.
+ * Deletes the branches kept when their PRs merged (executor.ts branchAtMerge), each once nothing
+ * uses it: with autopilot on and merged branches still deleted, while the list shows no open PR
+ * based on it or from it, and once its PR is read as merged (a merge that was asked for but never
+ * happened leaves the branch). The forge is asked again just before deleting (deleteBranch), so
+ * a list cut short or read a while ago never decides it. A branch with commits since is left.
  */
 async function deleteKeptBranches(proj: ProjectTick): Promise<void> {
   const { deps, now } = proj.t
-  const { repoKey, info, config, acting, listed, truncatedList, summaries } = proj
+  const { repoKey, info, config, acting, listed, summaries, forge, view, base } = proj
   const kept = loadKeptBranches(await deps.store.get(keptBranchesKey(repoKey)))
-  if (Object.keys(kept).length === 0) return
-  const next = { ...kept }
+  if (kept.size === 0) return
+  const before = JSON.stringify(Object.fromEntries(kept))
   const drop = (branch: string, why: string | null) => {
-    delete next[branch]
+    kept.delete(branch)
     if (why) deps.log(`${repoKey}: ${why}`)
   }
-  for (const [branch, k] of Object.entries(kept)) {
+  for (const [branch, k] of [...kept]) {
+    const about = `${branch}, kept when #${k.number} merged`
     if (!config.merge.deleteBranch) drop(branch, null)
-    else if (now - k.at > KEPT_BRANCH_MS) drop(branch, `left ${branch}, kept when #${k.number} merged: PRs were still based on it ${Math.round(KEPT_BRANCH_MS / 86_400_000)} days later`)
-    else if (!acting || !listed || truncatedList || summaries.some((s) => !s.baseRef) || !deps.executor?.deleteBranch) continue
-    else if (k.failedAt !== undefined && now - k.failedAt < KEPT_RETRY_MS) continue
+    // A record from before long-lived branches were never kept, or a default branch renamed since.
+    else if (!stackableBranch(branch, base?.name ?? null)) drop(branch, `left ${about}: it is ${branch === base?.name ? 'the default branch' : 'a long-lived branch'}`)
+    else if (now - k.at > KEPT_BRANCH_MS) drop(branch, `stopped trying to delete ${about}, after ${Math.round(KEPT_BRANCH_MS / 86_400_000)} days; it is left as it is`)
+    else if (!acting || !listed || !deps.executor?.deleteBranch || !forge) continue
+    else if (k.retryAt !== undefined && now < k.retryAt) continue
+    // The list may be cut short or old; what it does show in use is enough to wait.
     else if (summaries.some((s) => s.baseRef === branch || (s.headRef === branch && !s.crossRepo))) continue
     else {
-      const r = await deps.executor.deleteBranch(info.ref, branch, k.sha).catch((error: Error) => ({ error: error.message }))
+      // Asked of the forge until it reads as merged; then remembered.
+      const state = k.merged ? 'MERGED' : await forge.detail(info.ref, k.number).then((d) => d.pr?.state, () => undefined)
+      // In use, or its PR still open, where the list does not show it: asked again after a while.
+      const later = { ...k, ...(state === 'MERGED' ? { merged: true } : {}), retryAt: now + KEPT_RETRY_MS }
+      if (state === 'OPEN') {
+        kept.set(branch, later)
+        continue
+      }
+      if (state === 'CLOSED') {
+        drop(branch, `left ${about}: #${k.number} closed without merging`)
+        continue
+      }
+      const r = state === 'MERGED' ? await deps.executor.deleteBranch(info.ref, branch, k.sha).catch((error: Error) => ({ error: error.message })) : { error: `could not read #${k.number}` }
       if ('error' in r) {
-        next[branch] = { ...k, failedAt: now }
-        deps.log(`${repoKey}: could not delete ${branch}, kept when #${k.number} merged: ${r.error}`)
+        const failures = (k.failures ?? 0) + 1
+        kept.set(branch, { ...k, ...(state === 'MERGED' ? { merged: true } : {}), failures, error: r.error, retryAt: now + Math.min(KEPT_RETRY_MS * 2 ** (failures - 1), 86_400_000) })
+        if (r.error !== k.error) deps.log(`${repoKey}: could not delete ${about}: ${r.error}`)
+      } else if (r.result === 'in-use') {
+        // Not a failure: whatever uses it has not moved yet.
+        const { failures: _f, error: _e, ...rest } = later
+        kept.set(branch, rest)
       } else {
         drop(
           branch,
-          r.result === 'deleted' ? `deleted ${branch}, kept when #${k.number} merged until the PRs based on it had moved off it`
-          : r.result === 'moved' ? `left ${branch}, kept when #${k.number} merged: it has commits made since`
+          r.result === 'deleted' ? `deleted ${about}, once no open PR was based on it`
+          : r.result === 'moved' ? `left ${about}: it has commits made since`
           : null
         )
       }
     }
   }
-  if (JSON.stringify(next) !== JSON.stringify(kept)) await deps.store.set(keptBranchesKey(repoKey), next as unknown as JsonValue)
+  // A deletion that keeps failing shows on the project, not only in the log.
+  for (const [branch, k] of kept) {
+    if ((k.failures ?? 0) >= 2) view.warnings.push(`Could not delete ${branch}, kept when #${k.number} merged (tried ${k.failures} times): ${k.error}`)
+  }
+  if (JSON.stringify(Object.fromEntries(kept)) !== before) await saveKeptBranches(deps, repoKey, kept)
 }
 
 /** Carries out a plan's actions under autopilot, recording each in the ledger as it succeeds. Answers the ledger, and the marks and log lines for the track. */
@@ -1660,7 +1686,7 @@ async function act(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Pl
   const logged: LogEntry[] = []
   const ownerRow = item.ws ? byWorktree.get(item.ws) : undefined
   const failedLogs = p.actions.some((a) => a.kind === 'send-ci-failure') ? await keptLogs(deps, info, snap) : {}
-  const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null, owner: owner?.address ?? null, failedLogs }
+  const ctx = { repo: info.ref, pr: snap, config, root: info.root, supervisor, worktree: item.ws?.path ?? null, ownerLive: ownerRow ? ownerRow.live !== false : null, owner: owner?.address ?? null, failedLogs, defaultBranch: proj.base?.name ?? null }
   const run1 = async (a: Action) => {
     try {
       return await deps.executor!.execute(a, ctx)
@@ -1694,7 +1720,7 @@ async function act(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Pl
         }).catch(() => {})
       }
       ledger = await remember(action, ledger)
-      if (action.kind === 'merge' && action.keepBranch && config.merge.deleteBranch) await keepBranch(deps, repoKey, snap.headRef, { sha: action.sha, number: snap.number, at: now })
+      if (action.kind === 'merge' && outcome.keptBranch) await keepBranch(deps, repoKey, snap.headRef, { sha: action.sha, number: snap.number, at: now })
       marks.push(markFor(action, now, kind))
       logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
       // Saved after each success, so a later failure in this tick cannot make it run twice.

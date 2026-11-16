@@ -206,17 +206,31 @@ When the parent merged:
 When the forge lists more open PRs than Matriarch reads (four pages), a PR into a branch with an
 Orca worktree here may be stacked on one left out: it waits for you instead of merging.
 
-The parent's branch outlives its merge while PRs are based on it. A forge closes the PRs based on
-a branch that is deleted: GitHub moves them itself only when the branch goes by its own
-"Automatically delete head branches" setting, not when `gh pr merge --delete-branch` or the API
-deletes it (seen live: seaway #20 was closed this way). So with `merge.deleteBranch` on, a PR
-Matriarch merges while any open PR (anyone's, a fork's too) is based on its branch, or while the
-open list was cut short or lacked a PR's base, merges without deleting it, and the branch is
-recorded for the project (`kept-branches:<repo>`: its merged head, the PR, when). Each poll, with
-autopilot on and a full list, a kept branch no open PR is based on or comes from is deleted, if it
-still points at the merged head (read just before; one with commits since is left, and logged).
-A failed deletion is tried again after 10 minutes; a branch PRs are still based on 30 days later
-is left, and forgotten. Turning `merge.deleteBranch` off forgets the records.
+The parent's branch outlives its merge while something uses it. GitHub closes the PRs based on a
+branch deleted with `gh pr merge --delete-branch` or the API (seen live: seaway #20 was closed
+this way); it moves them only when its own "Automatically delete head branches" setting, or a
+person after the merge, deletes the branch. GitLab, deleting a
+merged merge request's source branch, first moves up to four open merge requests of the project
+that target it (`RetargetChainService`); a fork's, and any past four, are left on a missing branch.
+
+So with `merge.deleteBranch` on, the executor asks the forge just before each merge (not the list
+read at the start of the tick) which open PRs are based on the branch and which come from it
+(`branchUse`: GitHub's `pulls?base=` and `?head=`, GitLab's `merge_requests?target_branch=` and
+`?source_branch=`). The branch goes with the merge when nothing else uses it, or on GitLab when
+GitLab will move all that is based on it; otherwise, or when the forge cannot say, the merge keeps
+it, says why in the PR's log, and records it for the project (`kept-branches:<repo>`: its merged
+head, the PR, when). The default branch, a long-lived one (`LONG_LIVED_BRANCH`: develop,
+`release/*`, …) and a fork's are never deleted, so a git-flow release PR from develop keeps it.
+
+Each poll, with autopilot on, a kept branch is deleted once the list shows nothing using it and
+its PR reads as merged (one that closed unmerged leaves its branch, and the record goes), asking
+the forge again just before and only while it still points at the merged head (read just
+before; one with commits since is left, and logged). A branch the forge says is still in use, or
+whose PR is still open though the list leaves it out, is asked about again after 10 minutes. A
+record that names the default branch or a long-lived one is dropped and the branch left. A deletion that fails is tried
+again after 10 minutes, then 20, 40 and so on up to a day; each new error is logged once, and two
+failures in a row show on the project. After 30 days Matriarch stops trying and leaves the
+branch. Turning `merge.deleteBranch` off forgets the records.
 
 ### Flaky checks
 
@@ -631,10 +645,11 @@ there too.
   clean ones are updated, and a PR stacked on the merged one moves on (see Stacked PRs).
 - **Cleanup.** The merged PR's worktree is removed once no worker is live there and nothing in it
   is uncommitted (`merge.removeWorktree`); the branch is deleted when `deleteBranch` is set, once
-  no open PR is based on it (see [Stacked PRs](#stacked-prs)). A
-  worktree the supervisor's workers used that never became a PR goes an hour after its last
-  worker finished, when nothing in it is uncommitted or unpushed (`merge.removeFinishedWorktrees`),
-  except one whose worker Matriarch stopped over a limit (see Worker limits).
+  nothing else uses it, and never the default or a long-lived one (see
+  [Stacked PRs](#stacked-prs)). A worktree the supervisor's workers used that never became a PR
+  goes an hour after its last worker finished, when nothing in it is uncommitted or unpushed
+  (`merge.removeFinishedWorktrees`), except one whose worker Matriarch stopped over a limit (see
+  Worker limits).
 
 ## Forges: GitHub and GitLab
 
@@ -717,7 +732,9 @@ and does the signing in. Matriarch never reads, prints or passes a token.
 
 - **Actions.**
   - Merge: `PUT …/merge_requests/:iid/merge` with `sha` (GitLab refuses when it is no longer the
-    head), `squash` (method `squash`) and `should_remove_source_branch` (`merge.deleteBranch`).
+    head), `squash` (method `squash`) and `should_remove_source_branch` (`merge.deleteBranch`, unless
+    the branch is kept: see [Stacked PRs](#stacked-prs)); `false` overrides the merge request's own
+    "delete source branch" box.
     Methods `merge` and `rebase` both merge with the project's own merge method in GitLab.
   - Update a branch that is behind: `PUT …/rebase`, which GitLab runs in the background, like
     `gh pr update-branch`. GitLab has no API to merge the base into a branch, so with
@@ -1122,9 +1139,12 @@ lockdown was checked live (2026-11-10, Claude Code 2.1.322, Codex 0.167.0):
 - **A parent's branch outlives its merge while PRs are based on it.** Matriarch merged #18 with
   `gh pr merge --delete-branch`, and GitHub closed #20, which was stacked on it, before Matriarch
   could move it (its events: `base_ref_deleted`, then `closed`). The branch now stays while any
-  open PR is based on it, and goes once they have moved off it (see [Stacked PRs](#stacked-prs)).
-  #20 was recovered by restoring the branch at #18's head and reopening it; Matriarch then moved
-  it to main, had its worker rebase it, and merged it.
+  open PR is based on it, asked of the forge as the PR merges and again before the branch is
+  deleted, and goes once they have moved off it and the PR reads as merged (see
+  [Stacked PRs](#stacked-prs)). Its review also found that a develop → main release PR would have
+  deleted develop; long-lived branches are never deleted now. #20 was recovered by restoring the
+  branch at #18's head and reopening it; Matriarch then moved it to main, had its worker rebase
+  it, and merged it.
 - **An agent whose worker exited is done.** What a worker was doing came only from its agent's
   status events, and an agent that is stopped or crashes never sends a last "done". A worker
   Matriarch stopped over a limit read "working" for a day after, so PR #19, which a later worker

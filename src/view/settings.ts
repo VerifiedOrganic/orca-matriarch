@@ -366,7 +366,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
     row('Paths that always need you', 'A PR that touches one (in any case) waits for you, even when Matriarch merges.',
       textInput(d.merge.requireHuman.join(', '), (v) => (d.merge.requireHuman = globList(v)), { placeholder: 'e.g. migrations/**, .github/**' }), { stack: true }),
     el('div', { class: 'group-sub' }, 'Cleanup'),
-    row('Delete merged branches', 'On GitHub or GitLab, once the PR merged.', toggle(d.merge.deleteBranch, (on) => (d.merge.deleteBranch = on))),
+    row('Delete merged branches', 'On GitHub or GitLab, once the PR merged and no other PR is based on the branch. Never the default branch or a long-lived one.', toggle(d.merge.deleteBranch, (on) => (d.merge.deleteBranch = on))),
     row('Remove merged worktrees', 'Only when nothing runs there and nothing is uncommitted.', toggle(d.merge.removeWorktree, (on) => (d.merge.removeWorktree = on))),
     row('Remove finished worktrees', "A worktree the supervisor's workers finished in that never became a PR, such as a review gate, an hour later. Only when nothing in it is uncommitted or unpushed.",
       toggle(d.merge.removeFinishedWorktrees, (on) => (d.merge.removeFinishedWorktrees = on))))

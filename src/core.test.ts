@@ -270,11 +270,13 @@ describe('executor', () => {
   })
 
   test('merges only the reviewed commit, without --admin', async () => {
-    const f = fakeExec(() => ({}))
+    // GitHub is asked first whether an open PR is based on the branch or comes from it: none here.
+    const f = fakeExec((_file, args) => (args[1]?.includes('/pulls?') ? { stdout: '[]' } : {}))
     const ex = createExecutor({ exec: f.exec, orca: createOrcaCli(f.exec), notify: async () => {} })
     assert.deepEqual(await ex.execute({ kind: 'merge', sha: SHA, method: 'squash' }, ctx), { ok: true })
-    assert.deepEqual(f.calls[0].args, ['pr', 'merge', '12', '--repo', 'acme/app', '--squash', '--match-head-commit', SHA, '--delete-branch'])
-    assert.ok(!f.calls[0].args.includes('--admin'))
+    const merge = f.calls.find((c) => c.args[0] === 'pr')!.args
+    assert.deepEqual(merge, ['pr', 'merge', '12', '--repo', 'acme/app', '--squash', '--match-head-commit', SHA, '--delete-branch'])
+    assert.ok(!merge.includes('--admin'))
   })
 
   test('a CI failure message carries each failing job\'s log tail', async () => {

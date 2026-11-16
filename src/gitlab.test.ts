@@ -216,16 +216,18 @@ describe('acting on GitLab', () => {
   const ctx = { repo: REPO, pr: snap, config: config(), root: '/r' }
 
   test('a merge is pinned to the reviewed commit, with squash and branch removal from the config', async () => {
-    const { g, ex } = lab()
+    // GitLab is asked first which merge requests the branch is the target or source of: none here.
+    const { g, ex } = lab((args) => ({ stdout: args.at(-1)!.includes('merge_requests?') ? '[]' : '{"ok":true,"result":{}}' }))
+    const merges = () => g.calls.filter((c) => c.args.at(-1)!.startsWith('should_remove_source_branch='))
     assert.deepEqual(await ex.execute({ kind: 'merge', sha: SHA, method: 'squash' }, ctx), { ok: true })
-    assert.deepEqual(g.calls[0].args, [
+    assert.deepEqual(merges()[0].args, [
       'api', '--hostname', HOST, '-X', 'PUT', 'projects/group%2Fsub%2Fapp/merge_requests/12/merge',
       '-f', `sha=${SHA}`, '-F', 'squash=true', '-F', 'should_remove_source_branch=true'
     ])
-    assert.equal(g.calls[0].file, 'glab')
+    assert.equal(merges()[0].file, 'glab')
     const keep = config((c) => (c.merge.deleteBranch = false))
     await ex.execute({ kind: 'merge', sha: SHA, method: 'merge' }, { ...ctx, config: keep })
-    assert.deepEqual(g.calls[1].args.slice(-4), ['-F', 'squash=false', '-F', 'should_remove_source_branch=false'])
+    assert.deepEqual(merges()[1].args.slice(-4), ['-F', 'squash=false', '-F', 'should_remove_source_branch=false'])
   })
 
   test('gitlab.com is named too, so glab never guesses the host from the working folder', async () => {

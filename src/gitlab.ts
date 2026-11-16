@@ -10,7 +10,7 @@
 // Merge requests are read into the same PrSnapshot as GitHub's PRs, so the planner reads both.
 import { obj, type Obj } from './values.ts'
 import type { Exec, ExecOptions, ExecResult } from './exec.ts'
-import { ISSUE_PAGES, issueText, projectPath, repoKey, tailLog, type Forge, type ForgeReview, type IssueInfo, type LabelCheck, type Outcome, type RepoRef, type FileMoves } from './forge.ts'
+import { ISSUE_PAGES, issueText, projectPath, repoKey, tailLog, type BranchUse, type Forge, type ForgeReview, type IssueInfo, type LabelCheck, type Outcome, type RepoRef, type FileMoves } from './forge.ts'
 import {
   ciStateOf,
   OUR_MARKER,
@@ -479,6 +479,25 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     throw failure(what, res)
   }
 
+  /** The open merge requests into and out of a branch, from GitLab just now; a failure throws. */
+  async function branchUse(repo: RepoRef, branch: string): Promise<BranchUse> {
+    const mrs = async (filter: string): Promise<Obj[]> => {
+      const what = 'merge requests on a branch'
+      const r = await restRead(repo, what, projectApi(projectPath(repo), `merge_requests?state=opened&${filter}=${encodeURIComponent(branch)}&per_page=100`))
+      const list = r.missing ? null : parseJson(r.text)
+      if (!Array.isArray(list)) throw new Error(`glab api ${what}: ${r.missing ? 'not found' : 'an answer that is not a list'}`)
+      return list.map(obj)
+    }
+    const fork = (m: Obj) => m.source_project_id !== m.target_project_id
+    const based = await mrs('target_branch')
+    const from = await mrs('source_branch')
+    return {
+      based: based.flatMap((m) => (typeof m.iid === 'number' ? [{ number: m.iid, crossRepo: fork(m) }] : [])),
+      // A fork's branch of the same name is another branch.
+      from: from.flatMap((m) => (typeof m.iid === 'number' && !fork(m) ? [m.iid] : []))
+    }
+  }
+
   /** A read that may fail without harm: its JSON, or undefined when it failed, is missing or is not JSON. */
   const readJson = async (repo: RepoRef, what: string, path: string): Promise<unknown> => {
     const r = await restRead(repo, what, path).catch(() => null)
@@ -578,7 +597,15 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     // Asynchronous, like gh pr update-branch: GitLab answers at once and rebases in the background.
     updateBranch: (repo, pr) => act(repo, 'rebase', ['-X', 'PUT', projectApi(projectPath(repo), `merge_requests/${pr.number}/rebase`)]),
     retarget: (repo, pr, base) => act(repo, 'update', ['-X', 'PUT', projectApi(projectPath(repo), `merge_requests/${pr.number}`), '-f', `target_branch=${base}`]),
+    branchUse: (repo, branch) => branchUse(repo, branch),
     async deleteBranch(repo, branch, sha) {
+      let use: BranchUse
+      try {
+        use = await branchUse(repo, branch)
+      } catch (error) {
+        return { error: (error as Error).message }
+      }
+      if (use.based.length > 0 || use.from.length > 0) return { result: 'in-use', use }
       const path = projectApi(projectPath(repo), `repository/branches/${encodeURIComponent(branch)}`)
       const head = await glab(repo, [path])
       if (head.code !== 0) return /\b404\b/.test(head.stderr + head.stdout) ? { result: 'gone' } : { error: `glab api branch: ${(head.stderr || head.stdout).trim().slice(0, 400)}` }

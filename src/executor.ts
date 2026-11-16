@@ -4,7 +4,7 @@
 import type { MatriarchConfig } from './config.ts'
 import type { Crew } from './crew.ts'
 import type { Exec } from './exec.ts'
-import { forgeKind, forgeTerms, type BranchDeletion, type ForgeActions, type ForgeKind, type Outcome, type RepoRef } from './forge.ts'
+import { forgeKind, forgeTerms, stackableBranch, type BranchDeletion, type BranchUse, type ForgeActions, type ForgeKind, type Outcome, type RepoRef } from './forge.ts'
 import { createGitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
 import { ciFailureMessage, commentsMessage, draftMessage, escalationMessage, rebaseMessage, restackMessage, updateMessage } from './messages.ts'
@@ -28,6 +28,42 @@ export interface ActionContext {
   owner?: string | null
   /** Failed checks' log tails already read this commit (to judge a flaky failure), by check name. */
   failedLogs?: Record<string, string>
+  /** The repository's default branch, when known: never deleted, nor a long-lived one. */
+  defaultBranch?: string | null
+}
+
+/** GitLab moves up to this many merge requests into a branch it deletes at a merge (RetargetChainService). */
+export const GITLAB_RETARGETS = 4
+
+/**
+ * Whether a PR's branch is deleted as it merges, for a project that deletes merged branches; when
+ * it is kept although such a branch would go, why. Deleting a branch an open PR is based on closes
+ * that PR on GitHub (it moves them only when its own auto-delete setting or a person deletes the
+ * branch after the merge, not when the API does), so the branch is
+ * kept, and deleted once they have moved off it (engine.ts deleteKeptBranches). GitLab moves the
+ * merge requests into the branch itself when it deletes it at the merge: up to four, of this
+ * project, so it is kept only past that, for a fork's, or for another merge request from it. The
+ * forge is asked just before the merge, not from the list read at the start of the tick. The
+ * default branch, a long-lived one (develop, release/*) and a fork's are never deleted.
+ */
+export async function branchAtMerge(forge: ForgeActions, ctx: ActionContext): Promise<{ delete: boolean; kept?: string }> {
+  const { pr, repo } = ctx
+  if (pr.crossRepo || !stackableBranch(pr.headRef, ctx.defaultBranch ?? null)) return { delete: false }
+  let use: BranchUse
+  try {
+    use = await forge.branchUse(repo, pr.headRef)
+  } catch (error) {
+    return { delete: false, kept: `Matriarch could not tell whether another ${pr.forge === 'gitlab' ? 'merge request' : 'PR'} is based on it (${(error as Error).message})` }
+  }
+  const from = use.from.filter((n) => n !== pr.number)
+  const gitlabMoves = pr.forge === 'gitlab' && use.based.length <= GITLAB_RETARGETS && use.based.every((b) => !b.crossRepo)
+  if (from.length === 0 && (use.based.length === 0 || gitlabMoves)) return { delete: true }
+  const refs = (ns: number[]) => (ns.length === 1 ? `#${ns[0]}` : `${ns.slice(0, -1).map((n) => `#${n}`).join(', ')} and #${ns.at(-1)}`)
+  const why = [
+    use.based.length > 0 ? `${refs(use.based.map((b) => b.number))} ${use.based.length === 1 ? 'is' : 'are'} based on it` : null,
+    from.length > 0 ? `${refs(from)} ${from.length === 1 ? 'comes' : 'come'} from it` : null
+  ].filter(Boolean)
+  return { delete: false, kept: why.join(', and ') }
 }
 
 /** Orca's answer when only the Run's coordinator may wake a finished worker. */
@@ -152,9 +188,12 @@ export function createExecutor(deps: ExecutorDeps): Executor {
           const m = updateMessage(pr, action.method)
           return send(ctx, to, m.subject, m.body)
         }
-        case 'merge':
-          // A branch other PRs are based on stays until they moved off it (engine.ts deleteKeptBranches).
-          return forgeOf(repo).merge(repo, pr, action.sha, action.method, config.merge.deleteBranch && !action.keepBranch)
+        case 'merge': {
+          // Whether its branch goes with it is asked of the forge just before (branchAtMerge).
+          const branch = config.merge.deleteBranch ? await branchAtMerge(forgeOf(repo), ctx) : { delete: false }
+          const out = await forgeOf(repo).merge(repo, pr, action.sha, action.method, branch.delete)
+          return out.ok && branch.kept ? { ...out, keptBranch: branch.kept } : out
+        }
         case 'retarget':
           return forgeOf(repo).retarget(repo, pr, action.base)
         case 'rerun-check':

@@ -2,10 +2,10 @@
 // its parent merged, and is rebased off the parent's commits before it merges itself.
 import { assert, describe, test } from 'orca/testing'
 import { validateConfig } from './config.ts'
-import { canBeParent, KEPT_BRANCH_MS, KEPT_RETRY_MS, keptBranchesKey, stackableBranch, tick, type EngineDeps, type KeptBranch, type Workspace } from './engine.ts'
+import { canBeParent, KEPT_BRANCH_MS, KEPT_RETRY_MS, keptBranchesKey, tick, type EngineDeps, type KeptBranch, type Workspace } from './engine.ts'
 import type { Exec, ExecResult } from './exec.ts'
-import type { BranchDeletion } from './forge.ts'
-import { createExecutor, type Executor } from './executor.ts'
+import { stackableBranch, type BranchDeletion, type BranchUse, type ForgeActions } from './forge.ts'
+import { branchAtMerge, createExecutor, type Executor } from './executor.ts'
 import { createGitHub, normalizePr, type GitHub, type PrSnapshot } from './github.ts'
 import { createGitLab, normalizeMr } from './gitlab.ts'
 import { emptyLedger, ledgerKey, loadLedger, record, recordRefusedRetarget, type PrLedger, type StackParent } from './ledger.ts'
@@ -374,9 +374,10 @@ describe('an engine tick over stacked PRs', () => {
   })
 
   // Seen live: the parent merged with gh's --delete-branch, and GitHub closed the child, whose base
-  // was gone (it moves a child only when the branch goes by its own "delete head branches" setting).
-  describe('the branch of a parent other PRs are based on', () => {
-    const setup = (opts: { truncated?: boolean; deletion?: BranchDeletion | Error } = {}) => {
+  // was gone. Whether a branch is kept is decided as it merges (executor.ts branchAtMerge, tested
+  // below); here the executor says it kept it, and the engine deletes it once nothing uses it.
+  describe('a branch kept when its PR merged', () => {
+    const setup = (opts: { truncated?: boolean; deletion?: (n: number) => BranchDeletion | Error; keptBy?: string | null } = {}) => {
       const auth = pr({ number: 11, headRef: 'feature/auth', headSha: PARENT_SHA, title: 'Auth' })
       const login = pr({ number: 12, headRef: 'feature/login', baseRef: 'feature/auth' })
       const prs = [auth, login]
@@ -385,23 +386,27 @@ describe('an engine tick over stacked PRs', () => {
       const logged: string[] = []
       h.deps.log = (line) => void logged.push(line)
       h.deps.executor = {
-        execute: async (a) => (h.executed.push(a), { ok: true }),
+        execute: async (a) => (h.executed.push(a), a.kind === 'merge' && a.sha === PARENT_SHA && opts.keptBy !== null ? { ok: true, keptBranch: opts.keptBy ?? '#12 is based on it' } : { ok: true }),
         deleteBranch: async (_repo, branch, sha) => {
           deleted.push([branch, sha])
-          if (opts.deletion instanceof Error) throw opts.deletion
-          return opts.deletion ?? { result: 'deleted' }
+          const r = opts.deletion?.(deleted.length) ?? { result: 'deleted' }
+          if (r instanceof Error) throw r
+          return r
         }
       }
       const kept = () => h.store.get(keptBranchesKey('acme/app')) as Record<string, KeptBranch> | undefined
-      return { h, prs, auth, login, deleted, logged, kept }
+      // The parent merged, and the child moved to main: nothing in the list uses the branch.
+      const parentMergedChildMoved = () => {
+        prs[0] = { ...auth, state: 'MERGED' }
+        prs[1] = { ...login, baseRef: 'main', updatedAt: '2026-11-10T11:00:00Z' }
+      }
+      return { h, prs, auth, login, deleted, logged, kept, parentMergedChildMoved }
     }
 
-    test('is kept when it merges, and deleted once the PRs based on it moved off it', async () => {
+    test('is recorded when the merge kept it, and deleted once nothing uses it and its PR merged', async () => {
       const { h, prs, auth, login, deleted, logged, kept } = setup()
       const first = await tick(h.deps, { autopilot: true })
-      const merge = h.executed.find((a) => a.kind === 'merge')
-      assert.deepEqual(merge, { kind: 'merge', sha: PARENT_SHA, method: 'squash', keepBranch: '#12 is based on it' })
-      assert.match(first.tracks.find((t) => t.pr?.number === 11)!.reason, /keeping its branch while #12 is based on it/)
+      assert.deepEqual(h.executed.find((a) => a.kind === 'merge'), { kind: 'merge', sha: PARENT_SHA, method: 'squash' })
       assert.deepEqual(kept(), { 'feature/auth': { sha: PARENT_SHA, number: 11, at: first.at } })
 
       // Merged; the child still on its branch: moved, and the branch stays.
@@ -409,26 +414,66 @@ describe('an engine tick over stacked PRs', () => {
       h.advance(60_000)
       await tick(h.deps, { autopilot: true })
       assert.ok(h.executed.some((a) => a.kind === 'retarget'))
-      assert.deepEqual(deleted, [], 'not while #12 is based on it')
+      assert.deepEqual(deleted, [], 'not while the list shows #12 on it')
 
-      // The forge shows the child on main: the branch goes, once.
       prs[1] = { ...login, baseRef: 'main', updatedAt: '2026-11-10T11:00:00Z' }
       h.advance(60_000)
       await tick(h.deps, { autopilot: true })
       assert.deepEqual(deleted, [['feature/auth', PARENT_SHA]])
       assert.deepEqual(kept(), {})
-      assert.ok(logged.some((l) => /deleted feature\/auth, kept when #11 merged/.test(l)))
+      assert.ok(logged.some((l) => /deleted feature\/auth, kept when #11 merged, once no open PR was based on it/.test(l)))
       h.advance(60_000)
       await tick(h.deps, { autopilot: true })
       assert.equal(deleted.length, 1)
     })
 
-    test('a branch with commits since is left, and one already gone is forgotten quietly', async () => {
+    test('a merge that deleted the branch records nothing', async () => {
+      const { h, kept } = setup({ keptBy: null })
+      await tick(h.deps, { autopilot: true })
+      assert.equal(kept(), undefined)
+    })
+
+    test('nothing is deleted while its PR is open, and the branch is left when it closed unmerged', async () => {
+      // The merge was asked for and answered, but never happened (a merge queue dropped it).
+      const { h, prs, login, deleted, logged, kept } = setup()
+      await tick(h.deps, { autopilot: true })
+      prs[1] = { ...login, baseRef: 'main' }
+      h.advance(60_000)
+      await tick(h.deps, { autopilot: true })
+      assert.deepEqual(deleted, [], 'still open: its own branch')
+      prs[0] = { ...prs[0], state: 'CLOSED' }
+      h.advance(60_000)
+      await tick(h.deps, { autopilot: true })
+      assert.deepEqual(deleted, [])
+      assert.deepEqual(kept(), {})
+      assert.ok(logged.some((l) => /left feature\/auth, kept when #11 merged: #11 closed without merging/.test(l)))
+    })
+
+    test('another open PR from the branch keeps it, even with the merged PR gone from the list', async () => {
+      const { h, prs, deleted, kept, parentMergedChildMoved } = setup()
+      await tick(h.deps, { autopilot: true })
+      parentMergedChildMoved()
+      prs.push(pr({ number: 14, headRef: 'feature/auth', baseRef: 'main', headSha: NEW_SHA }))
+      h.advance(60_000)
+      await tick(h.deps, { autopilot: true })
+      assert.deepEqual(deleted, [])
+      assert.ok(kept()?.['feature/auth'])
+    })
+
+    test('what the forge says just before decides: in use, moved on, or already gone', async () => {
+      const inUse = setup({ deletion: () => ({ result: 'in-use', use: { based: [{ number: 15, crossRepo: false }], from: [] } }) })
+      await tick(inUse.h.deps, { autopilot: true })
+      inUse.parentMergedChildMoved()
+      inUse.h.advance(60_000)
+      await tick(inUse.h.deps, { autopilot: true })
+      assert.equal(inUse.deleted.length, 1)
+      assert.ok(inUse.kept()?.['feature/auth'], 'a PR the list did not show yet is based on it: kept')
+      assert.ok(!inUse.logged.some((l) => /feature\/auth/.test(l)), 'quietly')
+
       for (const [result, line] of [['moved', /left feature\/auth, kept when #11 merged: it has commits made since/], ['gone', null]] as const) {
-        const { h, prs, auth, login, deleted, logged, kept } = setup({ deletion: { result } })
+        const { h, deleted, logged, kept, parentMergedChildMoved } = setup({ deletion: () => ({ result }) })
         await tick(h.deps, { autopilot: true })
-        prs[0] = { ...auth, state: 'MERGED' }
-        prs[1] = { ...login, baseRef: 'main' }
+        parentMergedChildMoved()
         h.advance(60_000)
         await tick(h.deps, { autopilot: true })
         assert.equal(deleted.length, 1, result)
@@ -437,45 +482,46 @@ describe('an engine tick over stacked PRs', () => {
       }
     })
 
-    test('a deletion that fails is tried again after a while, not every tick', async () => {
-      const { h, prs, auth, login, deleted, kept } = setup({ deletion: { error: 'HTTP 403' } })
+    test('a deletion that keeps failing backs off, is logged once per error, and shows on the project', async () => {
+      const { h, deleted, logged, kept, parentMergedChildMoved } = setup({ deletion: (n) => ({ error: n < 4 ? 'HTTP 422: protected branch' : 'HTTP 500' }) })
       await tick(h.deps, { autopilot: true })
-      prs[0] = { ...auth, state: 'MERGED' }
-      prs[1] = { ...login, baseRef: 'main' }
+      parentMergedChildMoved()
       h.advance(60_000)
-      const failed = await tick(h.deps, { autopilot: true })
-      assert.equal(kept()?.['feature/auth']?.failedAt, failed.at)
-      h.advance(60_000)
+      const first = await tick(h.deps, { autopilot: true })
+      assert.deepEqual(kept()?.['feature/auth'], { sha: PARENT_SHA, number: 11, at: T0, merged: true, failures: 1, error: 'HTTP 422: protected branch', retryAt: first.at + KEPT_RETRY_MS })
+      h.advance(KEPT_RETRY_MS - 1)
       await tick(h.deps, { autopilot: true })
-      assert.equal(deleted.length, 1)
-      h.advance(KEPT_RETRY_MS)
+      assert.equal(deleted.length, 1, 'not before the wait')
+      h.advance(1)
+      const second = await tick(h.deps, { autopilot: true })
+      assert.equal(kept()?.['feature/auth']?.retryAt, second.at + 2 * KEPT_RETRY_MS, 'the wait doubles')
+      assert.match(second.repos[0].warnings.join(' '), /Could not delete feature\/auth, kept when #11 merged \(tried 2 times\): HTTP 422: protected branch/)
+      h.advance(2 * KEPT_RETRY_MS)
       await tick(h.deps, { autopilot: true })
-      assert.equal(deleted.length, 2)
+      h.advance(4 * KEPT_RETRY_MS)
+      await tick(h.deps, { autopilot: true })
+      assert.equal(deleted.length, 4)
+      assert.deepEqual(logged.filter((l) => /could not delete feature\/auth/.test(l)).map((l) => l.slice(l.indexOf('merged: ') + 8)), ['HTTP 422: protected branch', 'HTTP 500'], 'each error once')
     })
 
-    test('nothing is deleted in dry run, or while the list of open PRs is cut short', async () => {
+    test('nothing is deleted in dry run; a cut-short list does not stop it, as the forge is asked first', async () => {
       const dry = setup()
       await tick(dry.h.deps, { autopilot: true })
-      dry.prs[0] = { ...dry.auth, state: 'MERGED' }
-      dry.prs[1] = { ...dry.login, baseRef: 'main' }
+      dry.parentMergedChildMoved()
       dry.h.advance(60_000)
       await tick(dry.h.deps, { autopilot: false })
       assert.deepEqual(dry.deleted, [])
       assert.ok(dry.kept()?.['feature/auth'], 'still kept for when autopilot is on')
 
-      const cut = setup()
+      const cut = setup({ truncated: true })
       await tick(cut.h.deps, { autopilot: true })
-      // Its list now cut short: another PR based on the branch may be among those left out.
-      const short = harness(cut.prs, { truncated: true })
-      cut.h.deps.github = short.deps.github
-      cut.prs[0] = { ...cut.auth, state: 'MERGED' }
-      cut.prs[1] = { ...cut.login, baseRef: 'main' }
+      cut.parentMergedChildMoved()
       cut.h.advance(60_000)
       await tick(cut.h.deps, { autopilot: true })
-      assert.deepEqual(cut.deleted, [])
+      assert.deepEqual(cut.deleted, [['feature/auth', PARENT_SHA]])
     })
 
-    test('a branch PRs stay based on is left after 30 days; with merged branches kept, nothing is recorded', async () => {
+    test('after 30 days it is left and forgotten; with merged branches kept, the records go', async () => {
       const { h, prs, auth, deleted, logged, kept } = setup()
       await tick(h.deps, { autopilot: true })
       prs[0] = { ...auth, state: 'MERGED' }
@@ -484,13 +530,80 @@ describe('an engine tick over stacked PRs', () => {
       await tick(h.deps, { autopilot: true })
       assert.deepEqual(deleted, [])
       assert.deepEqual(kept(), {})
-      assert.ok(logged.some((l) => /left feature\/auth, kept when #11 merged: PRs were still based on it 30 days later/.test(l)))
+      assert.ok(logged.some((l) => /stopped trying to delete feature\/auth, kept when #11 merged, after 30 days; it is left as it is/.test(l)))
 
       const off = setup()
-      off.h.deps.readConfig = async () => validateConfig({ review: { enabled: false }, merge: { mode: 'auto', deleteBranch: false } })
       await tick(off.h.deps, { autopilot: true })
-      assert.deepEqual(off.h.executed.find((a) => a.kind === 'merge'), { kind: 'merge', sha: PARENT_SHA, method: 'squash' })
-      assert.equal(off.kept(), undefined)
+      assert.ok(off.kept()?.['feature/auth'])
+      off.h.deps.readConfig = async () => validateConfig({ review: { enabled: false }, merge: { mode: 'auto', deleteBranch: false } })
+      off.h.advance(60_000)
+      await tick(off.h.deps, { autopilot: true })
+      assert.deepEqual(off.kept(), {})
+      assert.deepEqual(off.deleted, [])
+    })
+
+    test('its PR still open where the list leaves it out, or a failed read, deletes nothing; both wait a while', async () => {
+      for (const read of ['open', 'failed'] as const) {
+        const { h, prs, login, deleted, kept } = setup()
+        await tick(h.deps, { autopilot: true })
+        prs[1] = { ...login, baseRef: 'main' }
+        const { listOpen, detail } = h.deps.github!
+        // The list leaves the parent out (cut short, or stale), while it is still open.
+        h.deps.github = {
+          ...h.deps.github!,
+          listOpen: async (repo, o) => {
+            const l = await listOpen(repo, o)
+            return { ...l, prs: l.prs.filter((p) => p.number !== 11) }
+          },
+          detail: async (repo, n) => {
+            if (n === 11 && read === 'failed') throw new Error('HTTP 502')
+            return detail(repo, n)
+          }
+        }
+        h.advance(60_000)
+        const board = await tick(h.deps, { autopilot: true })
+        assert.deepEqual(deleted, [], read)
+        const k = kept()?.['feature/auth']
+        assert.equal(k?.retryAt, board.at + KEPT_RETRY_MS, read)
+        assert.equal(k?.merged, undefined, read)
+        assert.equal(k?.failures, read === 'failed' ? 1 : undefined, `${read}: only a failed read counts as a failure`)
+      }
+    })
+
+    test('a PR read as merged is not read again while the branch waits', async () => {
+      let n = 0
+      const { h, deleted, kept, parentMergedChildMoved } = setup({ deletion: () => (++n === 1 ? { result: 'in-use', use: { based: [], from: [16] } } : { result: 'deleted' }) })
+      await tick(h.deps, { autopilot: true })
+      parentMergedChildMoved()
+      h.advance(60_000)
+      const waited = await tick(h.deps, { autopilot: true })
+      assert.deepEqual(kept()?.['feature/auth'], { sha: PARENT_SHA, number: 11, at: T0, merged: true, retryAt: waited.at + KEPT_RETRY_MS }, 'in use is no failure')
+      // Reading it would fail now: it is not read, and the branch goes.
+      const { detail } = h.deps.github!
+      h.deps.github = { ...h.deps.github!, detail: async (repo, num) => (num === 11 ? Promise.reject(new Error('HTTP 502')) : detail(repo, num)) }
+      h.advance(KEPT_RETRY_MS)
+      await tick(h.deps, { autopilot: true })
+      assert.equal(deleted.length, 2)
+      assert.deepEqual(kept(), {})
+    })
+
+    test('a record naming the default branch or a long-lived one is dropped, and the branch left', async () => {
+      const { h, deleted, logged, kept } = setup({ keptBy: null })
+      h.store.set(keptBranchesKey('acme/app'), { develop: { sha: PARENT_SHA, number: 9, at: T0 }, main: { sha: PARENT_SHA, number: 8, at: T0 } })
+      await tick(h.deps, { autopilot: true })
+      assert.deepEqual(deleted, [])
+      assert.deepEqual(kept(), {})
+      assert.ok(logged.some((l) => /left develop, kept when #9 merged: it is a long-lived branch/.test(l)))
+      assert.ok(logged.some((l) => /left main, kept when #8 merged: it is the default branch/.test(l)))
+    })
+
+    test('a branch may be named anything, __proto__ too', async () => {
+      const { h, kept } = setup()
+      // Read back from storage, and written again when another record goes.
+      h.store.set(keptBranchesKey('acme/app'), JSON.parse(`{"__proto__": {"sha": "abc", "number": 9, "at": ${T0}}, "old": {"sha": "abc", "number": 8, "at": 1}}`))
+      await tick(h.deps, { autopilot: false })
+      assert.ok(Object.hasOwn(kept()!, '__proto__'))
+      assert.deepEqual(Object.keys(kept()!), ['__proto__'])
     })
   })
 })
@@ -555,69 +668,144 @@ describe('reading what stacking needs from each forge', () => {
   })
 })
 
-describe('merging a PR other PRs are based on', () => {
-  const merging = (over: Partial<Parameters<typeof input>[0]> = {}) => plan(input({ config: auto, ...over }, passed()))
-  test('keeps its branch, and says why, when merged branches are deleted', () => {
-    assert.deepEqual(merging({ basedOnIt: [12] }).actions, [{ kind: 'merge', sha: SHA, method: 'squash', keepBranch: '#12 is based on it' }])
-    assert.equal(merging({ basedOnIt: [12, 14] }).reason, 'merging (squash); keeping its branch while #12 and #14 are based on it')
-    assert.match(merging({ basedOnIt: null }).reason, /keeping its branch while GitHub listed too many open PRs to tell whether one is based on it/)
+describe("whether a merging PR's branch goes with it", () => {
+  // The forge is asked as the PR merges; `use` is what it answers.
+  const decide = (over: { pr?: Partial<PrSnapshot>; use?: BranchUse | Error; defaultBranch?: string | null } = {}) => {
+    const asked: string[] = []
+    const forge = {
+      branchUse: async (_repo: unknown, branch: string) => {
+        asked.push(branch)
+        if (over.use instanceof Error) throw over.use
+        return over.use ?? { based: [], from: [] }
+      }
+    } as unknown as ForgeActions
+    const snap = pr({ number: 11, headRef: 'feature/auth', ...over.pr })
+    return branchAtMerge(forge, { repo: { owner: 'acme', name: 'app' }, pr: snap, config: auto, root: '/r', defaultBranch: over.defaultBranch === undefined ? 'main' : over.defaultBranch }).then((d) => ({ ...d, asked }))
+  }
+  const based = (...numbers: number[]) => numbers.map((number) => ({ number, crossRepo: false }))
+
+  test('GitHub: it goes only when no open PR is based on it or comes from it', async () => {
+    assert.deepEqual(await decide(), { delete: true, asked: ['feature/auth'] })
+    assert.deepEqual(await decide({ use: { based: [], from: [11] } }), { delete: true, asked: ['feature/auth'] }, 'the merging PR itself')
+    assert.deepEqual((await decide({ use: { based: based(12), from: [] } })).kept, '#12 is based on it')
+    assert.deepEqual((await decide({ use: { based: based(12, 13, 14), from: [15] } })).kept, '#12, #13 and #14 are based on it, and #15 comes from it')
   })
-  test('deletes it as before otherwise', () => {
-    for (const p of [merging({ basedOnIt: [] }), merging(), merging({ basedOnIt: [12], config: config((c) => ((c.merge.mode = 'auto'), (c.merge.deleteBranch = false))) }), merging({ basedOnIt: [12], pr: pr({ crossRepo: true }) })]) {
-      assert.equal(p.lane, 'merging')
-      assert.equal((p.actions[0] as Extract<Action, { kind: 'merge' }>).keepBranch, undefined)
-    }
+
+  test("GitLab: it goes when GitLab moves the merge requests into it (up to four of this project's)", async () => {
+    const gl = { forge: 'gitlab' as const }
+    assert.equal((await decide({ pr: gl, use: { based: based(12, 13, 14, 15), from: [] } })).delete, true)
+    assert.equal((await decide({ pr: gl, use: { based: based(12, 13, 14, 15, 16), from: [] } })).kept, '#12, #13, #14, #15 and #16 are based on it')
+    assert.equal((await decide({ pr: gl, use: { based: [{ number: 12, crossRepo: true }], from: [] } })).kept, '#12 is based on it', "a fork's GitLab does not move")
+    assert.equal((await decide({ pr: gl, use: { based: [], from: [14] } })).kept, '#14 comes from it')
+  })
+
+  test('kept when the forge cannot say; never the default branch, a long-lived one or a fork’s', async () => {
+    assert.match((await decide({ use: new Error('HTTP 502') })).kept ?? '', /^Matriarch could not tell whether another PR is based on it \(HTTP 502\)$/)
+    for (const headRef of ['main', 'develop', 'release/2.0', 'v2']) assert.deepEqual(await decide({ pr: { headRef } }), { delete: false, asked: [] }, headRef)
+    assert.deepEqual(await decide({ pr: { headRef: 'trunk2' }, defaultBranch: 'trunk2' }), { delete: false, asked: [] }, 'the default, whatever its name')
+    assert.deepEqual(await decide({ pr: { crossRepo: true } }), { delete: false, asked: [] })
+  })
+
+  test('the merge passes the answer on, and says why a branch stayed', async () => {
+    const calls: (readonly string[])[] = []
+    let answer = '[]'
+    const exec: Exec = async (_file, args): Promise<ExecResult> => (calls.push(args), { code: 0, stdout: args[1]?.startsWith('repos/acme/app/pulls') ? answer : '', stderr: '' })
+    const ex = createExecutor({ exec, orca: createOrcaCli(exec), notify: async () => {} })
+    const ctx = { repo: { owner: 'acme', name: 'app' }, pr: pr({ number: 11, headRef: 'feature/auth' }), config: auto, root: '/r', defaultBranch: 'main' }
+    assert.deepEqual(await ex.execute({ kind: 'merge', sha: SHA, method: 'squash' }, ctx), { ok: true })
+    assert.ok(calls.at(-1)!.includes('--delete-branch'))
+    answer = '[{"number":12,"crossRepo":false}]'
+    assert.deepEqual(await ex.execute({ kind: 'merge', sha: SHA, method: 'squash' }, ctx), { ok: true, keptBranch: '#12 is based on it' })
+    assert.ok(!calls.at(-1)!.includes('--delete-branch'))
+    calls.length = 0
+    const off = { ...ctx, config: config((c) => ((c.merge.mode = 'auto'), (c.merge.deleteBranch = false))) }
+    assert.deepEqual(await ex.execute({ kind: 'merge', sha: SHA, method: 'squash' }, off), { ok: true })
+    assert.equal(calls.length, 1, 'merged branches kept: the forge is not asked')
+    assert.ok(!calls[0].includes('--delete-branch'))
   })
 })
 
-describe('deleting a kept branch on each forge', () => {
-  test('GitHub: the merge leaves out --delete-branch while the branch is kept', async () => {
+describe('asking a forge about a branch, and deleting one', () => {
+  type Reply = { code?: number; stdout?: string; stderr?: string }
+  const github = (reply: (args: readonly string[]) => Reply) => {
     const calls: (readonly string[])[] = []
-    const exec: Exec = async (_file, args): Promise<ExecResult> => (calls.push(args), { code: 0, stdout: '', stderr: '' })
-    const ex = createExecutor({ exec, orca: createOrcaCli(exec), notify: async () => {} })
-    const ctx = { repo: { owner: 'acme', name: 'app' }, pr: pr(), config: auto, root: '/r' }
-    await ex.execute({ kind: 'merge', sha: SHA, method: 'squash', keepBranch: '#12 is based on it' }, ctx)
-    await ex.execute({ kind: 'merge', sha: SHA, method: 'squash' }, ctx)
-    assert.ok(!calls[0].includes('--delete-branch'))
-    assert.ok(calls[1].includes('--delete-branch'))
+    const exec: Exec = async (_file, args): Promise<ExecResult> => {
+      calls.push(args)
+      const r = reply(args)
+      return { code: r.code ?? 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
+    }
+    return { gh: createGitHub(exec), calls }
+  }
+  const repo = { owner: 'acme', name: 'app' }
+
+  test('GitHub: the open PRs into and out of a branch, its name escaped', async () => {
+    const { gh, calls } = github((args) => ({ stdout: args[1].includes('base=') ? '[{"number":12,"crossRepo":false},{"number":13,"crossRepo":true}]' : '[14]' }))
+    assert.deepEqual(await gh.branchUse(repo, 'me/feature #2'), { based: [{ number: 12, crossRepo: false }, { number: 13, crossRepo: true }], from: [14] })
+    assert.deepEqual(calls.map((c) => c[1]), ['repos/acme/app/pulls?state=open&base=me%2Ffeature%20%232&per_page=100', 'repos/acme/app/pulls?state=open&head=acme:me%2Ffeature%20%232&per_page=100'])
+    assert.match(calls[0][3], /head\.repo\.full_name/)
+    const failing = github(() => ({ code: 1, stderr: 'gh: Bad credentials (HTTP 401)' }))
+    await assert.rejects(failing.gh.branchUse(repo, 'x'), /gh api pulls: gh: Bad credentials/)
   })
 
-  test('GitHub: deleted only while it still points at the merged commit', async () => {
-    type Reply = { code: number; stdout?: string; stderr?: string }
-    const run = async (head: Reply, del: Reply = { code: 0 }) => {
-      const calls: (readonly string[])[] = []
-      const exec: Exec = async (_file, args): Promise<ExecResult> => {
-        calls.push(args)
-        const r = args.includes('DELETE') ? del : head
-        return { code: r.code, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
-      }
-      return { out: await createGitHub(exec).deleteBranch({ owner: 'acme', name: 'app' }, 'me/feature #2', PARENT_SHA), calls }
+  test('GitHub: deleted only when nothing uses it and it still points at the merged commit', async () => {
+    const run = async (opts: { use?: string; from?: string; head?: Reply; del?: Reply }) => {
+      const { gh, calls } = github((args) => (args[1].includes('/pulls?') ? { stdout: args[1].includes('base=') ? (opts.use ?? '[]') : (opts.from ?? '[]') } : args.includes('DELETE') ? (opts.del ?? {}) : (opts.head ?? { stdout: `${PARENT_SHA}\n` })))
+      return { out: await gh.deleteBranch(repo, 'me/feature #2', PARENT_SHA), calls: calls.filter((c) => !c[1].includes('/pulls?')) }
     }
-    const ok = await run({ code: 0, stdout: `${PARENT_SHA}\n` })
+    const ok = await run({})
     assert.deepEqual(ok.out, { result: 'deleted' })
     assert.deepEqual(ok.calls, [
       ['api', 'repos/acme/app/git/ref/heads/me/feature%20%232', '--jq', '.object.sha'],
       ['api', '-X', 'DELETE', 'repos/acme/app/git/refs/heads/me/feature%20%232']
     ])
-    const moved = await run({ code: 0, stdout: `${NEW_SHA}\n` })
-    assert.deepEqual(moved.out, { result: 'moved' })
-    assert.equal(moved.calls.length, 1, 'no delete')
-    assert.deepEqual((await run({ code: 1, stderr: 'gh: Not Found (HTTP 404)' })).out, { result: 'gone' })
-    assert.deepEqual((await run({ code: 0, stdout: PARENT_SHA }, { code: 1, stderr: 'gh: Reference does not exist (HTTP 422)' })).out, { result: 'gone' })
-    assert.match(JSON.stringify((await run({ code: 1, stderr: 'gh: Bad credentials (HTTP 401)' })).out), /"error":"gh api: gh: Bad credentials/)
+    const used = await run({ use: '[{"number":12,"crossRepo":false}]' })
+    assert.deepEqual(used.out, { result: 'in-use', use: { based: [{ number: 12, crossRepo: false }], from: [] } })
+    assert.deepEqual(used.calls, [], 'not even read')
+    const from = await run({ from: '[16]' })
+    assert.deepEqual(from.out, { result: 'in-use', use: { based: [], from: [16] } }, 'another open PR from it')
+    assert.deepEqual(from.calls, [])
+    assert.deepEqual((await run({ head: { stdout: NEW_SHA } })).out, { result: 'moved' })
+    assert.deepEqual((await run({ head: { code: 1, stderr: 'gh: Not Found (HTTP 404)' } })).out, { result: 'gone' })
+    assert.deepEqual((await run({ del: { code: 1, stderr: 'gh: Reference does not exist (HTTP 422)' } })).out, { result: 'gone' })
+    assert.match(JSON.stringify((await run({ del: { code: 1, stderr: 'gh: Cannot delete this protected branch (HTTP 422)' } })).out), /"error":"gh api: gh: Cannot delete this protected branch/)
   })
 
-  test('GitLab: the same, through the branches API on its own host', async () => {
-    const g = fakeGlab((args) => (args.includes('DELETE') ? {} : { stdout: JSON.stringify({ name: 'feature/auth', commit: { id: PARENT_SHA } }) }))
-    assert.deepEqual(await createGitLab(g.exec).deleteBranch(REPO, 'feature/auth', PARENT_SHA), { result: 'deleted' })
-    assert.deepEqual(g.calls.map((c) => c.args), [
+  test("GitLab: the same through its API on its own host; a fork's merge request from a same-named branch is not from this one", async () => {
+    const answer = (args: readonly string[]) => {
+      const path = args.at(-1)!
+      if (path.includes('target_branch=')) return { stdout: JSON.stringify([{ iid: 12, source_project_id: 1, target_project_id: 1 }, { iid: 13, source_project_id: 2, target_project_id: 1 }]) }
+      if (path.includes('source_branch=')) return { stdout: JSON.stringify([{ iid: 14, source_project_id: 2, target_project_id: 1 }]) }
+      return {}
+    }
+    const g = fakeGlab(answer)
+    assert.deepEqual(await createGitLab(g.exec).branchUse(REPO, 'feature/auth'), { based: [{ number: 12, crossRepo: false }, { number: 13, crossRepo: true }], from: [] })
+    assert.deepEqual(g.calls.map((c) => c.args.at(-1)), [
+      'projects/group%2Fsub%2Fapp/merge_requests?state=opened&target_branch=feature%2Fauth&per_page=100',
+      'projects/group%2Fsub%2Fapp/merge_requests?state=opened&source_branch=feature%2Fauth&per_page=100'
+    ])
+    assert.ok(g.calls.every((c) => c.args.includes(HOST)))
+
+    const free = fakeGlab((args) => (args.at(-1)!.includes('merge_requests?') ? { stdout: '[]' } : args.includes('DELETE') ? {} : { stdout: JSON.stringify({ name: 'feature/auth', commit: { id: PARENT_SHA } }) }))
+    assert.deepEqual(await createGitLab(free.exec).deleteBranch(REPO, 'feature/auth', PARENT_SHA), { result: 'deleted' })
+    assert.deepEqual(free.calls.slice(2).map((c) => c.args), [
       ['api', '--hostname', HOST, 'projects/group%2Fsub%2Fapp/repository/branches/feature%2Fauth'],
       ['api', '--hostname', HOST, '-X', 'DELETE', 'projects/group%2Fsub%2Fapp/repository/branches/feature%2Fauth']
     ])
-    const moved = fakeGlab(() => ({ stdout: JSON.stringify({ commit: { id: NEW_SHA } }) }))
+    const used = fakeGlab(answer)
+    assert.equal(((await createGitLab(used.exec).deleteBranch(REPO, 'feature/auth', PARENT_SHA)) as { result: string }).result, 'in-use')
+    assert.equal(used.calls.length, 2, 'not deleted')
+    const moved = fakeGlab((args) => (args.at(-1)!.includes('merge_requests?') ? { stdout: '[]' } : { stdout: JSON.stringify({ commit: { id: NEW_SHA } }) }))
     assert.deepEqual(await createGitLab(moved.exec).deleteBranch(REPO, 'feature/auth', PARENT_SHA), { result: 'moved' })
-    assert.equal(moved.calls.length, 1)
-    const gone = fakeGlab(() => ({ code: 1, stderr: 'glab: 404 Branch Not Found' }))
-    assert.deepEqual(await createGitLab(gone.exec).deleteBranch(REPO, 'feature/auth', PARENT_SHA), { result: 'gone' })
+    const fromIt = fakeGlab((args) => (args.at(-1)!.includes('source_branch=') ? { stdout: JSON.stringify([{ iid: 16, source_project_id: 1, target_project_id: 1 }]) } : { stdout: '[]' }))
+    assert.deepEqual(await createGitLab(fromIt.exec).deleteBranch(REPO, 'feature/auth', PARENT_SHA), { result: 'in-use', use: { based: [], from: [16] } })
+    assert.equal(fromIt.calls.length, 2, 'not deleted')
+  })
+
+  test('GitLab merges with its own branch removal as decided', async () => {
+    const g = fakeGlab((args) => (args.at(-1)!.includes('merge_requests?') ? { stdout: '[]' } : { stdout: '{}' }))
+    const ex = createExecutor({ exec: g.exec, orca: createOrcaCli(g.exec), notify: async () => {} })
+    const snap = normalizeMr(detailData().project.mergeRequest, KEY, HOST, 'me', 0)!
+    await ex.execute({ kind: 'merge', sha: SHA, method: 'squash' }, { repo: REPO, pr: snap, config: auto, root: '/r', defaultBranch: 'main' })
+    assert.ok(g.calls.at(-1)!.args.includes('should_remove_source_branch=true'))
   })
 })

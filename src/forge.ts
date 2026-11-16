@@ -36,10 +36,34 @@ export function gitlabRef(host: string, path: string): RepoRef {
   return { kind: 'gitlab', host, owner: path.slice(0, cut), name: path.slice(cut + 1) }
 }
 
-/** What happened when Matriarch acted: done, failed with the forge's or Orca's words, or skipped on purpose. */
-/** What became of a branch Matriarch set out to delete (ForgeActions.deleteBranch). */
-export type BranchDeletion = { result: 'deleted' | 'gone' | 'moved' } | { error: string }
+/**
+ * Branches that live on after their PRs merge (a release or integration branch), by name. A PR
+ * from one is a release or a back-merge, never a parent that PRs into that branch wait for, and
+ * Matriarch never deletes one when such a PR merges.
+ */
+export const LONG_LIVED_BRANCH = /^(?:main|master|trunk|develop|development|dev|staging|stage|production|prod|stable|next|releases?(?:[/-].+)?|v?\d+(?:\.(?:\d+|x))*)$/i
 
+/** A short-lived branch: not the default branch or a long-lived one. PRs can be stacked on it, and it is deleted once merged. */
+export function stackableBranch(branch: string, defaultBranch: string | null): boolean {
+  return branch !== '' && branch !== defaultBranch && !LONG_LIVED_BRANCH.test(branch)
+}
+
+/** The open PRs a branch is the base of, and those it is the head of (in this repository). */
+export interface BranchUse {
+  /** PRs into the branch; a fork's is marked. */
+  based: { number: number; crossRepo: boolean }[]
+  /** PRs from the branch, a fork's left out: a fork's branch of that name is another branch. */
+  from: number[]
+}
+
+/**
+ * What became of a branch Matriarch set out to delete (ForgeActions.deleteBranch): deleted, gone
+ * already, left because it points past the merged commit, left because an open PR is based on it
+ * or comes from it, or an error to try again later.
+ */
+export type BranchDeletion = { result: 'deleted' | 'gone' | 'moved' } | { result: 'in-use'; use: BranchUse } | { error: string }
+
+/** What happened when Matriarch acted: done, failed with the forge's or Orca's words, or skipped on purpose. */
 export interface Outcome {
   ok: boolean
   error?: string
@@ -51,6 +75,8 @@ export interface Outcome {
    * its thread is known to be about this PR (mailbox.ts).
    */
   sent?: { to: 'worker' | 'supervisor' | 'you'; subject: string; note?: string; address?: string; messageId?: string | null; from?: string | null }
+  /** A merge that kept the PR's branch although merged branches are deleted: why (other PRs are based on it, say). */
+  keptBranch?: string
 }
 
 /** An open issue, as handed to the supervisor. */
@@ -151,10 +177,11 @@ export interface ForgeActions {
   failedLogs(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
   /** Points a PR at another base branch: a stacked PR, once the PR it was stacked on merged. */
   retarget(repo: RepoRef, pr: PrSnapshot, base: string): Promise<Outcome>
+  /** The open PRs into and out of a branch, asked of the forge just now (not from the cached list). */
+  branchUse(repo: RepoRef, branch: string): Promise<BranchUse>
   /**
-   * Deletes a branch of the repository while it still points at `sha` (a merged PR's branch kept
-   * for the PRs based on it): 'gone' when it no longer exists, 'moved' when it points elsewhere
-   * and so is left, or an error to try again later.
+   * Deletes a merged PR's branch that was kept, asking just before: not while an open PR is based
+   * on it or comes from it ('in-use'), nor once it points past `sha` ('moved').
    */
   deleteBranch(repo: RepoRef, branch: string, sha: string): Promise<BranchDeletion>
   /** Runs failed checks' jobs again (checks that looked flaky); several only when they share a GitHub workflow run. */

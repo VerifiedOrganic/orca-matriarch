@@ -50,11 +50,8 @@ export type Action =
   | { kind: 'start-review'; sha: string; round: number; reviewers: ReviewerSpec[] }
   | { kind: 'send-findings'; to: string; sha: string; round: number }
   | { kind: 'publish-review'; sha: string; round: number }
-  /**
-   * Merges the PR at `sha`. With `keepBranch` (why it is kept) its branch stays although the
-   * project deletes merged branches: other PRs are based on it, and deleting it would close them.
-   */
-  | { kind: 'merge'; sha: string; method: 'squash' | 'merge' | 'rebase'; keepBranch?: string }
+  /** Merges the PR at `sha`; whether its branch goes with it is decided as it merges (executor.ts branchAtMerge). */
+  | { kind: 'merge'; sha: string; method: 'squash' | 'merge' | 'rebase' }
   | { kind: 'escalate'; to: 'supervisor' | 'human'; key: string; reason: string; address: string | null }
   | { kind: 'notify'; key: string; title: string; body: string }
   /** Points the PR at its merged parent's base, when the forge left it on the parent's branch. */
@@ -91,11 +88,6 @@ export interface PlanInput {
    * forge's list of open PRs was cut short: Matriarch cannot rule out that it is stacked.
    */
   unlistedBase?: boolean
-  /**
-   * Open PRs whose base is this PR's branch, anyone's: deleting the branch when this one merges
-   * would close them. `null` when the forge's list of open PRs was cut short, so some may be missing.
-   */
-  basedOnIt?: number[] | null
   now: number
 }
 
@@ -614,25 +606,5 @@ function mergeGate(input: PlanInput): Plan {
     return { lane: 'ready', reason: why, actions: e.actions }
   }
   if (!input.mergeSlotFree) return { lane: 'ready', reason: `queued: another merge into ${pr.baseRef} is in flight`, actions: [] }
-  const keep = merge.deleteBranch && !pr.crossRepo ? keptBranchReason(input) : null
-  return {
-    lane: 'merging',
-    reason: `merging (${merge.method})${keep ? `; keeping its branch while ${keep}` : ''}`,
-    actions: [{ kind: 'merge', sha, method: merge.method, ...(keep ? { keepBranch: keep } : {}) }]
-  }
-}
-
-/**
- * Why a merging PR's branch must stay although merged branches are deleted, or null when it can
- * go. A forge closes the PRs based on a branch that is deleted (GitHub moves them only when the
- * branch goes by its own setting), so it stays until Matriarch has moved them onto the branch
- * this PR merges into; then it is deleted (engine.ts deleteKeptBranches).
- */
-export function keptBranchReason(input: PlanInput): string | null {
-  const based = input.basedOnIt
-  if (based === undefined) return null
-  if (based === null) return `${forgeTerms(input.pr.forge).name} listed too many open PRs to tell whether one is based on it`
-  if (based.length === 0) return null
-  const refs = based.map((n) => `#${n}`)
-  return `${refs.length === 1 ? refs[0] : `${refs.slice(0, -1).join(', ')} and ${refs.at(-1)}`} ${refs.length === 1 ? 'is' : 'are'} based on it`
+  return { lane: 'merging', reason: `merging (${merge.method})`, actions: [{ kind: 'merge', sha, method: merge.method }] }
 }

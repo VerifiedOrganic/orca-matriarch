@@ -211,10 +211,14 @@ usual but waits at the merge step until its parent has merged. Then:
 3. it merges like any other PR: marked ready for you, or merged by Matriarch when the project
    lets it.
 
-When Matriarch merges a PR that other PRs are based on, it keeps that PR's branch even with
-**Delete merged branches** on, because deleting it would make the forge close them. Once no open
-PR is based on it, Matriarch deletes it, if it still points at the merged commit; one with commits
-since is left.
+With **Delete merged branches** on, Matriarch asks the forge just before it merges a PR whether
+another open PR is based on its branch or comes from it. On GitHub such a branch is kept, because
+deleting it would close the PRs based on it. GitLab moves up to four merge requests of the project
+onto the new base itself when it deletes a branch, so there a branch is kept only for more, a
+fork's, or another merge request from it. Matriarch deletes a kept branch once nothing uses it
+and its PR shows as merged, if it still points at the merged commit (one with commits since is
+left); it stops trying after 30 days. The default branch and long-lived ones (develop,
+`release/*`, …) are never deleted.
 
 If the parent closes without merging, the PR needs you. There is no switch: Matriarch never
 merges a PR into the branch of another PR of yours that it follows. Some PRs are never parents,
@@ -365,7 +369,7 @@ a poll.
 - stops workers that started over a limit;
 - hands labeled issues to the supervisor and comments on them;
 - runs the advisor and mails its answers;
-- removes merged and finished worktrees;
+- removes merged and finished worktrees, and deletes the merged branches it kept;
 - sends away alerts, except the one above.
 
 A project whose settings have errors is only watched, autopilot or not, until they are fixed.
@@ -463,7 +467,8 @@ It never passes `--admin` and never bypasses branch protection or GitLab's merge
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
 | `gh api repos/<repo>/compare/<sha>...<branch>` | once when a stacked PR's parent merged: whether the base kept the commit the PR was built on |
 | `gh pr edit <n> --base <branch>` | autopilot: move a stacked PR to where its parent merged, when GitHub left it on the parent's branch |
-| `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit (with `--delete-branch` when merged branches are deleted and no open PR is based on it) |
+| `gh api repos/<repo>/pulls?state=open&base=<branch>`, `…&head=<owner>:<branch>` | autopilot, with **Delete merged branches** on: just before a merge, and before deleting a kept branch, whether an open PR is based on the branch or comes from it |
+| `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit (with `--delete-branch` when merged branches are deleted and nothing uses it) |
 | `gh api repos/<repo>/git/ref/heads/<branch>`, `gh api -X DELETE …/git/refs/heads/<branch>` | autopilot: delete a merged PR's branch kept for the PRs based on it, once none is, if it still points at the merged commit |
 | `gh api repos/<repo>/issues?state=open&labels=<label>&page=<n>` | with **Issues** on, every 5 minutes: the open issues with the label |
 | `gh api graphql` (an issue's label and title events and last edit), `gh api repos/<repo>/collaborators/<login>/permission` | with **Issues** on, once per new or changed labeled issue: who added the label, and whether it changed since |
@@ -484,7 +489,8 @@ It never passes `--admin` and never bypasses branch protection or GitLab's merge
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/rebase` | autopilot: rebase a merge request that is behind its base |
 | `glab api --hostname <host> …/repository/merge_base?refs[]=<sha>&refs[]=<branch>` | once when a stacked merge request's parent merged: whether the base kept the commit it was built on |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n> -f target_branch=<branch>` | autopilot: move a stacked merge request to where its parent merged |
-| `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
+| `glab api --hostname <host> …/merge_requests?state=opened&target_branch=<branch>`, `…&source_branch=<branch>` | autopilot, with **Delete merged branches** on: just before a merge, and before deleting a kept branch, which merge requests the branch is the target or source of |
+| `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit (removing its branch when merged branches are deleted and GitLab moves whatever is based on it) |
 | `glab api --hostname <host> …/repository/branches/<branch>`, `-X DELETE …/repository/branches/<branch>` | autopilot: delete a merged merge request's branch kept for the merge requests based on it, once none is, if it still points at the merged commit |
 | `glab api --hostname <host> projects/<project>/issues?state=opened&labels=<label>&page=<n>` | with **Issues** on, every 5 minutes: the open issues with the label |
 | `glab api --hostname <host> …/issues/<n>/resource_label_events`, `…/members/all/<id>`, `users/<id>`, `graphql` (its last edit) | with **Issues** on, once per new or changed labeled issue: who added the label, whether they are a bot, and whether it changed since |

@@ -26,7 +26,7 @@ function done(action: Action, who: string, forge: ForgeKind): string {
     case 'publish-review':
       return forge === 'gitlab' ? 'Posted the AI review on the merge request as a note' : 'Posted the AI review on the PR as a comment review'
     case 'merge':
-      return `Asked ${forgeTerms(forge).name} to merge ${shortSha(action.sha)} (${action.method})${action.keepBranch ? `, keeping its branch while ${action.keepBranch}` : ''}`
+      return `Asked ${forgeTerms(forge).name} to merge ${shortSha(action.sha)} (${action.method})`
     case 'escalate':
       if (action.to === 'human') return `Told you: ${action.reason}`
       return action.key.startsWith('draft:') ? `Asked ${who} whether the draft is ready: ${action.reason}` : `Escalated to ${who}: ${action.reason}`
@@ -52,10 +52,12 @@ export function logEntry(action: Action, outcome: Outcome, at: number, forge: Fo
   const text = action.kind === 'update-branch' && sent
     ? `Asked ${WHO[sent.to]} to ${action.method === 'merge' ? 'merge its base in' : 'rebase onto its base'}${forge === 'gitlab' ? ` (${forgeTerms(forge).name} cannot)` : ''}`
     : done(action, sent ? WHO[sent.to] : 'the worker', forge)
+  // A merge that kept its branch says why: other PRs are based on it.
+  const kept = outcome.keptBranch ? `, keeping its branch: ${outcome.keptBranch}` : ''
   return {
     at,
     kind: action.kind,
-    text: sent?.note ? `${text} (${sent.note})` : text,
+    text: `${text}${kept}${sent?.note ? ` (${sent.note})` : ''}`,
     ...(sent ? { to: sent.to, subject: sent.subject } : {})
   }
 }

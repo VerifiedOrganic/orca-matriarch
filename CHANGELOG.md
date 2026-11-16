@@ -33,7 +33,8 @@ The first release.
     GitLab jobs only.
   - **Stacked PRs** merge in order: a PR on another of your PRs' branch waits until that one
     merges, is moved onto its base if the forge did not move it, and, when the base did not keep
-    the parent's commits, its worker is asked to rebase off them before it merges.
+    the parent's commits, its worker is asked to rebase off them before it merges. A merged
+    branch other PRs are based on is kept until they have moved off it, then deleted.
 - A **review crew** of several reviewers, each on its own agent and model, in a throwaway
   worktree. Claude and Codex reviewers start **read-only** (Claude in `dontAsk` mode with an
   allowlist, Codex in its sandbox with no network). Later rounds check only what changed; a

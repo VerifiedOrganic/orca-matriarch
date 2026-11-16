@@ -7,7 +7,7 @@
 // and reads failed job logs, all with `gh`.
 import { obj, type Obj } from './values.ts'
 import type { Exec } from './exec.ts'
-import { ISSUE_PAGES, issueText, repoKey, tailLog, type Forge, type ForgeKind, type ForgeReader, type IssueInfo, type LabelCheck, type Outcome, type RepoRef } from './forge.ts'
+import { ISSUE_PAGES, issueText, repoKey, tailLog, type BranchUse, type Forge, type ForgeKind, type ForgeReader, type IssueInfo, type LabelCheck, type Outcome, type RepoRef } from './forge.ts'
 
 export { repoKey, type RepoRef }
 
@@ -503,6 +503,28 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
 
   const repoArg = (r: RepoRef) => `${r.owner}/${r.name}`
 
+  /** The open PRs into and out of a branch, from GitHub just now; a failure throws. */
+  async function branchUse(repo: RepoRef, branch: string): Promise<BranchUse> {
+    const pulls = async (filter: string, jq: string): Promise<unknown> => {
+      const res = await exec(bin, ['api', `repos/${repoArg(repo)}/pulls?state=open&${filter}&per_page=100`, '--jq', jq], { timeoutMs: 30_000 })
+      if (res.code !== 0) throw new Error(`${bin} api pulls: ${(res.stderr || res.stdout).trim().slice(0, 400)}`)
+      try {
+        return JSON.parse(res.stdout)
+      } catch {
+        throw new Error(`${bin} api pulls: an answer that is not JSON`)
+      }
+    }
+    const name = encodeURIComponent(branch)
+    // A fork's PR has its head in another repository, or in none once the fork is deleted.
+    const based = await pulls(`base=${name}`, '[.[] | {number, crossRepo: ((.head.repo.full_name // "") != .base.repo.full_name)}]')
+    const from = await pulls(`head=${encodeURIComponent(repo.owner)}:${name}`, '[.[].number]')
+    if (!Array.isArray(based) || !Array.isArray(from)) throw new Error(`${bin} api pulls: an answer that is not a list`)
+    return {
+      based: based.flatMap((p) => (typeof obj(p).number === 'number' ? [{ number: obj(p).number as number, crossRepo: obj(p).crossRepo === true }] : [])),
+      from: from.filter((n): n is number => typeof n === 'number')
+    }
+  }
+
   /** Runs one gh command for an action; a failure answers what gh said. */
   async function run(args: string[]): Promise<Outcome> {
     const res = await exec(bin, args, { timeoutMs: 120_000 })
@@ -548,7 +570,15 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
         ...(deleteBranch ? ['--delete-branch'] : [])
       ]),
     retarget: (repo, pr, base) => run(['pr', 'edit', String(pr.number), '--repo', repoArg(repo), '--base', base]),
+    branchUse: (repo, branch) => branchUse(repo, branch),
     async deleteBranch(repo, branch, sha) {
+      let use: BranchUse
+      try {
+        use = await branchUse(repo, branch)
+      } catch (error) {
+        return { error: (error as Error).message }
+      }
+      if (use.based.length > 0 || use.from.length > 0) return { result: 'in-use', use }
       // A branch name may hold slashes; each part is escaped on its own.
       const ref = `heads/${branch.split('/').map(encodeURIComponent).join('/')}`
       const head = await exec(bin, ['api', `repos/${repoArg(repo)}/git/ref/${ref}`, '--jq', '.object.sha'], { timeoutMs: 30_000 })
