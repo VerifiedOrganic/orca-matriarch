@@ -578,6 +578,21 @@ export function createGitLab(exec: Exec, now: () => number = Date.now, bin = 'gl
     // Asynchronous, like gh pr update-branch: GitLab answers at once and rebases in the background.
     updateBranch: (repo, pr) => act(repo, 'rebase', ['-X', 'PUT', projectApi(projectPath(repo), `merge_requests/${pr.number}/rebase`)]),
     retarget: (repo, pr, base) => act(repo, 'update', ['-X', 'PUT', projectApi(projectPath(repo), `merge_requests/${pr.number}`), '-f', `target_branch=${base}`]),
+    async deleteBranch(repo, branch, sha) {
+      const path = projectApi(projectPath(repo), `repository/branches/${encodeURIComponent(branch)}`)
+      const head = await glab(repo, [path])
+      if (head.code !== 0) return /\b404\b/.test(head.stderr + head.stdout) ? { result: 'gone' } : { error: `glab api branch: ${(head.stderr || head.stdout).trim().slice(0, 400)}` }
+      let id: string | null = null
+      try {
+        id = str(obj(obj(JSON.parse(head.stdout)).commit).id)
+      } catch {
+        return { error: 'glab api branch: an answer that is not JSON' }
+      }
+      if (id !== sha) return { result: 'moved' }
+      const res = await glab(repo, ['-X', 'DELETE', path])
+      if (res.code === 0) return { result: 'deleted' }
+      return /\b404\b/.test(res.stderr + res.stdout) ? { result: 'gone' } : { error: `glab api delete branch: ${(res.stderr || res.stdout).trim().slice(0, 400)}` }
+    },
     // Each job on its own, in the project it ran in: a fork's pipeline runs in the fork.
     async rerun(repo, checks) {
       for (const check of checks) {

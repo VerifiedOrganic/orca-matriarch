@@ -37,6 +37,9 @@ export function gitlabRef(host: string, path: string): RepoRef {
 }
 
 /** What happened when Matriarch acted: done, failed with the forge's or Orca's words, or skipped on purpose. */
+/** What became of a branch Matriarch set out to delete (ForgeActions.deleteBranch). */
+export type BranchDeletion = { result: 'deleted' | 'gone' | 'moved' } | { error: string }
+
 export interface Outcome {
   ok: boolean
   error?: string
@@ -148,6 +151,12 @@ export interface ForgeActions {
   failedLogs(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Record<string, string>>
   /** Points a PR at another base branch: a stacked PR, once the PR it was stacked on merged. */
   retarget(repo: RepoRef, pr: PrSnapshot, base: string): Promise<Outcome>
+  /**
+   * Deletes a branch of the repository while it still points at `sha` (a merged PR's branch kept
+   * for the PRs based on it): 'gone' when it no longer exists, 'moved' when it points elsewhere
+   * and so is left, or an error to try again later.
+   */
+  deleteBranch(repo: RepoRef, branch: string, sha: string): Promise<BranchDeletion>
   /** Runs failed checks' jobs again (checks that looked flaky); several only when they share a GitHub workflow run. */
   rerun(repo: RepoRef, checks: readonly CheckInfo[]): Promise<Outcome>
   /** Posts one comment on an issue as the signed-in person. */

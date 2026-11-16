@@ -2,7 +2,7 @@
 // each one's forge (GitHub or GitLab), plan each one, act when autopilot is on, record history,
 // and answer the board. Every dependency is injected, so a tick runs in tests without Orca, git,
 // GitHub or GitLab.
-import { gb, shortSha } from './values.ts'
+import { gb, obj, shortSha } from './values.ts'
 import type { JsonValue } from 'orca/host'
 import { logEntry, markEntry } from './activity.ts'
 import type { Advisor } from './advisor.ts'
@@ -229,7 +229,7 @@ export function describe(action: Action, forge: ForgeKind = 'github'): string {
     case 'publish-review':
       return forge === 'gitlab' ? 'post the AI review on the merge request as a note' : 'post the AI review to GitHub as a comment review'
     case 'merge':
-      return `merge ${shortSha(action.sha)} (${action.method})`
+      return `merge ${shortSha(action.sha)} (${action.method})${action.keepBranch ? `, keeping its branch while ${action.keepBranch}` : ''}`
     case 'escalate':
       return `escalate to ${action.to === 'human' ? 'you' : 'the supervisor'}: ${action.reason}`
     case 'notify':
@@ -739,6 +739,7 @@ async function tickProject(t: TickContext, repoKey: string, info: RepoInfo, repo
   await cleanupFinishedWorktrees(proj)
   prepareTracks(proj)
   for (const item of proj.items) await planAndAct(proj, item)
+  await deleteKeptBranches(proj)
   await logLeftoverCleanups(proj)
   await logLeftoverReplies(proj)
   await worktreeTracks(proj)
@@ -1526,6 +1527,12 @@ async function planFor(proj: ProjectTick, item: TickItem, owner: Owner | null): 
     // A cut-short list may leave out the PR whose branch this one merges into.
     unlistedBase:
       truncatedList && snap.state === 'OPEN' && !item.ledger.stack && byBranch.has(snap.baseRef) && stackableBranch(snap.baseRef, base?.name ?? null),
+    // Deleting its branch as it merges would close these (plan.ts keptBranchReason); a list cut
+    // short, or one without every PR's base, may leave one out.
+    basedOnIt:
+      truncatedList || proj.summaries.some((o) => !o.baseRef)
+        ? null
+        : proj.summaries.filter((o) => o.baseRef === snap.headRef && o.number !== snap.number).map((o) => o.number).sort((a, b) => a - b),
     now
   })
 
@@ -1541,6 +1548,79 @@ async function planFor(proj: ProjectTick, item: TickItem, owner: Owner | null): 
   }
 
   return { p, run }
+}
+
+/** A merged PR's branch kept for the PRs based on it (plan.ts keptBranchReason), until it can go. */
+export interface KeptBranch {
+  /** The merged head: the branch is deleted only while it still points here. */
+  sha: string
+  /** The PR that merged from it. */
+  number: number
+  at: number
+  /** When deleting it last failed: it is tried again after KEPT_RETRY_MS. */
+  failedAt?: number
+}
+
+/** Where a project's kept branches are recorded, by branch name. */
+export const keptBranchesKey = (repo: string): string => `kept-branches:${repo}`
+/** How long a kept branch waits for the PRs based on it to move off it; then it is left as it is. */
+export const KEPT_BRANCH_MS = 30 * 24 * 3600_000
+/** A deletion that failed is tried again after this. */
+export const KEPT_RETRY_MS = 10 * 60_000
+
+function loadKeptBranches(raw: unknown): Record<string, KeptBranch> {
+  const out: Record<string, KeptBranch> = {}
+  for (const [branch, v] of Object.entries(obj(raw))) {
+    const k = obj(v)
+    if (typeof k.sha !== 'string' || typeof k.number !== 'number' || typeof k.at !== 'number') continue
+    out[branch] = { sha: k.sha, number: k.number, at: k.at, ...(typeof k.failedAt === 'number' ? { failedAt: k.failedAt } : {}) }
+  }
+  return out
+}
+
+async function keepBranch(deps: EngineDeps, repo: string, branch: string, kept: KeptBranch): Promise<void> {
+  const all = loadKeptBranches(await deps.store.get(keptBranchesKey(repo)))
+  await deps.store.set(keptBranchesKey(repo), { ...all, [branch]: kept } as unknown as JsonValue)
+}
+
+/**
+ * Deletes the branches kept when their PRs merged, each once no open PR is based on it or comes
+ * from it, if it still points at the merged commit (one with commits since is left). Only with
+ * autopilot on, the project still deleting merged branches, and a full list of open PRs: a list
+ * cut short may leave out a PR the deletion would close.
+ */
+async function deleteKeptBranches(proj: ProjectTick): Promise<void> {
+  const { deps, now } = proj.t
+  const { repoKey, info, config, acting, listed, truncatedList, summaries } = proj
+  const kept = loadKeptBranches(await deps.store.get(keptBranchesKey(repoKey)))
+  if (Object.keys(kept).length === 0) return
+  const next = { ...kept }
+  const drop = (branch: string, why: string | null) => {
+    delete next[branch]
+    if (why) deps.log(`${repoKey}: ${why}`)
+  }
+  for (const [branch, k] of Object.entries(kept)) {
+    if (!config.merge.deleteBranch) drop(branch, null)
+    else if (now - k.at > KEPT_BRANCH_MS) drop(branch, `left ${branch}, kept when #${k.number} merged: PRs were still based on it ${Math.round(KEPT_BRANCH_MS / 86_400_000)} days later`)
+    else if (!acting || !listed || truncatedList || summaries.some((s) => !s.baseRef) || !deps.executor?.deleteBranch) continue
+    else if (k.failedAt !== undefined && now - k.failedAt < KEPT_RETRY_MS) continue
+    else if (summaries.some((s) => s.baseRef === branch || (s.headRef === branch && !s.crossRepo))) continue
+    else {
+      const r = await deps.executor.deleteBranch(info.ref, branch, k.sha).catch((error: Error) => ({ error: error.message }))
+      if ('error' in r) {
+        next[branch] = { ...k, failedAt: now }
+        deps.log(`${repoKey}: could not delete ${branch}, kept when #${k.number} merged: ${r.error}`)
+      } else {
+        drop(
+          branch,
+          r.result === 'deleted' ? `deleted ${branch}, kept when #${k.number} merged until the PRs based on it had moved off it`
+          : r.result === 'moved' ? `left ${branch}, kept when #${k.number} merged: it has commits made since`
+          : null
+        )
+      }
+    }
+  }
+  if (JSON.stringify(next) !== JSON.stringify(kept)) await deps.store.set(keptBranchesKey(repoKey), next as unknown as JsonValue)
 }
 
 /** Carries out a plan's actions under autopilot, recording each in the ledger as it succeeds. Answers the ledger, and the marks and log lines for the track. */
@@ -1588,6 +1668,7 @@ async function act(proj: ProjectTick, item: TickItem, owner: Owner | null, p: Pl
         }).catch(() => {})
       }
       ledger = await remember(action, ledger)
+      if (action.kind === 'merge' && action.keepBranch && config.merge.deleteBranch) await keepBranch(deps, repoKey, snap.headRef, { sha: action.sha, number: snap.number, at: now })
       marks.push(markFor(action, now, kind))
       logged.push(logEntry(action, outcome, now, kind, describe(action, kind)))
       // Saved after each success, so a later failure in this tick cannot make it run twice.

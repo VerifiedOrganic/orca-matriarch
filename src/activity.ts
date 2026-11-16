@@ -26,7 +26,7 @@ function done(action: Action, who: string, forge: ForgeKind): string {
     case 'publish-review':
       return forge === 'gitlab' ? 'Posted the AI review on the merge request as a note' : 'Posted the AI review on the PR as a comment review'
     case 'merge':
-      return `Asked ${forgeTerms(forge).name} to merge ${shortSha(action.sha)} (${action.method})`
+      return `Asked ${forgeTerms(forge).name} to merge ${shortSha(action.sha)} (${action.method})${action.keepBranch ? `, keeping its branch while ${action.keepBranch}` : ''}`
     case 'escalate':
       if (action.to === 'human') return `Told you: ${action.reason}`
       return action.key.startsWith('draft:') ? `Asked ${who} whether the draft is ready: ${action.reason}` : `Escalated to ${who}: ${action.reason}`

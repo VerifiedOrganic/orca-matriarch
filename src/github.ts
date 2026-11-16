@@ -548,6 +548,16 @@ export function createGitHub(exec: Exec, now: () => number = Date.now, bin = 'gh
         ...(deleteBranch ? ['--delete-branch'] : [])
       ]),
     retarget: (repo, pr, base) => run(['pr', 'edit', String(pr.number), '--repo', repoArg(repo), '--base', base]),
+    async deleteBranch(repo, branch, sha) {
+      // A branch name may hold slashes; each part is escaped on its own.
+      const ref = `heads/${branch.split('/').map(encodeURIComponent).join('/')}`
+      const head = await exec(bin, ['api', `repos/${repoArg(repo)}/git/ref/${ref}`, '--jq', '.object.sha'], { timeoutMs: 30_000 })
+      if (head.code !== 0) return /HTTP 404/.test(head.stderr + head.stdout) ? { result: 'gone' } : { error: `${bin} api: ${(head.stderr || head.stdout).trim().slice(0, 400)}` }
+      if (head.stdout.trim() !== sha) return { result: 'moved' }
+      const res = await exec(bin, ['api', '-X', 'DELETE', `repos/${repoArg(repo)}/git/refs/${ref}`], { timeoutMs: 30_000 })
+      if (res.code === 0) return { result: 'deleted' }
+      return /Reference does not exist/.test(res.stderr + res.stdout) ? { result: 'gone' } : { error: `${bin} api: ${(res.stderr || res.stdout).trim().slice(0, 400)}` }
+    },
     // One job runs again alone. GitHub refuses a second job of a run while the first runs again,
     // so several jobs of one workflow run go together (`rerun-failed-jobs`): that re-runs every
     // failed job of the run, a real failure among them too, which then fails again and goes to

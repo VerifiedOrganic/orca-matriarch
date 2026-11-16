@@ -211,6 +211,11 @@ usual but waits at the merge step until its parent has merged. Then:
 3. it merges like any other PR: marked ready for you, or merged by Matriarch when the project
    lets it.
 
+When Matriarch merges a PR that other PRs are based on, it keeps that PR's branch even with
+**Delete merged branches** on, because deleting it would make the forge close them. Once no open
+PR is based on it, Matriarch deletes it, if it still points at the merged commit; one with commits
+since is left.
+
 If the parent closes without merging, the PR needs you. There is no switch: Matriarch never
 merges a PR into the branch of another PR of yours that it follows. Some PRs are never parents,
 so PRs into their branch merge there as they ask: one from the default branch, a long-lived

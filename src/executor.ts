@@ -4,7 +4,7 @@
 import type { MatriarchConfig } from './config.ts'
 import type { Crew } from './crew.ts'
 import type { Exec } from './exec.ts'
-import { forgeKind, forgeTerms, type ForgeActions, type ForgeKind, type Outcome, type RepoRef } from './forge.ts'
+import { forgeKind, forgeTerms, type BranchDeletion, type ForgeActions, type ForgeKind, type Outcome, type RepoRef } from './forge.ts'
 import { createGitHub, type PrSnapshot } from './github.ts'
 import { createGitLab } from './gitlab.ts'
 import { ciFailureMessage, commentsMessage, draftMessage, escalationMessage, rebaseMessage, restackMessage, updateMessage } from './messages.ts'
@@ -55,6 +55,8 @@ export { tailLog } from './forge.ts'
 
 export interface Executor {
   execute(action: Action, ctx: ActionContext): Promise<Outcome>
+  /** Deletes a merged PR's branch that was kept for the PRs based on it, while it still points at `sha`. */
+  deleteBranch?(repo: RepoRef, branch: string, sha: string): Promise<BranchDeletion>
 }
 
 export interface ExecutorDeps {
@@ -120,6 +122,7 @@ export function createExecutor(deps: ExecutorDeps): Executor {
   }
 
   return {
+    deleteBranch: (repo, branch, sha) => forgeOf(repo).deleteBranch(repo, branch, sha),
     async execute(action, ctx) {
       const { pr, repo, config } = ctx
       switch (action.kind) {
@@ -150,7 +153,8 @@ export function createExecutor(deps: ExecutorDeps): Executor {
           return send(ctx, to, m.subject, m.body)
         }
         case 'merge':
-          return forgeOf(repo).merge(repo, pr, action.sha, action.method, config.merge.deleteBranch)
+          // A branch other PRs are based on stays until they moved off it (engine.ts deleteKeptBranches).
+          return forgeOf(repo).merge(repo, pr, action.sha, action.method, config.merge.deleteBranch && !action.keepBranch)
         case 'retarget':
           return forgeOf(repo).retarget(repo, pr, action.base)
         case 'rerun-check':
