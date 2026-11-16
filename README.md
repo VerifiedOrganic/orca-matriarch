@@ -62,15 +62,21 @@ Windows are untested.
 
 ## Install
 
-**From GitHub:**
+**From Orca's plugin directory:** open
+[Matriarch on orca.dev](https://orca.dev/plugins/verifiedorganic.matriarch?catalog=community) and
+press **Open in Orca**, or run:
 
 ```sh
-orca plugin install VerifiedOrganic/orca-matriarch
+orca plugin install verifiedorganic.matriarch --catalog community
 ```
 
-Orca installs the newest version tag, or `main` while there is none, pinned to that commit. It
-shows what Matriarch asks for (see [Permissions](#permissions)) and asks you to approve it.
-Matriarch is not in Orca's plugin directory yet.
+Matriarch is in Orca's community catalog, which Orca asks you about before adding it the first
+time. Orca then shows what Matriarch asks for (see [Permissions](#permissions)) and asks you to
+approve it. With **Update plugins automatically** on (Orca's default), a new version installs by
+itself 12 hours after it is listed; one that asks for more access waits for you to approve it.
+
+**From GitHub:** `orca plugin install VerifiedOrganic/orca-matriarch` installs the newest version
+tag, pinned to its commit.
 
 **From a clone,** to change it: see [Develop](#develop).
 
@@ -541,13 +547,14 @@ with it. No issue text is stored.
     (which needs one recent enough to have the GraphQL fields Matriarch reads; DESIGN.md lists
     them). Nor have the GitLab calls of the options above: the issue list and label checks,
     merge request diffs, moving a merge request's target branch, job retries and merge bases.
-- Not all of the new [options](#options) have run on a real project yet. On Orca 1.4.259 and a
-  real GitHub project, Matriarch has read its mailbox and acted on the supervisor's replies,
-  had the advisor answer the supervisor, stopped workers started over the disk floor, moved and
-  rebased a stacked PR once its parent merged, kept each PR's activity log, and sent away alerts
-  (to a local test receiver). Not yet seen live: flaky re-runs, light review, issues as
-  objectives, and a worker start refused before it runs. Everything on GitLab is untested on a
-  real instance. DESIGN.md lists exactly what ran where.
+- Not every [option](#options) has run on a real project yet. On Orca 1.4.259 and a real
+  GitHub project, Matriarch has read its mailbox and acted on the supervisor's replies, had the
+  advisor answer the supervisor, handed a labeled issue to the supervisor (its worker opened a PR
+  that closes it), stopped workers started over the disk floor, given a docs-only PR a light
+  review, moved and rebased a stacked PR once its parent merged, kept each PR's activity log, and
+  sent away alerts (to a local test receiver). Not yet seen live: flaky re-runs, a stop over the
+  worker-count limits, and a worker start refused before it runs. Everything on GitLab is
+  untested on a real instance. DESIGN.md lists exactly what ran where.
 - Mail sent to Matriarch's mailbox while its terminal is closed is lost: Orca keeps it, but
   answers nothing for a terminal that is gone. Matriarch makes a new mailbox and tells the
   supervisor the new address; a reply to a message sent from the old one is lost the same way.
@@ -597,9 +604,15 @@ the Actions tab can run both by hand.
    git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0
    ```
 
-Orca's plugin directory lists a repository with the `orca-plugin` topic at its newest `vX.Y.Z`
-tag, pinned to its commit and file hash. This one has no topic yet, so it is not listed. Once it
-is, a listed version never changes, and its tag cannot be moved.
+4. Publish a GitHub release for the tag, with that version's `CHANGELOG.md` section as its notes:
+   `gh release create v0.1.0 --verify-tag --title "Matriarch 0.1.0" --notes-file <section>`.
+
+Orca's community catalog lists a repository with the `orca-plugin` topic at its newest `vX.Y.Z`
+tag, pinned to its commit and file hash, on its next run after the tag is pushed. The listing is
+at <https://orca.dev/plugins/VerifiedOrganic/orca-matriarch>; when a version is held back, the
+repository's entry in the catalog's
+[`status.json`](https://github.com/stablyai/orca-community-plugins/blob/main/status.json) says
+why. A listed version never changes, and its tag cannot be moved: a mistake takes a new version.
 
 ### Screenshots and listing art
 

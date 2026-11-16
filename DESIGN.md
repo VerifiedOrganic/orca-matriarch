@@ -13,10 +13,10 @@ It can run unattended.
 
 Status: the engine, timeline, review crew and supervisor have run on a real project (see
 [Tuned after the first long run](#tuned-after-the-first-long-run-on-a-real-project-2026-11-12)).
-Of what came after that run, the mailbox, the activity log and away alerts have run live too;
-stacked PRs, flaky re-runs, light review, worker limits, issues as objectives and the advisor
-answering are built and tested offline only. See [Run live, and not
-yet](#run-live-and-not-yet) and [Roadmap](#roadmap).
+Of what came after that run, the mailbox, the activity log, away alerts, the advisor answering,
+stacked PRs, light review, issues as objectives and the stop over the disk floor have run live
+too; flaky re-runs, the worker-count limits and refusing a worker before it starts are built and
+tested offline only. See [Run live, and not yet](#run-live-and-not-yet) and [Roadmap](#roadmap).
 
 ## Goals
 
@@ -1233,21 +1233,27 @@ plugin's worker:
   asked once to rebase off #18's commits; it pushed only its own two commits, was reviewed again
   and merged. Deleting a kept branch was run by hand with the calls Matriarch now makes (`gh api
   …/git/ref/heads/<branch>`, then `-X DELETE …/git/refs/heads/<branch>`), on the restored branch.
+- **Light review.** #19, which changed only docs, was reviewed by the correctness reviewer alone;
+  its two findings went to its worker, were fixed, and it merged.
+- **Issues as objectives.** Once a repository admin labeled #21 `matriarch`, Matriarch read the
+  labeled issues, who last added the label and that person's permission
+  (`collaborators/<login>/permission`), handed #21 to the supervisor once as a new objective, and
+  logged its reply. The supervisor started one worker, whose PR, #22, closes #21.
 
 Not yet run live:
 
 - Whether a chat's session id stays the same after `/clear`.
-- **Worker limits.** That `agent.tool.before` never fires for a supervisor in a chat (read from
-  Orca's source, above).
+- **Worker limits.** A stop over **Workers at once** or **Worker starts a day** (the stop over the
+  disk floor ran, above), a start refused before it runs, and that `agent.tool.before` never
+  fires for a supervisor in a chat (read from Orca's source, above).
 - **The read-back of a long tool output** by a reviewer or the advisor: the live advisor showed
   the guard refusing it; the fix has run only in tests, and a scratch Claude in `dontAsk` mode
   read its own saved output with no permission prompt.
 - **Matriarch keeping and then deleting a parent's branch** by itself, and an agent whose
   worker exited counting as done: both fixed after that run, and so far run only in tests.
-- **Flaky checks, light review and issues** against a real repository: the GitHub writes each
-  makes (the job and workflow re-runs, issue comments) and the reads not listed above (check-run
-  annotations, the issue list, the collaborator permission), and every GitLab call listed under
-  [Forges](#gitlab-through-glab).
+- **Flaky checks** against a real repository: the job and workflow re-runs and the check-run
+  annotations they read; the comment on a handed-over issue (off by default); and every GitLab
+  call listed under [Forges](#gitlab-through-glab).
 - **The activity log and the Alerts page** on screen inside Orca, rather than in the preview.
 
 ## Roadmap
@@ -1260,13 +1266,14 @@ Not yet run live:
    verdict parsing, aggregation by policy, publishing, prompt detection, on-demand rounds, and
    reviewers locked down at launch by their own agent. Not built yet: the arbiter.
 4. **Supervisor (built, live):** the brief, finding its Run, escalations, worker settings and
-   limits told to a running supervisor, and its replies read from Matriarch's mailbox. Built,
-   offline only: the advisor answering, issues as objectives, and stopping or refusing a worker
-   over a limit.
+   limits told to a running supervisor, its replies read from Matriarch's mailbox, the advisor
+   answering, issues as objectives, and stopping a worker over the disk floor. Built, offline
+   only: refusing a worker over a limit, and stopping one over the worker-count limits.
 5. **Merge train (built):** auto merge pinned to the reviewed commit, branch updates, the
-   base-red pause, cleanup after a merge, and stacked PRs (offline only). Next: merge queues, and
-   `onBaseRed: "revert"` opening the revert PR itself.
+   base-red pause, cleanup after a merge, and stacked PRs (live; Matriarch keeping and deleting a
+   parent's branch by itself, offline only). Next: merge queues, and `onBaseRed: "revert"` opening
+   the revert PR itself.
 6. **Seeing the work (built, live):** timeline, board, Needs you, the activity log and away
    alerts.
-7. **Next:** run every offline-only part on a real project and a live Orca, then publish to the
-   community catalog.
+7. **Published:** 0.1.0 is in Orca's community catalog. **Next:** run the parts still offline
+   only on a real project and a live Orca, and GitLab on a real instance.
