@@ -463,7 +463,8 @@ It never passes `--admin` and never bypasses branch protection or GitLab's merge
 | `gh pr update-branch` | autopilot: update a branch that is behind its base |
 | `gh api repos/<repo>/compare/<sha>...<branch>` | once when a stacked PR's parent merged: whether the base kept the commit the PR was built on |
 | `gh pr edit <n> --base <branch>` | autopilot: move a stacked PR to where its parent merged, when GitHub left it on the parent's branch |
-| `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
+| `gh pr merge --match-head-commit <sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit (with `--delete-branch` when merged branches are deleted and no open PR is based on it) |
+| `gh api repos/<repo>/git/ref/heads/<branch>`, `gh api -X DELETE …/git/refs/heads/<branch>` | autopilot: delete a merged PR's branch kept for the PRs based on it, once none is, if it still points at the merged commit |
 | `gh api repos/<repo>/issues?state=open&labels=<label>&page=<n>` | with **Issues** on, every 5 minutes: the open issues with the label |
 | `gh api graphql` (an issue's label and title events and last edit), `gh api repos/<repo>/collaborators/<login>/permission` | with **Issues** on, once per new or changed labeled issue: who added the label, and whether it changed since |
 | `gh api -X POST repos/<repo>/issues/<n>/comments` | autopilot, with **Comment on the issue**: one comment when Matriarch hands an issue over |
@@ -484,6 +485,7 @@ It never passes `--admin` and never bypasses branch protection or GitLab's merge
 | `glab api --hostname <host> …/repository/merge_base?refs[]=<sha>&refs[]=<branch>` | once when a stacked merge request's parent merged: whether the base kept the commit it was built on |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n> -f target_branch=<branch>` | autopilot: move a stacked merge request to where its parent merged |
 | `glab api --hostname <host> -X PUT …/merge_requests/<n>/merge -f sha=<sha>` | autopilot, when the project lets Matriarch merge: merge exactly the reviewed commit |
+| `glab api --hostname <host> …/repository/branches/<branch>`, `-X DELETE …/repository/branches/<branch>` | autopilot: delete a merged merge request's branch kept for the merge requests based on it, once none is, if it still points at the merged commit |
 | `glab api --hostname <host> projects/<project>/issues?state=opened&labels=<label>&page=<n>` | with **Issues** on, every 5 minutes: the open issues with the label |
 | `glab api --hostname <host> …/issues/<n>/resource_label_events`, `…/members/all/<id>`, `users/<id>`, `graphql` (its last edit) | with **Issues** on, once per new or changed labeled issue: who added the label, whether they are a bot, and whether it changed since |
 | `glab api --hostname <host> -X POST …/issues/<n>/notes` | autopilot, with **Comment on the issue**: one note when Matriarch hands an issue over |

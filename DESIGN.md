@@ -206,6 +206,18 @@ When the parent merged:
 When the forge lists more open PRs than Matriarch reads (four pages), a PR into a branch with an
 Orca worktree here may be stacked on one left out: it waits for you instead of merging.
 
+The parent's branch outlives its merge while PRs are based on it. A forge closes the PRs based on
+a branch that is deleted: GitHub moves them itself only when the branch goes by its own
+"Automatically delete head branches" setting, not when `gh pr merge --delete-branch` or the API
+deletes it (seen live: seaway #20 was closed this way). So with `merge.deleteBranch` on, a PR
+Matriarch merges while any open PR (anyone's, a fork's too) is based on its branch, or while the
+open list was cut short or lacked a PR's base, merges without deleting it, and the branch is
+recorded for the project (`kept-branches:<repo>`: its merged head, the PR, when). Each poll, with
+autopilot on and a full list, a kept branch no open PR is based on or comes from is deleted, if it
+still points at the merged head (read just before; one with commits since is left, and logged).
+A failed deletion is tried again after 10 minutes; a branch PRs are still based on 30 days later
+is left, and forgotten. Turning `merge.deleteBranch` off forgets the records.
+
 ### Flaky checks
 
 `src/flaky.ts`, with `fix.ci.rerunFlaky` (on by default). Once per failed check and commit, the
@@ -618,7 +630,8 @@ there too.
 - **After each merge.** The other PRs are polled again: newly conflicting ones are sent back,
   clean ones are updated, and a PR stacked on the merged one moves on (see Stacked PRs).
 - **Cleanup.** The merged PR's worktree is removed once no worker is live there and nothing in it
-  is uncommitted (`merge.removeWorktree`); the branch is deleted when `deleteBranch` is set. A
+  is uncommitted (`merge.removeWorktree`); the branch is deleted when `deleteBranch` is set, once
+  no open PR is based on it (see [Stacked PRs](#stacked-prs)). A
   worktree the supervisor's workers used that never became a PR goes an hour after its last
   worker finished, when nothing in it is uncommitted or unpushed (`merge.removeFinishedWorktrees`),
   except one whose worker Matriarch stopped over a limit (see Worker limits).
