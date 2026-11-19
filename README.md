@@ -12,7 +12,23 @@ providers, fixes, and merge, and shows all of it on one timeline. Projects can b
 It starts in **dry run**: it reads and shows what it would do, and acts only once you turn on
 autopilot. [Dry run and autopilot](#dry-run-and-autopilot) lists what runs in each.
 
+Matriarch is young: 0.1 has run on one real GitHub project, on macOS. [Known
+limitations](#known-limitations) says what has not been seen working yet.
+
 <br clear="right">
+
+## Quick start
+
+1. In Orca, turn on orchestration (Settings → Experimental), and sign the GitHub CLI in
+   (`gh auth login`).
+2. Open [Matriarch on orca.dev](https://orca.dev/plugins/verifiedorganic.matriarch?catalog=community),
+   press **Open in Orca**, and approve it.
+3. In the **Matriarch** panel, click **+ Add project** and **Turn on** a project open in Orca.
+4. Click **Open supervisor chat** and ask for something small.
+5. Watch what it would do in dry run; when you like it, **Turn on autopilot**.
+
+By default the supervisor runs on Claude Code, workers on Codex, and the review crew on both, so
+both need to be installed and signed in; [Get started](#get-started) shows how to pick others.
 
 ## How a PR moves
 
@@ -26,12 +42,16 @@ autopilot. [Dry run and autopilot](#dry-run-and-autopilot) lists what runs in ea
    infrastructure rather than the code is [run again once](#flaky-checks) first. A branch that
    falls behind its base is updated.
 4. **AI review.** When CI passes, a review crew reads the PR in a throwaway worktree: several
-   reviewers, each on its own agent and model, each with its own focus. Their verdicts are
+   reviewers, each on its own agent and model, each with its own focus. A reviewer on the agent
+   that wrote the PR reviews it on another reviewer's agent and model instead, so no agent grades
+   its own work (**Keep reviewers off the author's agent**). Their verdicts are
    combined by your rule (every must-approve reviewer approves, a majority, or no blockers).
    Findings go to the worker; later rounds check only what changed. A PR that changes only docs
    gets a [lighter review](#light-review).
 5. **Merge.** Matriarch marks the PR ready for you to merge, or merges the reviewed commit itself
    if the project allows it. A PR [stacked](#stacked-prs) on another of yours waits for that one.
+   With autopilot on, the supervisor is told when a PR its workers built merges or is closed, so
+   work that waited on it starts with nothing polling for it.
 
 Anything that needs a decision goes to the supervisor first, then to you if it is not settled
 after a while (30 minutes by default). Matriarch reads what the supervisor writes back: its
@@ -41,7 +61,7 @@ never answers an agent's permission prompt for you: those show as **Needs you**.
 
 ## Requirements
 
-- Orca **1.4.259** or newer, with orchestration turned on (Settings → Experimental), so the
+- Orca **1.4.263** or newer, with orchestration turned on (Settings → Experimental), so the
   supervisor can start and message workers.
 - For projects on GitHub: the GitHub CLI, `gh`, signed in. Only github.com (not GitHub Enterprise).
 - **Experimental:** for projects on GitLab, gitlab.com or self-hosted: the GitLab CLI, `glab`,
@@ -49,7 +69,8 @@ never answers an agent's permission prompt for you: those show as **Needs you**.
   never sees it.
 - The agents you want to use, installed and signed in. Any agent Orca can start works as the
   supervisor or a worker; reviewers and the advisor start read-only only on **Claude Code** and
-  **Codex**.
+  **Codex**. Codex's sandbox stops writes and network but not reading files outside the worktree
+  (see [Permissions](#permissions)).
   - Orca starts a worker on the thinking level you pick for Claude Code, Codex, Cursor,
     Antigravity, Grok, Muse and **Oh My Pi**. OpenCode workers get the model you pick but run at
     OpenCode's own default thinking level until Orca can pass one
@@ -78,7 +99,7 @@ itself 12 hours after it is listed; one that asks for more access waits for you 
 **From GitHub:** `orca plugin install VerifiedOrganic/orca-matriarch` installs the newest version
 tag, pinned to its commit.
 
-**From a clone,** to change it: see [Develop](#develop).
+**From a clone,** to change it: see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Get started
 
@@ -308,7 +329,6 @@ hand:
 - choose cheaper models for worker tiers and for some reviewers;
 - **Review rounds per PR** (default 3) caps the rounds before it asks someone instead;
 - later rounds check only what changed (**Later rounds**: check the fixes);
-- reviewers on the same agent as the PR's author sit it out (**Skip the author's agent**);
 - a PR that changes only docs gets a [lighter review](#light-review);
 - **Reviews at once** (default 2) limits how many review crews run together in a project;
 - the worker and disk limits below cap what the supervisor starts.
@@ -319,7 +339,7 @@ When a reviewer's account hits its usage limit, Matriarch can restart it once on
 ### Worker and disk limits
 
 Under **Settings → Limits**: **Workers at once** (default 4), **Worker starts a day** (counted from
-midnight, default no limit) and **Disk floor** (default 10 GB: below it no new worker starts, and
+midnight, default 20) and **Disk floor** (default 10 GB: below it no new worker starts, and
 **Needs you** says the disk is nearly full). 0 turns each off. The supervisor's brief states them,
 and a running supervisor is told when you change them. They are held two ways:
 
@@ -369,6 +389,8 @@ a poll.
 
 - sends CI failures, comments, AI findings, rebase and update requests to workers, and
   escalations to the supervisor and to you;
+- tells the supervisor when each PR its workers built merges or is closed without merging (also
+  one that closed while autopilot was off, within a day);
 - starts automatic AI reviews and posts them on the PR (when **Where reviews go** says so);
 - updates branches, moves stacked PRs onto their new base, re-runs flaky checks, and merges (when
   the project lets it);
@@ -414,7 +436,10 @@ It also adds two **hooks**:
     and `glab` writes, `gh api`, `glab api`, `rm`, web fetches, and flags that run a program),
     plus `--setting-sources user --strict-mcp-config`.
   - Codex: the bypass flags are removed and it runs with `--sandbox workspace-write
-    --ask-for-approval never`, no network, no extra writable folders and no MCP servers.
+    --ask-for-approval never`, no network, no extra writable folders and no MCP servers. Its
+    sandbox does not stop reads, so a Codex reviewer or advisor can read files elsewhere on your
+    machine. What a reviewer writes stays in Orca unless **Where reviews go** posts it on the PR,
+    where it would carry anything the reviewer was led to quote.
   - Any other agent is refused as a reviewer or advisor unless you mark it **Run it without the
     read-only lockdown**.
 - **Before an agent uses a tool** (`agent.tool.before`):
@@ -455,7 +480,7 @@ It never passes `--admin` and never bypasses branch protection or GitLab's merge
 | `orca terminal read` | a reviewer or the advisor: whether it waits on a prompt, or came back without its lockdown |
 | `orca terminal close` | a reviewer or advisor that started without its lockdown is stopped |
 | `orca worktree set --unread --comment` | a reviewer stuck on a prompt: mark its worktree in Orca's sidebar, with why |
-| `git -C <worktree> status --porcelain`, `symbolic-ref -q HEAD`, `rev-list --count HEAD --not --remotes`, `orca worktree rm` | autopilot: remove a merged PR's worktree (and its branch) when nothing runs there and nothing is uncommitted, or a finished worktree that never became a PR when nothing in it is uncommitted or unpushed |
+| `git -C <worktree> status --porcelain`, `symbolic-ref -q --short HEAD`, `merge-base --is-ancestor HEAD <merged head>`, `rev-list --count HEAD --not --remotes`, `orca worktree rm` | autopilot: remove a merged PR's worktree (and its branch) when nothing runs there, nothing is uncommitted, and it is still on that PR's branch with no commits the PR did not have; or a finished worktree that never became a PR when nothing in it is uncommitted or unpushed. Ignored files (builds, caches) go with it |
 | `sqlite3 'file:…?mode=ro'` | read your Orca settings ([below](#what-it-reads-from-orcas-own-files)), read-only |
 | `opencode api model.list` (or `opencode models`), `omp models ls --json` | **Settings**: the models OpenCode and Oh My Pi offer you now |
 | `orca --version` | **Settings**: say when this Orca is not the one Matriarch was tested with |
@@ -547,8 +572,8 @@ with it. No issue text is stored.
     (which needs one recent enough to have the GraphQL fields Matriarch reads; DESIGN.md lists
     them). Nor have the GitLab calls of the options above: the issue list and label checks,
     merge request diffs, moving a merge request's target branch, job retries and merge bases.
-- Not every [option](#options) has run on a real project yet. On Orca 1.4.259 and a real
-  GitHub project, Matriarch has read its mailbox and acted on the supervisor's replies, had the
+- Not every [option](#options) has run on a real project yet. On Orca 1.4.259 to 1.4.263 and a
+  real GitHub project, Matriarch has read its mailbox and acted on the supervisor's replies, had the
   advisor answer the supervisor, handed a labeled issue to the supervisor (its worker opened a PR
   that closes it), stopped workers started over the disk floor, given a docs-only PR a light
   review, moved and rebased a stacked PR once its parent merged, kept each PR's activity log, and
@@ -566,72 +591,16 @@ with it. No issue text is stored.
 - Read-only reviewers and advisor on Claude Code and Codex only.
 - The worker-start refusal works only for Claude Code in a terminal; every other case relies on
   stopping the worker after it started.
-- It relies on Orca's orchestration behaving as it does in 1.4.259, and on the files above.
-  Settings says when you run a different Orca.
+- It relies on Orca's orchestration behaving as it does in 1.4.263, and on the files above.
+  Settings says when you run a different Orca. When Orca's worker list answers in a form
+  Matriarch does not read, the board says so, and until it reads again nothing goes to workers,
+  no PR's worktree is removed and Matriarch's mail waits in Orca.
 - Orca tells plugins only a workspace's name and branch, so when two projects' own checkouts are
   both "main" with no terminal open, the panel asks you to pick the project.
 
 ## Develop
 
-```sh
-pnpm install            # TypeScript, and Node's typings
-pnpm types              # Orca's plugin typings, into .orca/ (from Orca, or from GitHub without it)
-pnpm verify             # typecheck, orca plugin test, orca plugin validate, binary check
-pnpm preview            # the panel with sample data at http://127.0.0.1:8765
-orca plugin dev load .  # run it in Orca; it reloads as you edit
-```
-
-The repository root is the plugin, and Orca installs every tracked file in it. `node_modules`
-is flat with no symlinks (`pnpm-workspace.yaml`), because Orca refuses to load a folder that
-holds one. [DESIGN.md](DESIGN.md) explains how it works and why.
-
-CI runs the same checks on every push and pull request, with the Orca CLI from the Linux package
-of the Orca in `config.orcaVersion`. Every Monday it runs them on Orca's newest release too, and
-the Actions tab can run both by hand.
-
-## Releasing
-
-1. Raise `version` in `orca-plugin.json` and `PLUGIN_VERSION` in `src/worker.ts` (a test keeps
-   them equal), and add the version to `CHANGELOG.md`. When moving to a newer Orca, raise
-   `config.orcaVersion` in `package.json`, `TESTED_ORCA` and `engines.orca` together, and set
-   `config.orcaDebSha512` to the sha512 that release's `latest-linux.yml` gives
-   `orca-ide_<version>_amd64.deb` (`gh release download v<version> -R stablyai/orca -p
-   latest-linux.yml -O -`).
-2. `pnpm verify`, then commit.
-3. Tag the commit and push the tag:
-
-   ```sh
-   git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0
-   ```
-
-4. Publish a GitHub release for the tag, with that version's `CHANGELOG.md` section as its notes:
-   `gh release create v0.1.0 --verify-tag --title "Matriarch 0.1.0" --notes-file <section>`.
-
-Orca's community catalog lists a repository with the `orca-plugin` topic at its newest `vX.Y.Z`
-tag, pinned to its commit and file hash, on its next run after the tag is pushed. The listing is
-at <https://orca.dev/plugins/VerifiedOrganic/orca-matriarch>; when a version is held back, the
-repository's entry in the catalog's
-[`status.json`](https://github.com/stablyai/orca-community-plugins/blob/main/status.json) says
-why. A listed version never changes, and its tag cannot be moved: a mistake takes a new version.
-
-### Screenshots and listing art
-
-`docs/*.png` and `assets/screenshot-1.png`, `-2.png` are the panel drawn by `pnpm preview`, always
-with `?clean=1` (no sample warnings):
-
-| Image | Query | Window |
-| --- | --- | --- |
-| `docs/timeline.png`, `assets/screenshot-1.png` | `&page=all&log=1` | 1280×800 |
-| `docs/board.png` | `&view=board` | 1280×780 |
-| `assets/screenshot-2.png` | `&view=board` | 1280×800 |
-| `docs/sidebar.png` | `&width=400` | 400×712 at 2× |
-| `docs/settings.png` | `&width=400&page=settings` | 400×1060 at 2× |
-| `docs/picker.png` | `&width=400&page=picker&q=deep` | 400×1400 at 2×, cropped to 800×1240 from y 1020 |
-
-`assets/icon.png` (256×256), `assets/cover.png` (1600×1000) and `assets/screenshot-3.png`
-(1280×800) are drawn from `art/*.html` (the cover and `screenshot-3` show `docs/sidebar.png` and
-`docs/settings.png`, so take those first): open each at that size and save it as PNG. The plugin page shows only the middle band of the cover (about y 380 to 620), so the
-name and tagline stay inside it.
+To change Matriarch, build it or release it, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

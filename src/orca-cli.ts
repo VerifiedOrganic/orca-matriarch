@@ -58,7 +58,10 @@ export interface WorkerRow {
   agent: string | null
   model: string | null
   state: string | null
-  /** False once its agent has exited (a failed or finished attempt); unknown counts as live. */
+  /**
+   * Whether Orca vouches that its agent runs: false once it exited, and also while Orca cannot
+   * tell (`unverifiable`). Where a running agent must not be disturbed, ask `mayRun` instead.
+   */
   live?: boolean
   /**
    * Orca's liveness verdict as given: `live`, `exited`, or `unverifiable` (just started, restored
@@ -69,14 +72,34 @@ export interface WorkerRow {
   terminal?: string | null
 }
 
+/** Worker states that carry an outcome (Orca's SETTLED_WORKER_STATES, and spellings around it). */
+export const SETTLED_STATES: ReadonlySet<string> = new Set(['succeeded', 'failed', 'stopped', 'abandoned', 'cancelled', 'canceled', 'done'])
+const settled = (w: WorkerRow): boolean => SETTLED_STATES.has((w.state ?? '').toLowerCase())
+
 /**
- * Reads `worker-list --full` (Orca 1.4.257: `runId`, `resource.worktreeId`, `workerState`,
- * `projection.provider` and `projection.liveness`), and the concise view as a fallback
- * (`workspace` for the worktree, `agent` as "agent/model", `liveness`). Verified live.
+ * Whether a worker's agent may still run: one Orca vouches for, or one it cannot vouch for
+ * (`unverifiable`: just started, restored after a restart) that has not settled. An unverifiable
+ * row that already has its outcome (an old worker whose status Orca no longer has) has not.
+ */
+export const mayRun = (w: WorkerRow): boolean => w.live !== false || (w.liveness === 'unverifiable' && !settled(w))
+
+/** worker-list answered in a form this Matriarch does not read: Orca changed it. */
+export class UnknownWorkerList extends Error {}
+
+/**
+ * Reads `worker-list --full` (Orca 1.4.257 to 1.4.263: `runId`, `resource.worktreeId`,
+ * `workerState`, `projection.provider` and `projection.liveness`; see
+ * testing/orca-1.4.263-worker-list.json), and the concise view as a fallback (`workspace` for the
+ * worktree, `agent` as "agent/model", `liveness`). Verified live.
+ *
+ * An answer it cannot read throws rather than reading as no workers: with none, every PR would
+ * look orphaned and every worktree idle, and Matriarch would act on that. Thrown, the engine sends
+ * nothing to workers and removes no worktree until the list reads again, and the board says why.
  */
 export function parseWorkerList(result: unknown): WorkerRow[] {
   const r = obj(result)
-  const list = Array.isArray(result) ? result : Array.isArray(r.workers) ? r.workers : Array.isArray(r.rows) ? r.rows : []
+  const list = Array.isArray(result) ? result : Array.isArray(r.workers) ? r.workers : Array.isArray(r.rows) ? r.rows : null
+  if (!list) throw new UnknownWorkerList(`worker-list answered in a form this Matriarch does not read (${Object.keys(r).slice(0, 6).join(', ') || typeof result}); check for a Matriarch update`)
   const rows: WorkerRow[] = []
   for (const item of list) {
     const w = obj(item)
@@ -86,7 +109,7 @@ export function parseWorkerList(result: unknown): WorkerRow[] {
     const projection = obj(w.projection)
     const provider = obj(projection.provider)
     const dispatchId = str(w.dispatchId) ?? str(projection.dispatchId) ?? str(obj(w.dispatch).id) ?? str(w.id)
-    if (!dispatchId) continue
+    if (!dispatchId) throw new UnknownWorkerList(`worker-list gave a worker with no dispatch id Matriarch can read (${Object.keys(w).slice(0, 6).join(', ')}); check for a Matriarch update`)
     // The concise view folds agent and model into one "agent/model" string.
     const combined = str(w.agent)
     const cut = combined?.indexOf('/') ?? -1

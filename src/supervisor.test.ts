@@ -52,7 +52,7 @@ test('once its Run is found, escalations go to the supervisor instead of you', a
   }
   const board = await tick(deps, { autopilot: true })
   assert.equal(store.get('supervisor:acme/app'), 'run:run-7')
-  assert.deepEqual(board.repos[0].supervisor, { agent: 'claude', model: 'claude-opus-5-5', run: 'run:run-7', pending: false, terminal: null, workers: 0, live: 0, maxWorkers: 4, startsToday: 0, maxStarts: 0 })
+  assert.deepEqual(board.repos[0].supervisor, { agent: 'claude', model: 'claude-opus-5-5', run: 'run:run-7', pending: false, terminal: null, workers: 0, live: 0, maxWorkers: 4, startsToday: 0, maxStarts: 20 })
   // No worker owns the branch, so the CI failure goes to the supervisor's Run, not straight to you.
   const e = executed[0] as Extract<Action, { kind: 'escalate' }>
   assert.equal(e.kind, 'escalate')
@@ -150,3 +150,20 @@ test('a running supervisor is told the new worker commands when Settings change 
   assert.ok(m.body.includes("default: orca orchestration worker-start --task <taskId> --worktree path:<worktree path> --agent 'omp' --model 'deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017' --effort 'max' --json"))
   assert.ok(m.body.includes("heavy: orca orchestration worker-start --task <taskId> --worktree path:<worktree path> --agent 'codex' --model 'gpt-6.1-sol' --effort 'xhigh' --json"))
 })
+
+test('the brief says merges are told, and how to wait in the shell the commands run in', () => {
+  const auto = validateConfig({ merge: { mode: 'auto' } }).config
+  const zsh = supervisorBrief({ repo: 'acme/app', root: '/r', objective: 'x', tag: 't', base: 'main', config: auto, shell: 'zsh' })
+  assert.ok(zsh.includes('With autopilot on, Matriarch tells you in this chat as each PR your workers built merges'))
+  assert.ok(zsh.includes('In dry run it does not;'))
+  assert.ok(zsh.includes('Do not write loops or background'))
+  assert.ok(zsh.includes('Your shell commands run in zsh, not bash: an unquoted $var is not split into words'))
+  assert.ok(zsh.includes('read -r a b c <<< "$s"'))
+  const bash = supervisorBrief({ repo: 'acme/app', root: '/r', objective: 'x', tag: 't', base: 'main', config: validateConfig({}).config, shell: 'bash' })
+  assert.ok(!bash.includes('zsh') && bash.includes('Give any command that waits a time limit'))
+  assert.ok(bash.includes('Matriarch tells you in this chat as each PR your workers built merges'), 'manual merges are told too')
+  // Only Claude Code is known to run commands in $SHELL: another supervisor gets no shell named.
+  const codex = supervisorBrief({ repo: 'acme/app', root: '/r', objective: 'x', tag: 't', base: 'main', config: validateConfig({ supervisor: { agent: 'codex' } }).config, shell: 'zsh' })
+  assert.ok(!codex.includes('zsh') && codex.includes('Give any command that waits a time limit'))
+})
+

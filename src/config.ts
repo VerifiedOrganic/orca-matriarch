@@ -199,7 +199,10 @@ export function defaultConfig(): MatriarchConfig {
       blockAt: 'major',
       differentProviderThanAuthor: true,
       maxRounds: 3,
-      publish: 'github',
+      // Reviews stay in Orca unless a project asks to post them: a Codex reviewer can read files
+      // outside its worktree (its sandbox stops writes and network, not reads), and a post would
+      // carry whatever it was led to quote.
+      publish: 'orca-only',
       followUp: 'focused',
       fallback: null,
       light: { paths: ['**/*.md', '**/*.rst', '**/*.adoc'], crew: 'one' }
@@ -222,8 +225,10 @@ export function defaultConfig(): MatriarchConfig {
     escalation: { supervisorFirst: true, humanAfterMinutes: 30 },
     // Four at once: each worker is an agent session and a worktree with its own builds, the
     // supervisor splits work into tasks on different files, and more in parallel mostly adds
-    // conflicts and cost. The disk floor is the nearly-full warning's: a full disk stalls builds.
-    limits: { maxConcurrentReviews: 2, maxWorkers: 4, maxWorkerStartsPerDay: 0, minFreeDiskGB: 10 },
+    // conflicts and cost. Twenty starts a day is a full day at four at once with room for
+    // restarts, and stops a supervisor that keeps starting workers before your bill does. The
+    // disk floor is the nearly-full warning's: a full disk stalls builds.
+    limits: { maxConcurrentReviews: 2, maxWorkers: 4, maxWorkerStartsPerDay: 20, minFreeDiskGB: 10 },
     issues: { enabled: false, label: 'matriarch', comment: false }
   }
 }

@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises'
 import { assert, describe, test } from 'orca/testing'
 import { parseConfig, validateConfig } from './config.ts'
 import type { Exec, ExecResult } from './exec.ts'
@@ -6,7 +7,7 @@ import { actionableThreads, ciStateOf, createGitHub, normalizePr, parseGitHubRem
 import { matchingGlobs } from './glob.ts'
 import { emptyHistory, noteLane, prune, windowed } from './history.ts'
 import { loadLedger } from './ledger.ts'
-import { createdTerminal, createOrcaCli, OrcaRefusal, OrcaUnavailable, parseWorkerList, sendFrom, sendMessage } from './orca-cli.ts'
+import { createdTerminal, createOrcaCli, OrcaRefusal, OrcaUnavailable, mayRun, parseWorkerList, sendFrom, sendMessage, UnknownWorkerList } from './orca-cli.ts'
 import { draftMessage } from './messages.ts'
 import { check, config, pr, SHA } from './testing/fixtures.ts'
 
@@ -210,8 +211,37 @@ describe('orca CLI adapter', () => {
   })
 
   test('worker-list rows from the projection shape and from flat fallbacks', () => {
-    const rows = parseWorkerList({ workers: [{ dispatchId: 'd1', resource: { worktreeId: 'w1' }, launch: { effective: { agent: 'codex', model: 'm' } } }, { id: 'd2', worktreeId: 'w2', agent: 'claude' }, { nothing: true }] })
+    const rows = parseWorkerList({ workers: [{ dispatchId: 'd1', resource: { worktreeId: 'w1' }, launch: { effective: { agent: 'codex', model: 'm' } } }, { id: 'd2', worktreeId: 'w2', agent: 'claude' }] })
     assert.deepEqual(rows.map((r) => [r.dispatchId, r.worktreeId, r.agent, r.model]), [['d1', 'w1', 'codex', 'm'], ['d2', 'w2', 'claude', null]])
+    assert.deepEqual(parseWorkerList({ workers: [] }), [], 'no workers is an answer')
+  })
+
+  test('a worker-list Matriarch cannot read throws, rather than reading as no workers', () => {
+    for (const answer of [{ dispatches: [{ dispatchId: 'd1' }] }, null, 'workers'] as unknown[]) {
+      assert.throws(() => parseWorkerList(answer), (e: unknown) => e instanceof UnknownWorkerList && /does not read/.test((e as Error).message))
+    }
+    assert.throws(() => parseWorkerList({ workers: [{ dispatchId: 'd1' }, { handle: 'x', status: 'ready' }] }), (e: unknown) => e instanceof UnknownWorkerList && /no dispatch id/.test((e as Error).message))
+  })
+
+  test('worker-list as Orca 1.4.263 gave it, recorded', async () => {
+    const recorded = JSON.parse(await readFile(new URL('./testing/orca-1.4.263-worker-list.json', import.meta.url), 'utf8'))
+    const rows = parseWorkerList(recorded)
+    assert.equal(rows.length, recorded.workers.length)
+    assert.deepEqual(rows[0], {
+      dispatchId: 'ctx_d1', worktreeId: 'repo1::/w/app/wt1', taskId: 'task_1', runId: 'run_1', agent: 'codex', model: 'gpt-6.1-sol',
+      state: 'ready', live: true, liveness: 'live', terminal: 'term_1'
+    })
+    // Every field Matriarch reads is there in each live row: a rename in Orca fails here.
+    const live = rows.filter((r) => r.liveness === 'live')
+    assert.equal(live.length, 3)
+    for (const r of live) for (const k of ['dispatchId', 'worktreeId', 'runId', 'agent', 'model', 'state', 'liveness', 'terminal'] as const) assert.ok(r[k], `${r.dispatchId}: ${k}`)
+    // A finished worker Orca saw exit, and an old one whose status Orca no longer has: unverifiable,
+    // but settled (succeeded, no terminal), so it cannot be running either.
+    const [exited, unknown] = rows.slice(3)
+    assert.deepEqual([exited.state, exited.live, exited.liveness, mayRun(exited), exited.terminal, exited.worktreeId], ['succeeded', false, 'exited', false, 'term_4', 'repo1::/w/app/wt4'])
+    assert.deepEqual([unknown.state, unknown.live, unknown.liveness, mayRun(unknown), unknown.terminal], ['succeeded', false, 'unverifiable', false, null])
+    // One Orca cannot vouch for that has not settled (just started, restored after a restart) may run.
+    assert.equal(mayRun({ ...unknown, state: 'running' }), true)
   })
 
   test('worker-list as Orca 1.4.257 gives it: --full, and the concise view', () => {

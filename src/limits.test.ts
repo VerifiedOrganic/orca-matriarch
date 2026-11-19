@@ -214,7 +214,9 @@ describe('the supervisor is told the limits', () => {
     const brief = supervisorBrief({ repo: 'acme/app', objective: 'x', tag: supervisorTag('acme/app', 'n'), base: 'main', config })
     assert.ok(brief.includes('Limits in this project: at most 3 workers running at once; at most 12 worker starts a day; no new worker while the disk has under 10 GB free.'))
     assert.ok(brief.includes('Start each worker with its own worker-start call, not in a loop'))
-    const off = validateConfig({ limits: { maxWorkers: 0, minFreeDiskGB: 0 } }).config
+    // By default: four at once, twenty starts a day and a 10 GB floor.
+    assert.equal(limitLines(defaults())[0], 'Limits in this project: at most 4 workers running at once; at most 20 worker starts a day; no new worker while the disk has under 10 GB free.')
+    const off = validateConfig({ limits: { maxWorkers: 0, maxWorkerStartsPerDay: 0, minFreeDiskGB: 0 } }).config
     assert.deepEqual(limitLines(off.limits), [])
     assert.ok(!supervisorBrief({ repo: 'acme/app', objective: 'x', tag: 't', base: 'main', config: off }).includes('Limits in this project'))
     assert.equal(limitsChanged(defaults(), defaults()), false)

@@ -322,7 +322,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       choice('Findings that block', null, d.review.blockAt, (Object.keys(SEVERITY_LABEL) as Severity[]).map((k): [Severity, string] => [k, SEVERITY_LABEL[k]]), (v) => (d.review.blockAt = v)),
       row('Review rounds per PR', 'Then it escalates instead of asking again.', number(d.review.maxRounds, (n) => (d.review.maxRounds = n), 1, 10)),
       choice('Later rounds', null, d.review.followUp, [['focused', 'check the fixes and what changed (cheaper)'], ['full', 'review the whole PR again']], (v) => (d.review.followUp = v)),
-      row("Skip the author's agent", 'Reviewers on the same agent that wrote the PR sit it out.', toggle(d.review.differentProviderThanAuthor, (on) => (d.review.differentProviderThanAuthor = on))),
+      row("Keep reviewers off the author's agent", "A reviewer on the agent that wrote the PR reviews it on another reviewer's agent and model instead.", toggle(d.review.differentProviderThanAuthor, (on) => (d.review.differentProviderThanAuthor = on))),
       row('Light changes', "A PR that changes only files like these gets a lighter review. Agents' instructions and tools' config (AGENTS.md, CLAUDE.md, SKILL.md, anything in .github/, .claude/, .cursor/ and the like) and renamed files always get the full crew. Leave it empty to review every PR in full.",
         textInput(d.review.light.paths.join(', '), (v) => (d.review.light.paths = globList(v)), { placeholder: 'e.g. **/*.md, **/*.rst' }), { stack: true }),
       choice('A light change gets', null, d.review.light.crew, [['one', 'one reviewer (the first that must approve)'], ['none', 'no AI review']], (v) => (d.review.light.crew = v)),
@@ -367,7 +367,7 @@ export function settingsForm(s: SettingsState, act: SettingsActions): HTMLElemen
       textInput(d.merge.requireHuman.join(', '), (v) => (d.merge.requireHuman = globList(v)), { placeholder: 'e.g. migrations/**, .github/**' }), { stack: true }),
     el('div', { class: 'group-sub' }, 'Cleanup'),
     row('Delete merged branches', 'On GitHub or GitLab, once the PR merged and no other PR is based on the branch. Never the default branch or a long-lived one.', toggle(d.merge.deleteBranch, (on) => (d.merge.deleteBranch = on))),
-    row('Remove merged worktrees', 'Only when nothing runs there and nothing is uncommitted.', toggle(d.merge.removeWorktree, (on) => (d.merge.removeWorktree = on))),
+    row('Remove merged worktrees', "Only when nothing runs there, nothing is uncommitted, and it holds only the merged PR's commits.", toggle(d.merge.removeWorktree, (on) => (d.merge.removeWorktree = on))),
     row('Remove finished worktrees', "A worktree the supervisor's workers finished in that never became a PR, such as a review gate, an hour later. Only when nothing in it is uncommitted or unpushed.",
       toggle(d.merge.removeFinishedWorktrees, (on) => (d.merge.removeFinishedWorktrees = on))))
 

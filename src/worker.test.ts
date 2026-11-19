@@ -2,12 +2,12 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { assert, mockHost, mountWorker, test } from 'orca/testing'
+import { assert, hostError, mockHost, mountWorker, test } from 'orca/testing'
 import { CONFIG_PATH } from './config.ts'
 import type { Exec } from './exec.ts'
 import type { GitHub } from './github.ts'
-import type { Board } from './protocol.ts'
-import { ActivityTracker, createWorker, deactivate, statusText } from './worker.ts'
+import { emptyBoard, type Board } from './protocol.ts'
+import { ActivityTracker, createWorker, deactivate, failedBoard, statusText } from './worker.ts'
 
 const noExec: Exec = async () => ({ code: 1, stdout: '', stderr: 'not in tests' })
 const noGitHub: GitHub = {
@@ -103,6 +103,71 @@ test('the status bar text counts lanes and says when it is a dry run', () => {
   const s = statusText({ ...base, tracks: [t('needs-you'), t('working'), t('building'), t('fixing-ci')] })
   assert.equal(s.text, 'Matriarch 1 need you · 1 fixing · 2 running (dry run)')
   assert.equal(s.tone, 'danger')
+})
+
+test('a check that fails outright says so on the board and in the status bar, and a good one clears it', async () => {
+  let broken = false
+  const host = mockHost({
+    capabilities: ['workspace:read', 'workspace:write', 'agent:read', 'notifications:show', 'storage:own', 'settings:own'],
+    results: {
+      'workspace.list': { workspaces: [], truncated: false },
+      'statusBar.update': { ok: true },
+      // The autopilot switch is read first in every check: once Orca cannot answer, the check throws.
+      'settings.get': () => {
+        if (broken) throw hostError('settings_unavailable', 'settings went away')
+        return { settings: { autopilot: false, pollSeconds: 45 } }
+      }
+    }
+  })
+  const worker = await mountWorker({ default: createWorker({ exec: noExec, github: noGitHub, autoStart: false }), deactivate }, {
+    host,
+    events: ['agent.status.changed', 'workspace.created', 'workspace.removed'],
+    commands: ['showBoard', 'refresh', 'toggleAutopilot']
+  })
+  const good = (await worker.request('board.refresh')) as Board
+  assert.ok(!good.errors.some((e) => e.startsWith("Matriarch's last check failed")))
+  broken = true
+  const failed = (await worker.request('board.refresh')) as Board
+  assert.ok(failed.errors.some((e) => e.startsWith("Matriarch's last check failed") && e.includes('it tries again by itself')), failed.errors.join(' | '))
+  const last = host.callsOf('statusBar.update').at(-1) as { text?: string; tone?: string } | undefined
+  assert.deepEqual([last?.text, last?.tone], ['Matriarch: check failed', 'warning'])
+  broken = false
+  const again = (await worker.request('board.refresh')) as Board
+  assert.ok(!again.errors.some((e) => e.startsWith("Matriarch's last check failed")))
+  await worker.deactivate()
+})
+
+test("the status bar tooltip fits Orca's 256 characters, whatever the problems say", () => {
+  const board: Board = { ...emptyBoard(0), ready: true, errors: Array.from({ length: 6 }, (_, i) => `acme/app${i}: ${'a long problem '.repeat(6)}`) }
+  const s = statusText(board)
+  assert.ok(s.tooltip.length <= 256, `${s.tooltip.length}`)
+  assert.ok(s.tooltip.startsWith('Dry run: watching, not acting'), 'the mode before the problems')
+  assert.ok(failedBoard(board, new Error('x'.repeat(400))).status.tooltip.length <= 256)
+  // And the text fits its 64, with every lane group counted.
+  const lanes = ['needs-you', 'fixing-ci', 'ai-review', 'working', 'awaiting-ci', 'ready'] as const
+  const busy: Board = { ...board, autopilot: true, tracks: lanes.map((lane, i) => ({ key: `k${i}`, repo: 'acme/app', lane })) as unknown as Board['tracks'] }
+  assert.ok(statusText(busy).text.length <= 64, statusText(busy).text)
+  assert.ok(statusText({ ...busy, autopilot: false }).text.length <= 64)
+})
+
+test('a failed check leaves the last board up, saying so and how old it is, until a good one replaces it', () => {
+  const last: Board = { ...emptyBoard(Date.UTC(2026, 10, 18, 9, 30)), ready: true, errors: ['acme/app: something else'] }
+  const once = failedBoard(last, new Error('orca workspace.list timed out\n    at stack line'))
+  assert.equal(once.board.errors[0], 'acme/app: something else')
+  assert.match(once.board.errors[1], /^Matriarch's last check failed: orca workspace\.list timed out\. What shows here is from \d{1,2}:\d{2}.*; it tries again by itself\.$/)
+  assert.deepEqual([once.status.text, once.status.tone], ['Matriarch: check failed', 'warning'])
+  assert.equal(once.board.at, last.at, 'still the time of the last good check')
+  // Failing again replaces the line rather than adding one.
+  const twice = failedBoard(once.board, new Error('again'))
+  assert.equal(twice.board.errors.length, 2)
+  assert.match(twice.board.errors[1], /failed: again\./)
+  // Before any check worked, there is no time to give.
+  assert.match(failedBoard(emptyBoard(0), 'boom').board.errors[0], /Nothing has been checked yet/)
+  // A full disk says what to do, in red, and replaces a failed-check line.
+  const full = failedBoard(twice.board, Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }))
+  assert.equal(full.board.errors.length, 2)
+  assert.match(full.board.errors[1], /^The disk is full: .*Free some space/)
+  assert.deepEqual([full.status.text, full.status.tone], ['Matriarch: disk full', 'danger'])
 })
 
 test('the status bar click opens what needs you, before the board', async () => {

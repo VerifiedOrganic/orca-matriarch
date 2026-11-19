@@ -4,12 +4,13 @@
 // out once it is free, and nothing is sent twice for the same commit. It reads GitHub and GitLab
 // alike; only the words and commands in its reasons come from the PR's forge.
 import { clip, shortSha } from './values.ts'
-import { ALWAYS_FULL_REVIEW, type MatriarchConfig, type ReviewerSpec } from './config.ts'
+import { ALWAYS_FULL_REVIEW, type MatriarchConfig, type ReviewerSpec, type RoleSpec } from './config.ts'
 import { forgeTerms } from './forge.ts'
 import { actionableThreads, type CheckInfo, type PrSnapshot, type ThreadInfo } from './github.ts'
 import { everyPathMatches, matchingGlobs } from './glob.ts'
 import { checkKey, roundsUsed, type PrLedger, type StackParent } from './ledger.ts'
 import { restackCommand } from './messages.ts'
+import { LOCKABLE_AGENTS } from './lockdown.ts'
 
 export type Lane =
   | 'building' // a worktree whose agent is working, no PR yet
@@ -118,16 +119,32 @@ export function ciSignature(checks: readonly CheckInfo[]): string {
     .join('|')
 }
 
-/** Reviewers for a PR, dropping those on the author's own agent when the config asks. */
+/**
+ * Reviewers for a PR. With `differentProviderThanAuthor`, a reviewer on the author's own agent
+ * reviews on the first other reviewer's agent, model and thinking level instead, keeping its name,
+ * focus and whether it blocks: every focus is still looked at, by an agent that did not write the
+ * code. Only an agent Matriarch starts read-only (Claude Code, Codex) takes a moved reviewer: one
+ * another reviewer runs without the lockdown was let off for that reviewer alone. With no such
+ * agent to move to, every reviewer runs on its own.
+ */
 export function selectReviewers(config: MatriarchConfig, authorAgent: string | null): { reviewers: ReviewerSpec[]; note: string | null } {
   const all = config.reviewers
   if (!config.review.differentProviderThanAuthor || !authorAgent) return { reviewers: all, note: null }
-  const others = all.filter((r) => r.agent !== authorAgent)
-  if (others.length === 0) {
-    return { reviewers: all, note: `every reviewer runs on ${authorAgent}, the author's agent` }
-  }
-  const dropped = all.length - others.length
-  return { reviewers: others, note: dropped ? `skipped ${dropped} reviewer(s) on ${authorAgent}, the author's agent` : null }
+  const moved = all.filter((r) => r.agent === authorAgent)
+  if (moved.length === 0) return { reviewers: all, note: null }
+  const other = all.find((r) => r.agent !== authorAgent && LOCKABLE_AGENTS.includes(r.agent))
+  if (!other) return { reviewers: all, note: `no reviewer to move off ${authorAgent}, the author's agent, onto another agent started read-only` }
+  // Only the fields the other reviewer sets: stored and sent as plain JSON, with no undefined.
+  const role: RoleSpec = { agent: other.agent }
+  if (other.model) role.model = other.model
+  if (other.effort) role.effort = other.effort
+  const reviewers = all.map((r) => {
+    if (r.agent !== authorAgent) return r
+    const { model: _model, effort: _effort, readOnly: _readOnly, ...own } = r
+    return { ...own, ...role }
+  })
+  const on = other.model ? `${other.agent} (${other.model})` : other.agent
+  return { reviewers, note: `${moved.map((r) => r.name).join(', ')} on ${on}, since ${authorAgent} wrote it` }
 }
 
 /**

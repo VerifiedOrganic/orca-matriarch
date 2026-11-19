@@ -19,8 +19,10 @@ import { addLog, addMark, historyKey, insertLog, loadHistory, noteLane, prune, w
 import { checkKey, keepChecks, ledgerKey, loadLedger, loadRepoEscalations, pruneRepoEscalations, record, recordRefusedRerun, recordRefusedRetarget, repoEscalationsKey, repoWide, roundsUsed, withRepoEscalations, type Escalation, type PrLedger, type StackParent, type SupervisorNote } from './ledger.ts'
 import { countStarts, dayOf, isWorking, loadPendingStops, loadStarts, overLimitStarts, STOP_RETRY_MS, stoppedMessage, type LimitState, type PendingStop } from './limits.ts'
 import { LOCK_LABEL } from './lockdown.ts'
-import type { SentReceipt, WorkerRow } from './orca-cli.ts'
+import { mayRun, type SentReceipt, type WorkerRow } from './orca-cli.ts'
+import type { RemovedWorktree, RemoveWorktree } from './worktrees.ts'
 import { applyReply, loadMailState, mailKey, recordSent, replyLine, takeMail, takenQuestions, type MailIdentities, type MailMessage, type MailReader } from './mailbox.ts'
+import { closedMessage } from './messages.ts'
 import { lightPaths, MERGE_TIMEOUT_MS, plan, type Action, type Activity, type Lane, type Owner, type Plan } from './plan.ts'
 import { supervisorTagPrefix } from './supervisor.ts'
 import type { AdvisorView, Attention, Board, LogEntry, Mark, RepoView, TrackView } from './protocol.ts'
@@ -94,10 +96,11 @@ export interface EngineDeps {
    */
   supervisorSenders?: (repo: string, run: string | null) => Promise<string[]>
   /**
-   * Removes a merged PR's worktree when it is safe: answers why not (uncommitted changes, Orca
-   * refused) otherwise. Absent where nothing is removed (tests of other parts).
+   * Removes a worktree when it is safe (see worktrees.ts): answers why not (uncommitted changes,
+   * another branch, commits the PR did not have, Orca refused) otherwise. Absent where nothing is
+   * removed (tests of other parts).
    */
-  removeWorktree?: (path: string, options?: { keepBranch?: boolean }) => Promise<{ removed: boolean; reason?: string }>
+  removeWorktree?: (path: string, what: RemoveWorktree) => Promise<RemovedWorktree>
   /** The disk holding a path: the same id for every path on it, and the bytes free there; null when it cannot tell. */
   disk?: (path: string) => Promise<{ id: string; free: number } | null>
   /** Each project's workers and disk against its limits, for the hook that refuses a worker start. */
@@ -130,10 +133,22 @@ interface PendingCleanup {
   path: string
   number: number
   at: number
+  /**
+   * The PR's branch, and the head commits Matriarch saw it have (the merged one first): the
+   * worktree goes only while it is on that branch with nothing beyond them. Absent when 0.1.0
+   * queued it.
+   */
+  branch?: string
+  heads?: string[]
   /** Why it was kept on the last try. */
   kept?: string
 }
 const CLEANUP_GIVE_UP_MS = 7 * 24 * 3600_000
+/** A merged PR's heads for its cleanup: the merged one, then each its ledger saw, newest first. */
+function prHeads(merged: string | null | undefined, ledger: PrLedger): string[] {
+  const seen = Object.entries(ledger.heads).sort((a, b) => b[1] - a[1]).map(([sha]) => sha)
+  return [...new Set([...(merged ? [merged] : []), ...seen])].slice(0, 25)
+}
 /** How long a merged or closed PR stays on the board and timeline, in Merged / closed. */
 export const SHOW_CLOSED_MS = 6 * 3600_000
 /** How long a worktree that never became a PR stays after its last worker finished. */
@@ -684,6 +699,9 @@ async function groupByProject(deps: EngineDeps, workspaces: readonly Workspace[]
   return repos
 }
 
+/** Which of a worktree's workers is its current one: live first, then one that may still run, then any. */
+const workerRank = (w: WorkerRow): number => (w.live !== false ? 2 : mayRun(w) ? 1 : 0)
+
 /** Orca's supervised workers, and each worktree's current one. */
 async function indexWorkers(deps: EngineDeps, board: Board): Promise<Pick<TickContext, 'workers' | 'ownersKnown' | 'workersAt' | 'byWorktree'>> {
   let workers: WorkerRow[] = []
@@ -696,7 +714,7 @@ async function indexWorkers(deps: EngineDeps, board: Board): Promise<Pick<TickCo
     workers = (await deps.workers()).map((w) => ({ ...w }))
   } catch (error) {
     ownersKnown = false
-    board.errors.push(`Can't see Orca's workers (${(error as Error).message}); nothing goes to workers until it is back.`)
+    board.errors.push(`Can't see Orca's workers (${(error as Error).message}); nothing goes to workers, no PR's worktree is removed and Matriarch's mail waits until it is back.`)
   }
   // worker-list is newest first: a worktree's current worker is its newest live one, else its
   // newest row (a failed attempt says what happened when nothing replaced it).
@@ -708,7 +726,7 @@ async function indexWorkers(deps: EngineDeps, board: Board): Promise<Pick<TickCo
     const sep = w.worktreeId.indexOf('::')
     for (const key of sep >= 0 ? [w.worktreeId, `path:${w.worktreeId.slice(sep + 2)}`] : [w.worktreeId]) {
       const had = workerKeys.get(key)
-      if (!had || (had.live === false && w.live !== false)) workerKeys.set(key, w)
+      if (!had || workerRank(w) > workerRank(had)) workerKeys.set(key, w)
     }
   }
   const byWorktree = { get: (ws: Workspace): WorkerRow | undefined => workerKeys.get(ws.id) ?? workerKeys.get(`path:${ws.path}`) }
@@ -750,6 +768,7 @@ async function tickProject(t: TickContext, repoKey: string, info: RepoInfo, repo
   await stepAdvisor(proj)
   await readOpenPrs(proj)
   await readClosedPrs(proj)
+  await tellClosedPrs(proj)
   await cleanupMergedWorktrees(proj)
   await cleanupFinishedWorktrees(proj)
   prepareTracks(proj)
@@ -881,9 +900,12 @@ async function openProject(t: TickContext, repoKey: string, info: RepoInfo, repo
  * reads, so it happens in dry run too. Adds questions, mailLog.
  */
 async function readMail(proj: ProjectTick): Promise<void> {
-  const { deps, now, workers } = proj.t
+  const { deps, now, workers, ownersKnown } = proj.t
   const { repoKey, supervisor, view } = proj
   if (!deps.mail || !deps.mailbox) return
+  // Who sent what is told by Orca's worker list: without it a worker's reply would read as no
+  // one's, or a chat worker's as the supervisor's. The mail stays in Orca until the list is back.
+  if (!ownersKnown) return
   const address = await deps.mailbox(repoKey).catch(() => null)
   if (!address) return
   const key = mailKey(repoKey)
@@ -1327,6 +1349,13 @@ async function readClosedPrs(proj: ProjectTick): Promise<void> {
           // Once, when Matriarch first sees it merged, whoever merged it; like every alert, only
           // while it acts (Orca has no notification for this one: it goes to the webhook only).
           if (pr.state === 'MERGED' && acting) deps.alert?.({ kind: 'merged', title: `${repoKey} #${number} merged`, body: pr.title, repo: repoKey, number, url: pr.url })
+          // The supervisor hears it too, so work that waited on this PR starts with nothing polling
+          // for it: queued here, sent by tellClosedPrs once autopilot is on and a supervisor is
+          // known. Only a PR one of the supervised workers built: one opened by hand waits on nothing.
+          if (ledger.builder) {
+            const notes = loadClosedNotes(await deps.store.get(closedNotesKey(repoKey)))
+            if (!notes.some((n) => n.number === number)) await deps.store.set(closedNotesKey(repoKey), [...notes, { number, at: now }] as unknown as JsonValue)
+          }
         }
         if (pr.state === 'MERGED' && ledger.merge && ledger.merge.status !== 'merged') {
           await deps.store.set(ledgerKey(repoKey, number), { ...ledger, merge: { ...ledger.merge, status: 'merged' } } as unknown as JsonValue)
@@ -1335,7 +1364,10 @@ async function readClosedPrs(proj: ProjectTick): Promise<void> {
         const done = byBranch.get(pr.headRef)
         if (pr.state === 'MERGED' && done && done.path !== info.root && config.merge.removeWorktree) {
           const list = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
-          if (!list.some((c) => c.path === done.path)) await deps.store.set(`cleanup:${repoKey}`, [...list, { path: done.path, number, at: now }] as unknown as JsonValue)
+          // One entry per PR: a later PR from the same worktree is its own, once the first is let go.
+          if (!list.some((c) => c.path === done.path && c.number === number)) {
+            await deps.store.set(`cleanup:${repoKey}`, [...list, { path: done.path, number, at: now, branch: pr.headRef, heads: prHeads(pr.headSha, ledger) }] as unknown as JsonValue)
+          }
         }
         // Kept as it closed, so it can stay on the board without asking the forge again.
         await deps.store.set(`snap:${repoKey}#${number}`, { snap: pr } as unknown as JsonValue)
@@ -1361,24 +1393,73 @@ async function readClosedPrs(proj: ProjectTick): Promise<void> {
   }
 }
 
+/** A PR the supervisor is yet to be told merged or closed, from when Matriarch first saw it so. */
+interface ClosedNote {
+  number: number
+  at: number
+}
+const closedNotesKey = (repo: string): string => `closednotes:${repo}`
+/** Told within a day, or not at all: after that the supervisor has moved on. */
+const CLOSED_NOTE_MS = 24 * 3600_000
+function loadClosedNotes(raw: unknown): ClosedNote[] {
+  return Array.isArray(raw) ? raw.filter((n): n is ClosedNote => typeof n?.number === 'number' && typeof n?.at === 'number') : []
+}
+
+/**
+ * Tells the supervisor each queued PR that merged or closed, with autopilot on: one that closed in
+ * dry run, before the supervisor was found, or whose send failed is told on a later check, within
+ * a day. Each goes once, recorded like Matriarch's other mail.
+ */
+async function tellClosedPrs(proj: ProjectTick): Promise<void> {
+  const { deps, now } = proj.t
+  const { repoKey, info, acting, supervisor, view } = proj
+  const notes = loadClosedNotes(await deps.store.get(closedNotesKey(repoKey)))
+  if (notes.length === 0) return
+  const still: ClosedNote[] = []
+  for (const n of notes) {
+    if (now - n.at > CLOSED_NOTE_MS) {
+      deps.log(`${repoKey}: the supervisor was not told that #${n.number} merged or closed: a day passed with autopilot off or no supervisor`)
+      continue
+    }
+    if (!acting || !supervisor || !deps.tellSupervisor) {
+      still.push(n)
+      continue
+    }
+    const pr = ((await deps.store.get(`snap:${repoKey}#${n.number}`)) as { snap?: PrSnapshot } | null)?.snap
+    // Gone from the store, or open again: nothing to tell.
+    if (!pr || pr.state === 'OPEN') continue
+    const m = closedMessage(pr)
+    try {
+      const receipt = await deps.tellSupervisor(repoKey, info.root, supervisor, m)
+      if (receipt) await recordSent(deps.store, repoKey, receipt, { at: now, to: supervisor, subject: m.subject, kind: pr.state === 'MERGED' ? 'merged' : 'closed', number: n.number })
+    } catch (error) {
+      view.warnings.push(`Could not tell the supervisor that #${n.number} ${pr.state === 'MERGED' ? 'merged' : 'was closed'}: ${(error as Error).message}. Matriarch tries again.`)
+      still.push(n)
+    }
+  }
+  if (still.length !== notes.length) await deps.store.set(closedNotesKey(repoKey), still as unknown as JsonValue)
+}
+
 /** Worktrees of merged PRs, removed once no worker is live there and nothing is uncommitted. */
 async function cleanupMergedWorktrees(proj: ProjectTick): Promise<void> {
   const { deps, now, byWorktree } = proj.t
-  const { repoKey, info, config, acting, repoWorkspaces, byBranch, view, gone, cleanedUp } = proj
+  const { repoKey, info, config, acting, listed, summaries, repoWorkspaces, byBranch, view, gone, cleanedUp } = proj
   // Worktrees of merged PRs: removed once no worker is live there and nothing is uncommitted.
-  if (acting && deps.removeWorktree && config.merge.removeWorktree) {
+  // Only with the forge's open PRs read: one may be from the same branch again.
+  if (acting && listed && deps.removeWorktree && config.merge.removeWorktree) {
     // Once per project: PRs merged before this cleanup existed are found by their ledgers.
     if (!(await deps.store.get(`cleanup:scanned:${repoKey}`)) && deps.store.keys) {
       const found: PendingCleanup[] = []
       for (const key of (await deps.store.keys()).filter((k) => k.startsWith(`pr:${repoKey}#`))) {
         const number = Number(key.slice(key.indexOf('#') + 1))
-        if (loadLedger(await deps.store.get(key)).merge?.status !== 'merged') continue
-        const head = ((await deps.store.get(`snap:${repoKey}#${number}`)) as { snap?: { headRef?: string } } | null)?.snap?.headRef
-        const ws = head ? byBranch.get(head) : undefined
-        if (ws && ws.path !== info.root) found.push({ path: ws.path, number, at: now })
+        const ledger = loadLedger(await deps.store.get(key))
+        if (ledger.merge?.status !== 'merged') continue
+        const snap = ((await deps.store.get(`snap:${repoKey}#${number}`)) as { snap?: { headRef?: string; headSha?: string } } | null)?.snap
+        const ws = snap?.headRef ? byBranch.get(snap.headRef) : undefined
+        if (ws && ws.path !== info.root) found.push({ path: ws.path, number, at: now, branch: snap?.headRef, heads: prHeads(snap?.headSha, ledger) })
       }
       const list = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
-      await deps.store.set(`cleanup:${repoKey}`, [...list, ...found.filter((f) => !list.some((c) => c.path === f.path))] as unknown as JsonValue)
+      await deps.store.set(`cleanup:${repoKey}`, [...list, ...found.filter((f) => !list.some((c) => c.path === f.path && c.number === f.number))] as unknown as JsonValue)
       await deps.store.set(`cleanup:scanned:${repoKey}`, now)
     }
     const pending = ((await deps.store.get(`cleanup:${repoKey}`)) as PendingCleanup[] | null) ?? []
@@ -1386,13 +1467,37 @@ async function cleanupMergedWorktrees(proj: ProjectTick): Promise<void> {
     for (const c of pending) {
       const ws = repoWorkspaces.find((w) => w.path === c.path)
       if (!ws || ws.path === info.root || now - c.at > CLEANUP_GIVE_UP_MS) continue
+      // Without Orca's worker list nothing says the worktree is idle: it waits for the list.
+      if (!proj.t.ownersKnown) {
+        still.push(c)
+        continue
+      }
       const owner = byWorktree.get(ws)
       const act = activityOf(proj.t, ws)
-      if ((owner && owner.live !== false) || agentBusy(act)) {
+      if ((owner && mayRun(owner)) || agentBusy(act)) {
         still.push({ ...c, kept: 'an agent is still running there' })
         continue
       }
-      const res = await deps.removeWorktree(ws.path).catch((error: Error) => ({ removed: false, reason: error.message }))
+      // Queued by 0.1.0, before Matriarch noted the PR's branch: read it from the PR as it closed.
+      const closedAs = c.branch === undefined ? ((await deps.store.get(`snap:${repoKey}#${c.number}`)) as { snap?: { headRef?: string; headSha?: string } } | null)?.snap : undefined
+      const branch = c.branch ?? closedAs?.headRef
+      const heads = c.branch !== undefined ? (c.heads ?? []) : prHeads(closedAs?.headSha, loadLedger(await deps.store.get(ledgerKey(repoKey, c.number))))
+      if (!branch) {
+        deps.log(`${repoKey}: left the worktree of merged #${c.number} (${ws.path}): which branch it held is no longer known`)
+        continue
+      }
+      // A new PR from the same branch: the worktree is that PR's work now, and its own merge cleans it up.
+      const reopened = summaries.find((s) => s.headRef === branch && s.number !== c.number)
+      if (reopened) {
+        deps.log(`${repoKey}: left the worktree of merged #${c.number} (${ws.path}): #${reopened.number} is open from ${branch} now`)
+        continue
+      }
+      const res: RemovedWorktree = await deps.removeWorktree(ws.path, { merged: { number: c.number, branch, heads } }).catch((error: Error) => ({ removed: false, reason: error.message }))
+      if (res.moved) {
+        // A later worker took the worktree over: what is in it now is not this PR's to clean up.
+        deps.log(`${repoKey}: left the worktree of merged #${c.number} (${ws.path}): ${res.reason}`)
+        continue
+      }
       if (res.removed) {
         deps.log(`${repoKey}: removed the worktree of merged #${c.number} (${ws.path})`)
         gone.add(ws.path)
@@ -1401,7 +1506,7 @@ async function cleanupMergedWorktrees(proj: ProjectTick): Promise<void> {
         // marks are written there below.
         const own = loadHistory(await deps.store.get(historyKey(ws.id)))
         if (own.pr === undefined || own.pr === c.number) await deps.store.set(historyKey(`pr:${repoKey}#${c.number}`), { ...own, pr: c.number } as unknown as JsonValue)
-        cleanedUp.set(c.number, { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: no agent ran there and nothing in it was uncommitted` })
+        cleanedUp.set(c.number, { at: now, kind: 'cleanup', text: `Removed the worktree ${ws.name}: no agent ran there, nothing in it was uncommitted, and it held only #${c.number}'s commits` })
         continue
       }
       still.push({ ...c, kept: res.reason ?? 'not removed' })
@@ -1427,7 +1532,7 @@ async function cleanupFinishedWorktrees(proj: ProjectTick): Promise<void> {
     for (const ws of repoWorkspaces) {
       if (ws.path === info.root || merging.has(ws.path) || prBranches.has(branchName(ws.branch) ?? '') || stoppedWorktrees[ws.path]) continue
       const row = byWorktree.get(ws)
-      if (!row?.runId || `run:${row.runId}` !== supervisor || row.live !== false) continue
+      if (!row?.runId || `run:${row.runId}` !== supervisor || mayRun(row)) continue
       const act = activityOf(proj.t, ws)
       if (agentBusy(act)) continue
       const since = seen[ws.path] ?? now

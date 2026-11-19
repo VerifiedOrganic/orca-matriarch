@@ -1,0 +1,402 @@
+{
+ "workers": [
+  {
+   "dispatchId": "ctx_d1",
+   "taskId": "task_1",
+   "runId": "run_1",
+   "workerState": "ready",
+   "dispatchStatus": "dispatched",
+   "agentTerminalHandle": "term_1",
+   "terminalState": "active",
+   "coordinatedFrom": null,
+   "resource": {
+    "id": "id_1",
+    "ownershipState": "owned",
+    "releaseState": "not_requested",
+    "retainedReason": null,
+    "terminalHandle": "term_1",
+    "worktreeId": "repo1::/w/app/wt1",
+    "endpointId": "endpointId_1",
+    "endpointIncarnation": "endpointIncarnation_1",
+    "originDispatchId": "ctx_d1",
+    "ownerDispatchId": "ctx_d1",
+    "releaseRequestedAt": null,
+    "releaseCompletedAt": null,
+    "releaseError": null,
+    "recoveryAttemptCount": 0,
+    "lastRecoveryAt": null,
+    "autoReleaseAt": null,
+    "archive": {
+     "source": null,
+     "status": null
+    }
+   },
+   "projection": {
+    "id": "id_2",
+    "dispatchId": "ctx_d1",
+    "taskId": "task_1",
+    "runId": "run_1",
+    "role": "worker",
+    "parent": null,
+    "provider": {
+     "id": "codex",
+     "model": "gpt-6.1-sol"
+    },
+    "host": {
+     "kind": "local",
+     "id": "id_3"
+    },
+    "workspace": {
+     "id": "id_4",
+     "kind": "folder_or_worktree"
+    },
+    "stage": {
+     "worker": "ready",
+     "dispatch": "dispatched",
+     "detail": "input_accepted",
+     "activity": "working"
+    },
+    "outcome": "in_progress",
+    "liveness": {
+     "verdict": "live",
+     "observedAt": 1795000000000,
+     "source": "execution_host"
+    },
+    "evidence": {
+     "durable": true,
+     "liveStatus": "fresh",
+     "lastObservedAt": 1795000000000
+    },
+    "resource": {
+     "state": "owned"
+    },
+    "nextAction": {
+     "kind": "none",
+     "argv": []
+    },
+    "attention": {
+     "categories": [],
+     "requiresAction": false
+    }
+   }
+  },
+  {
+   "dispatchId": "ctx_d2",
+   "taskId": "task_2",
+   "runId": "run_1",
+   "workerState": "succeeded",
+   "dispatchStatus": "completed",
+   "agentTerminalHandle": "term_2",
+   "terminalState": "reclaimable",
+   "coordinatedFrom": null,
+   "resource": {
+    "id": "id_5",
+    "ownershipState": "owned",
+    "releaseState": "not_requested",
+    "retainedReason": null,
+    "terminalHandle": "term_2",
+    "worktreeId": "repo1::/w/app/wt2",
+    "endpointId": "endpointId_1",
+    "endpointIncarnation": "endpointIncarnation_2",
+    "originDispatchId": "ctx_d2",
+    "ownerDispatchId": "ctx_d2",
+    "releaseRequestedAt": null,
+    "releaseCompletedAt": null,
+    "releaseError": null,
+    "recoveryAttemptCount": 0,
+    "lastRecoveryAt": null,
+    "autoReleaseAt": "2026-11-18T12:00:00.000Z",
+    "archive": {
+     "source": null,
+     "status": null
+    }
+   },
+   "projection": {
+    "id": "id_6",
+    "dispatchId": "ctx_d2",
+    "taskId": "task_2",
+    "runId": "run_1",
+    "role": "worker",
+    "parent": null,
+    "provider": {
+     "id": "omp",
+     "model": "deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    },
+    "host": {
+     "kind": "local",
+     "id": "id_3"
+    },
+    "workspace": {
+     "id": "id_7",
+     "kind": "folder_or_worktree"
+    },
+    "stage": {
+     "worker": "succeeded",
+     "dispatch": "completed",
+     "detail": "settled",
+     "activity": "done"
+    },
+    "outcome": "succeeded",
+    "liveness": {
+     "verdict": "live",
+     "observedAt": 1795000000000,
+     "source": "execution_host"
+    },
+    "evidence": {
+     "durable": true,
+     "liveStatus": "fresh",
+     "lastObservedAt": 1795000000000
+    },
+    "resource": {
+     "state": "owned"
+    },
+    "autoReleaseAt": "2026-11-18T12:00:00.000Z",
+    "nextAction": {
+     "kind": "none",
+     "argv": []
+    },
+    "attention": {
+     "categories": [
+      "categories_1"
+     ],
+     "requiresAction": false
+    }
+   }
+  },
+  {
+   "dispatchId": "ctx_d3",
+   "taskId": "task_3",
+   "runId": "run_1",
+   "workerState": "ready",
+   "dispatchStatus": "dispatched",
+   "agentTerminalHandle": "term_3",
+   "terminalState": "active",
+   "coordinatedFrom": null,
+   "resource": {
+    "id": "id_8",
+    "ownershipState": "owned",
+    "releaseState": "not_requested",
+    "retainedReason": null,
+    "terminalHandle": "term_3",
+    "worktreeId": "repo1::/w/app/wt3",
+    "endpointId": "endpointId_1",
+    "endpointIncarnation": "endpointIncarnation_3",
+    "originDispatchId": "ctx_d3",
+    "ownerDispatchId": "ctx_d3",
+    "releaseRequestedAt": null,
+    "releaseCompletedAt": null,
+    "releaseError": null,
+    "recoveryAttemptCount": 0,
+    "lastRecoveryAt": null,
+    "autoReleaseAt": null,
+    "archive": {
+     "source": null,
+     "status": null
+    }
+   },
+   "projection": {
+    "id": "id_9",
+    "dispatchId": "ctx_d3",
+    "taskId": "task_3",
+    "runId": "run_1",
+    "role": "worker",
+    "parent": null,
+    "provider": {
+     "id": "omp",
+     "model": "deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    },
+    "host": {
+     "kind": "local",
+     "id": "id_3"
+    },
+    "workspace": {
+     "id": "id_10",
+     "kind": "folder_or_worktree"
+    },
+    "stage": {
+     "worker": "ready",
+     "dispatch": "dispatched",
+     "detail": "input_accepted",
+     "activity": "working"
+    },
+    "outcome": "in_progress",
+    "liveness": {
+     "verdict": "live",
+     "observedAt": 1795000000000,
+     "source": "execution_host"
+    },
+    "evidence": {
+     "durable": true,
+     "liveStatus": "fresh",
+     "lastObservedAt": 1795000000000
+    },
+    "resource": {
+     "state": "owned"
+    },
+    "nextAction": {
+     "kind": "none",
+     "argv": []
+    },
+    "attention": {
+     "categories": [],
+     "requiresAction": false
+    }
+   }
+  },
+  {
+   "dispatchId": "ctx_d4",
+   "taskId": "task_4",
+   "runId": "run_4",
+   "workerState": "succeeded",
+   "dispatchStatus": "completed",
+   "agentTerminalHandle": "term_4",
+   "terminalState": "released",
+   "coordinatedFrom": null,
+   "resource": {
+    "id": "id_4",
+    "ownershipState": "released",
+    "releaseState": "released",
+    "retainedReason": null,
+    "terminalHandle": "term_4",
+    "worktreeId": "repo1::/w/app/wt4",
+    "endpointId": "endpointId_4",
+    "endpointIncarnation": "endpointIncarnation_4",
+    "originDispatchId": "ctx_d4",
+    "ownerDispatchId": "ctx_d4",
+    "releaseRequestedAt": "releaseRequestedAt_4",
+    "releaseCompletedAt": "releaseCompletedAt_4",
+    "releaseError": null,
+    "recoveryAttemptCount": 1,
+    "lastRecoveryAt": "lastRecoveryAt_4",
+    "autoReleaseAt": null,
+    "archive": {
+     "source": "transcript",
+     "status": "captured"
+    }
+   },
+   "projection": {
+    "id": "id_5",
+    "dispatchId": "ctx_d4",
+    "taskId": "task_4",
+    "runId": "run_4",
+    "role": "worker",
+    "parent": null,
+    "provider": null,
+    "host": {
+     "kind": "local",
+     "id": "id_6"
+    },
+    "workspace": {
+     "id": "id_7",
+     "kind": "folder_or_worktree"
+    },
+    "stage": {
+     "worker": "succeeded",
+     "dispatch": "completed",
+     "detail": "settled",
+     "activity": "unknown"
+    },
+    "outcome": "succeeded",
+    "liveness": {
+     "verdict": "exited",
+     "source": "resource_release"
+    },
+    "evidence": {
+     "durable": true,
+     "liveStatus": "unavailable",
+     "lastObservedAt": null
+    },
+    "resource": {
+     "state": "released"
+    },
+    "nextAction": {
+     "kind": "none",
+     "argv": []
+    },
+    "attention": {
+     "categories": [
+      "categories_4"
+     ],
+     "requiresAction": false
+    }
+   }
+  },
+  {
+   "dispatchId": "ctx_d5",
+   "taskId": "task_5",
+   "runId": "run_4",
+   "workerState": "succeeded",
+   "dispatchStatus": "completed",
+   "agentTerminalHandle": null,
+   "terminalState": null,
+   "coordinatedFrom": null,
+   "resource": null,
+   "projection": {
+    "id": "id_8",
+    "dispatchId": "ctx_d5",
+    "taskId": "task_5",
+    "runId": "run_4",
+    "role": "worker",
+    "parent": null,
+    "provider": null,
+    "host": {
+     "kind": "local",
+     "id": "id_6"
+    },
+    "workspace": {
+     "id": "id_9",
+     "kind": "folder_or_worktree"
+    },
+    "stage": {
+     "worker": "succeeded",
+     "dispatch": "completed",
+     "detail": "settled",
+     "activity": "unknown"
+    },
+    "outcome": "succeeded",
+    "liveness": {
+     "verdict": "unverifiable",
+     "reason": "missing_status"
+    },
+    "evidence": {
+     "durable": true,
+     "liveStatus": "unavailable",
+     "lastObservedAt": null
+    },
+    "resource": {
+     "state": "absent",
+     "reason": "not_materialized"
+    },
+    "nextAction": {
+     "kind": "none",
+     "argv": []
+    },
+    "attention": {
+     "categories": [
+      "categories_5",
+      "categories_4"
+     ],
+     "requiresAction": true
+    }
+   }
+  }
+ ],
+ "counts": {
+  "active": 2,
+  "reclaimable": 2,
+  "retained": 2,
+  "released": 96
+ },
+ "page": {
+  "limit": 3,
+  "total": 124,
+  "hasMore": true,
+  "nextCursor": "nextCursor_1"
+ },
+ "warnings": [
+  "Showing 3 of 124 Dispatches, newest first; more are on later pages. Follow page.nextCursor with --cursor."
+ ],
+ "scope": {
+  "source": "all"
+ }
+}

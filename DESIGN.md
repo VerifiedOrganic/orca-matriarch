@@ -11,8 +11,9 @@ agents in Orca:
 
 It can run unattended.
 
-Status: the engine, timeline, review crew and supervisor have run on a real project (see
-[Tuned after the first long run](#tuned-after-the-first-long-run-on-a-real-project-2026-11-12)).
+Status: 0.1.1 is tested with Orca 1.4.263. The engine, timeline, review crew and supervisor have
+run on a real project (see [Tuned after the first long
+run](#tuned-after-the-first-long-run-on-a-real-project-2026-11-12)).
 Of what came after that run, the mailbox, the activity log, away alerts, the advisor answering,
 stacked PRs, light review, issues as objectives and the stop over the disk floor have run live
 too; flaky re-runs, the worker-count limits and refusing a worker before it starts are built and
@@ -73,7 +74,7 @@ and the tier are examples):
   // A second opinion the supervisor can ask for (see Advisor). Read-only like a reviewer.
   "advisor": { "agent": "claude", "model": "claude-fable-5-2", "effort": "max" },
   "review": { "enabled": true, "trigger": "ci-green", "pass": "all-blocking-approve", "blockAt": "major",
-              "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "github", // "github": on the PR, GitLab too
+              "differentProviderThanAuthor": true, "maxRounds": 3, "publish": "orca-only", // "github": also on the PR, GitLab too
               "followUp": "focused", "fallback": null,
               // A PR changing only these files gets "one" reviewer or "none" (see Review crew).
               "light": { "paths": ["**/*.md", "**/*.rst", "**/*.adoc"], "crew": "one" } },
@@ -83,7 +84,7 @@ and the tier are examples):
              "onBaseRed": "pause", "deleteBranch": true, "removeWorktree": true, "removeFinishedWorktrees": true },
   "escalation": { "supervisorFirst": true, "humanAfterMinutes": 30 },
   // maxWorkers and maxWorkerStartsPerDay: 0 for no cap; minFreeDiskGB: 0 for no floor.
-  "limits": { "maxConcurrentReviews": 2, "maxWorkers": 4, "maxWorkerStartsPerDay": 0, "minFreeDiskGB": 10 },
+  "limits": { "maxConcurrentReviews": 2, "maxWorkers": 4, "maxWorkerStartsPerDay": 20, "minFreeDiskGB": 10 },
   // Labeled issues become the supervisor's objectives (see Supervisor).
   "issues": { "enabled": false, "label": "matriarch", "comment": false }
 }
@@ -344,8 +345,11 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
     - `no-blockers`: nothing at or above `blockAt`, with more than half the crew answering.
   - An optional `arbiter` gets every review and returns the final list (drops false
     positives, settles disagreements).
-- **Cross-provider rule.** With `differentProviderThanAuthor`, reviewers on the author's agent
-  are skipped, unless that would leave no reviewer.
+- **Cross-provider rule.** With `differentProviderThanAuthor`, a reviewer on the author's agent
+  reviews on the first other reviewer's agent, model and thinking level instead, keeping its
+  name, focus and whether it blocks; when every reviewer is on the author's agent they all run as
+  they are. (Until 0.1.1 such a reviewer sat the round out, which with the defaults, Codex
+  workers and a Codex security reviewer, left every PR to one reviewer.)
 - **Light changes** (`review.light`). A PR gets a lighter review when every changed file matches
   `paths`, none is in `ALWAYS_FULL_REVIEW` (what steers an agent once merged: `AGENTS.md`,
   `CLAUDE.md`, `GEMINI.md`, `SKILL.md`, `*.prompt.md`, `.github/**`, `.claude/**`, `.orca/**` and
@@ -361,7 +365,7 @@ in dry run too. Sending findings to a worker and posting to GitHub still wait fo
   - A round already on the commit (running, or asking for changes) still decides, and **Run AI
     review now** runs the full crew.
 - **Publishing** (`publish`).
-  - `github` (recommended; the name predates GitLab and means "on the PR"): one combined comment
+  - `github` (the name predates GitLab and means "on the PR"): one combined comment
     review per round, with inline comments for findings at or above `blockAt`. On GitLab, one
     merge request note with those findings folded in. Each carries a `<!-- matriarch:... -->`
     marker so the engine can tell its own threads from human ones. It posts as you, so it can
@@ -642,9 +646,19 @@ there too.
   to find and revert the change that broke it (Matriarch does not open the revert PR itself yet,
   and the config check says so).
 - **After each merge.** The other PRs are polled again: newly conflicting ones are sent back,
-  clean ones are updated, and a PR stacked on the merged one moves on (see Stacked PRs).
-- **Cleanup.** The merged PR's worktree is removed once no worker is live there and nothing in it
-  is uncommitted (`merge.removeWorktree`); the branch is deleted when `deleteBranch` is set, once
+  clean ones are updated, and a PR stacked on the merged one moves on (see Stacked PRs). The
+  supervisor is told, with autopilot on, when a PR its workers built merged or was closed without
+  merging, so work that waited on it starts without the supervisor polling for it (see Tuned
+  after an outside review).
+- **Cleanup.** The merged PR's worktree is removed once no worker may run there (Orca says it
+  exited; one it cannot vouch for counts as running), nothing in it is uncommitted (untracked
+  files too, whatever `status.showUntrackedFiles` says), and git there says it is still on the
+  PR's branch (`refs/heads/<branch>`) with no commit outside the heads the PR had (the merged one
+  and those its ledger saw: a branch the forge rebased merged a head the worktree never had), or
+  failing that, every commit on a remote. A worktree a later worker moved to another branch is no
+  longer this PR's, and its entry goes; one entry per PR, so that later PR's own merge cleans it.
+  Nothing is removed while Orca's worker list cannot be read (`merge.removeWorktree`). The checks
+  live in `src/worktrees.ts` and run right before the removal. The branch is deleted when `deleteBranch` is set, once
   nothing else uses it, and never the default or a long-lived one (see
   [Stacked PRs](#stacked-prs)). A worktree the supervisor's workers used that never became a PR
   goes an hour after its last worker finished, when nothing in it is uncommitted or unpushed
@@ -915,11 +929,12 @@ can be changed and checked without Orca.
 
 - **Name:** Matriarch, id `matriarch`. No Orca plugin or agent tool uses it. "Pod" and
   "Superpod" collide with other tools; "Spyhop" is an existing Orca session-board project.
-- **AI reviews on GitHub:** `publish: "github"` by default, as one combined comment review per
-  round, plus inline comments for findings at or above `blockAt`.
-  - Why: a record on the PR for people and other tools, it survives Orca restarts, and gives
-    workers real threads to resolve.
-  - `orca-only` keeps them local.
+- **AI reviews on GitHub:** `publish: "github"` posts one combined comment review per round, plus
+  inline comments for findings at or above `blockAt`: a record on the PR for people and other
+  tools that survives Orca restarts, and real threads for workers to resolve.
+  - Changed in 0.1.1: `orca-only` is the default. A Codex reviewer's sandbox stops writes and
+    network but not reads, so a reviewer led astray by what it reviews could quote a file from
+    elsewhere on the machine into a post on a public PR. Posting is a choice per project.
   - Posting as you only allows comment reviews, so the merge gate relies on Matriarch's own
     verdict, never on a GitHub approval from your account.
 - **Merging:** both modes. `manual` stops at *Ready to merge*. `auto` is for unattended runs:
@@ -1193,6 +1208,99 @@ lockdown was checked live (2026-11-10, Claude Code 2.1.322, Codex 0.167.0):
   minutes.
 - GitLab has no such free check: see [Forges](#forges-github-and-gitlab).
 
+### Tuned after an outside review (2026-11-18)
+
+An independent read of the whole plugin (Claude Fable 5.2, read-only, given the code rather than
+our conclusions) found these; each was checked against the code before it was changed.
+
+- **A merged PR's worktree could take later work with it.** It was queued by path when the PR
+  merged and removed once `git status` was clean, with `--delete-branch`. A later worker that
+  took the worktree over, committed without pushing and exited lost that work. The removal now
+  checks the branch and the commits in the worktree itself (see Merging: Cleanup), and a worker
+  Orca cannot vouch for (`unverifiable`) that has not settled counts as one that may still run
+  there (`mayRun`), as the limits already counted it.
+- **The default crew reviewed with one reviewer.** Codex workers and a Codex security reviewer,
+  with `differentProviderThanAuthor`, sat the security reviewer out of every PR. A reviewer now
+  moves to another reviewer's agent instead (see Review crew: Cross-provider rule).
+- **A failed check left the board looking current.** Only a full disk was said; any other
+  failure went to Orca's log. The last board now says the check failed, why, and how old it is,
+  and the status bar says so, until a good check replaces it.
+- **An unreadable worker list read as no workers.** A renamed field gave an empty list, so every
+  PR looked orphaned and every worktree idle. `parseWorkerList` now throws on a list or a row it
+  cannot read, which the engine already handles as "cannot see Orca's workers": nothing goes to
+  workers and nothing is removed until it reads again. Orca 1.4.263's real answer is recorded in
+  `src/testing/orca-1.4.263-worker-list.json` (names and paths replaced) and parsed by a test.
+- **Nothing capped starts by default.** **Worker starts a day** is 20 by default (was no limit).
+- **Reviews were posted on the PR by default.** They stay in Orca by default now (see Decisions).
+
+A second independent review, of these changes before they landed, found what they broke or
+missed, each reproduced (the rebase case with real git) and fixed with a test that fails without
+the fix:
+
+- A branch the forge rebased (`updateBranch: rebase`, or any update on GitLab) merged a head the
+  worker's worktree never had, so the cleanup would have kept it for a week: every head the PR
+  had now counts.
+- **Restart** on a moved reviewer started it on the author's agent again: it restarts as the
+  round chose it.
+- A moved reviewer could take another reviewer's `readOnly: false`, and so run without the
+  lockdown nobody chose for it: it moves only onto Claude Code or Codex.
+- A second PR from a worktree queued while the first waited was never cleaned up: one entry per
+  PR. The branch is compared as a full ref (a tag of the same name made `--short` ambiguous), and
+  a git failure is tried again rather than taken for a detached HEAD.
+- The worktree's newest worker that may run is its current one, so an exited row listed above an
+  unverifiable one does not hide it.
+- Mail was read with no worker list, so a chat worker's reply could have been learned as the
+  supervisor's: it waits in Orca until the list reads.
+- The longer worker-list error made the status bar tooltip longer than Orca's 256 characters, and
+  Orca refused the whole update (it could before, with long problems, and the text past its 64
+  with every lane busy): both are cut to fit.
+
+Its second pass, over those fixes, found more, fixed the same way:
+
+- A worker Orca cannot vouch for but whose state is settled (an old one whose status Orca no
+  longer has, in the recording) counted as running, and would have held its worktree for good:
+  `mayRun` counts an unverifiable worker only while it has not settled, as the limits do.
+- A worktree's current worker is its live one, then one that may run, then any, so a just-started
+  worker does not take the mail an older live one gets.
+- The cleanup waits for the forge's open PRs, and leaves a worktree whose branch has a new open
+  PR: its work is that PR's now.
+- A git timeout read as exit 1: it is 124 now (see below).
+- **Restart** keeps the agent the round started the reviewer on (from the round's own record),
+  rather than working the move out again from a worker list that may not read.
+
+**Told when a PR merges (from the seaway run, 2026-11-18).** The brief told the supervisor to
+wait for a PR to merge before starting what depends on it, and gave it nothing to wait with. It
+wrote a bash loop (`set -- $s; case "$1" in MERGED)…`) that ran in zsh, where an unquoted variable
+is not split into words, so it never matched and polled for good while the merge and the CI run
+after it were long done. Matriarch now queues a notice as it first sees a PR merged or closed,
+for a PR one of the supervised workers built (`closednotes:<repo>`), and `tellClosedPrs` sends
+it (`closedMessage`, recorded like its other mail) once autopilot is on and a supervisor is
+known, trying a failed send again on later checks, for up to a day. The brief says so, says what
+to do in dry run (look once when the user says a PR merged), says not to write loops that wait
+for a merge, and, for a Claude Code supervisor (which runs commands in `$SHELL`), names the shell
+with the zsh difference. Every brief asks for a time limit and a line of output on any wait.
+
+Its last pass found two more, fixed with tests: `nodeExec` fills an empty stderr with Node's
+message, so "a quiet exit 1" never held and a detached worktree read as git failing (a finished
+gate worktree would never have gone); a killed command now exits 124 (`exitCodeOf`), and exit 1
+is a detached HEAD again, checked with the real `nodeExec` on a real detached worktree. And the
+notice was sent once or never; it is queued, as above.
+
+Projects turned on with 0.1.0 have every setting written into `.orca/matriarch.json`, the old
+defaults included, so the new defaults reach them only by changing **Where reviews go** and
+**Worker starts a day** in Settings; the changelog says so.
+
+Not changed, with why:
+
+- **Turning autopilot off on an Orca it was not tested with.** Orca ships every day or two, so
+  this would turn autopilot off for nearly everyone nearly always. Matriarch instead refuses to
+  act on answers it cannot read (the worker list above), and Settings says when the Orca differs.
+- **A contract test against a running Orca in CI.** CI has Orca's CLI from its Linux package, not
+  a running Orca, so orchestration cannot be asked there. Recorded answers stand in, and a
+  release that moves to a newer Orca runs on a real project with it first.
+- **Ignored files keeping a worktree.** Every worktree with a build has them; keeping each would
+  turn the cleanup off. They go with it, and the README says so.
+
 ### Run live, and not yet
 
 Run live on Orca 1.4.259 against a real GitHub project (seaway, 2026-11-14 and 15), from the
@@ -1239,8 +1347,18 @@ plugin's worker:
   labeled issues, who last added the label and that person's permission
   (`collaborators/<login>/permission`), handed #21 to the supervisor once as a new objective, and
   logged its reply. The supervisor started one worker, whose PR, #22, closes #21.
+- **On Orca 1.4.263** (2026-11-18, the same project). #23 went from Working through CI and a
+  light review to merged, and its worktree was removed; Matriarch still saw its worker finish
+  after Orca 1.4.261 began dropping exited agents from its lists. `worker-list --full` answered
+  in the shape Matriarch reads (recorded in `src/testing/`). Read from Orca's changes, not seen
+  failing: 1.4.262 names mail from a Run's mailbox after its coordinator only on Orca's chat
+  cards, not in the sender address Matriarch matches; and it deletes a settled Run a day after
+  its last activity, which Matriarch handles as it does a Run Orca forgot on a restart.
 
 Not yet run live:
+
+- **The changes in [Tuned after an outside review](#tuned-after-an-outside-review-2026-11-18)**,
+  so far run only in tests.
 
 - Whether a chat's session id stays the same after `/clear`.
 - **Worker limits.** A stop over **Workers at once** or **Worker starts a day** (the stop over the

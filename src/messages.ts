@@ -121,6 +121,26 @@ export function draftMessage(pr: PrSnapshot, reason: string): Message {
   }
 }
 
+/**
+ * The supervisor's word that one of its PRs merged or was closed, sent once as Matriarch first
+ * sees it: work that waited on it starts then, with nothing left watching for it (an agent's own
+ * wait loop is easy to get wrong, and one that never ends looks like waiting).
+ */
+export function closedMessage(pr: PrSnapshot): Message {
+  const merged = pr.state === 'MERGED'
+  return {
+    subject: merged ? `${pr.repo} #${pr.number} merged` : `${pr.repo} #${pr.number} closed without merging`,
+    body: [
+      merged
+        ? `PR #${pr.number} "${pr.title}" (branch ${pr.headRef}) merged into ${pr.baseRef}. Start the work that waited on it now.`
+        : `PR #${pr.number} "${pr.title}" (branch ${pr.headRef}) was closed without merging: none of it reached ${pr.baseRef}. Re-plan the work that waited on it.`,
+      pr.url,
+      '',
+      'Matriarch tells you this for each PR as it merges or closes: nothing needs to wait or poll for it.'
+    ].join('\n')
+  }
+}
+
 export function escalationMessage(pr: PrSnapshot, reason: string): Message {
   return {
     subject: `Matriarch needs a decision on ${pr.repo} #${pr.number}`,

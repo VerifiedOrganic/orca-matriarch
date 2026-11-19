@@ -20,18 +20,15 @@
 // as a start, wherever it appears. A wrong guess costs only a refusal when a limit is reached.
 import { gb } from './values.ts'
 import type { MatriarchConfig } from './config.ts'
-import type { WorkerRow } from './orca-cli.ts'
+import { SETTLED_STATES, type WorkerRow } from './orca-cli.ts'
 
 export type Limits = MatriarchConfig['limits']
-
-/** Worker states that carry an outcome (Orca's SETTLED_WORKER_STATES, and spellings around it). */
-const SETTLED = new Set(['succeeded', 'failed', 'stopped', 'abandoned', 'cancelled', 'canceled', 'done'])
 
 /**
  * Still running, for the limits: anything but a settled worker or one Orca saw exit. A worker
  * Orca cannot vouch for (just started, restored after a restart, stale) counts as running.
  */
-export const isWorking = (w: WorkerRow): boolean => !SETTLED.has((w.state ?? '').toLowerCase()) && w.liveness !== 'exited'
+export const isWorking = (w: WorkerRow): boolean => !SETTLED_STATES.has((w.state ?? '').toLowerCase()) && w.liveness !== 'exited'
 
 /** The local calendar day of a time, `YYYY-MM-DD`: the daily budget starts again at midnight. */
 export function dayOf(at: number): string {

@@ -38,7 +38,9 @@ async function setup(opts: { context?: unknown; secondOnGitHub?: boolean; active
   }
   const orcaCli = {
     run: async (args: readonly string[]) =>
-      args[0] === 'repo' && args[1] === 'list' ? { repos: [{ path: root, displayName: 'app' }, { path: notes, displayName: 'notes' }, { path: '/nowhere/gone' }] } : {}
+      args[0] === 'repo' && args[1] === 'list' ? { repos: [{ path: root, displayName: 'app' }, { path: notes, displayName: 'notes' }, { path: '/nowhere/gone' }] }
+      : args[0] === 'orchestration' && args[1] === 'worker-list' ? { workers: [] }
+      : {}
   }
   const host = mockHost({
     capabilities: ['workspace:read', 'workspace:write', 'agent:read', 'notifications:show', 'storage:own', 'settings:own'],

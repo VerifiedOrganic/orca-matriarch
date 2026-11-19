@@ -151,12 +151,58 @@ describe('conflicts and comments', () => {
 })
 
 describe('AI review', () => {
-  test('starts once CI is green, skipping reviewers on the author\'s agent', () => {
+  test("starts once CI is green, moving reviewers off the author's agent rather than dropping them", () => {
     const p = plan(input({ owner: owner({ agent: 'codex' }) }))
     assert.equal(p.lane, 'ai-review')
     const a = p.actions[0] as Extract<Action, { kind: 'start-review' }>
     assert.equal(a.kind, 'start-review')
-    assert.deepEqual(a.reviewers.map((r) => r.name), ['correctness'])
+    // The default crew: correctness on Claude, security on Codex. Codex wrote it, so security
+    // reviews on Claude, still with its own focus and still blocking.
+    assert.deepEqual(a.reviewers.map((r) => [r.name, r.agent, r.blocking, r.focus]), [
+      ['correctness', 'claude', true, 'bugs, edge cases, missing tests'],
+      ['security', 'claude', true, 'authz, injection, secrets, unsafe input']
+    ])
+    assert.match(p.reason, /security on claude\b.*, since codex wrote it/)
+  })
+
+  test("a moved reviewer takes the other reviewer's agent, model and thinking level, and keeps the rest of its own", () => {
+    const c = config((x) => {
+      x.reviewers = [
+        { name: 'deep', agent: 'claude', model: 'claude-opus-5-5', effort: 'high', blocking: true },
+        { name: 'security', agent: 'codex', model: 'gpt-6-astra', effort: 'xhigh', blocking: false, focus: 'secrets' }
+      ]
+    })
+    const sel = selectReviewers(c, 'codex')
+    assert.deepEqual(sel.reviewers[1], { name: 'security', agent: 'claude', model: 'claude-opus-5-5', effort: 'high', blocking: false, focus: 'secrets' })
+    assert.equal(sel.note, 'security on claude (claude-opus-5-5), since codex wrote it')
+    assert.deepEqual(selectReviewers(c, 'opencode'), { reviewers: c.reviewers, note: null }, 'no reviewer on the author\'s agent: unchanged')
+    c.review.differentProviderThanAuthor = false
+    assert.deepEqual(selectReviewers(c, 'codex').reviewers, c.reviewers, 'off: every reviewer on its own agent')
+  })
+
+  test('a reviewer moves only onto an agent Matriarch starts read-only, never onto one let off the lockdown', () => {
+    // grok runs without the lockdown, by the person's choice for "style" alone.
+    const c = config((x) => {
+      x.reviewers = [
+        { name: 'bugs', agent: 'claude', blocking: true },
+        { name: 'style', agent: 'grok', blocking: false, readOnly: false },
+        { name: 'security', agent: 'codex', model: 'gpt-6-astra', blocking: true }
+      ]
+    })
+    const sel = selectReviewers(c, 'claude')
+    assert.deepEqual(sel.reviewers[0], { name: 'bugs', agent: 'codex', model: 'gpt-6-astra', blocking: true }, 'onto codex, past grok')
+    assert.ok(!('readOnly' in sel.reviewers[0]))
+    // With only grok to move to, nothing moves: every reviewer runs on its own agent.
+    c.reviewers = c.reviewers.filter((r) => r.name !== 'security')
+    const none = selectReviewers(c, 'claude')
+    assert.deepEqual(none.reviewers, c.reviewers)
+    assert.match(none.note ?? '', /no reviewer to move off claude/)
+  })
+
+  test("a light change gets one reviewer, moved off the author's agent like the rest", () => {
+    const p = plan(input({ owner: owner({ agent: 'claude' }), pr: pr({ files: ['README.md'] }) }))
+    const a = p.actions[0] as Extract<Action, { kind: 'start-review' }>
+    assert.deepEqual(a.reviewers.map((r) => [r.name, r.agent]), [['correctness', 'codex']])
   })
 
   test('keeps every reviewer when all share the author\'s agent', () => {

@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "matriarch",
   "name": "Matriarch",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A supervisor, workers and a read-only review crew across several models drive every PR through CI, review, fixes and merge. Starts in dry run.",
   "author": {
     "name": "VerifiedOrganic"
@@ -32,7 +32,7 @@
     }
   ],
   "engines": {
-    "orca": ">=1.4.259"
+    "orca": ">=1.4.263"
   },
   "execution": "trusted-worker",
   "pluginApi": 1,

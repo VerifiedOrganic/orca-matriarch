@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.1
+
+Tested with Orca 1.4.263, which it now needs. Fixes from an independent review of 0.1.0.
+
+- **A merged PR's worktree is removed only while it holds just that PR.** Before, a later worker
+  that took the worktree over, committed without pushing and finished could lose that work when
+  Matriarch removed the worktree and its branch. Now git in the worktree must say it is still on
+  the PR's branch with no commits the PR did not have; one moved to another branch is left alone.
+  A worker Orca cannot vouch for (just started, or restored after a restart) counts as running
+  there, and nothing is removed while Orca's worker list cannot be read.
+- **Every reviewer runs.** With **Keep reviewers off the author's agent** (on by default), a
+  reviewer on the agent that wrote the PR now reviews on another reviewer's agent and model,
+  keeping its focus; before, it sat the round out, so the default crew (Codex workers, a Codex
+  security reviewer) reviewed every PR with one reviewer.
+- **A failed check says so.** The board shows that the last check failed, why, and how old what
+  it shows is, and the status bar says **check failed**, until a good check replaces it.
+- **An Orca worker list Matriarch cannot read is not taken as "no workers".** It says it cannot
+  see Orca's workers, and sends nothing to workers, removes no PR's worktree and leaves its mail
+  in Orca until it can.
+- **The supervisor is told when a PR its workers built merges** or is closed without merging, so
+  work that waited on it starts then: with autopilot on, including one that closed while it was
+  off or before the supervisor was found, and tried again if the send fails, for up to a day. Its
+  brief says so, and not to write loops that wait for a merge: one such loop, written for bash,
+  polled forever in zsh, which does not split an unquoted variable into words. A Claude Code
+  supervisor's brief names the shell its commands run in, and every brief asks for a time limit
+  and a line of output on any wait.
+- **Restarting a reviewer** keeps it on the agent the round chose for it.
+- **The status bar** no longer stops updating when its text runs past Orca's 64 characters or
+  its tooltip past 256.
+- **Safer defaults:** **Worker starts a day** is 20 (was no limit), and reviews stay in Orca
+  unless a project posts them on the PR (**Where reviews go**), since a Codex reviewer can read
+  files outside its worktree.
+- The README starts with a quick start and says plainly what is new; building and releasing moved
+  to CONTRIBUTING.md.
+
+**Upgrading from 0.1.0:** turning a project on wrote every setting into its
+`.orca/matriarch.json`, the old defaults included, so the new defaults do not reach it by
+themselves. In each project's Settings, check **Where reviews go** (it was "also posted on the
+PR") and **Worker starts a day** (it was 0, no limit).
+
 ## 0.1.0
 
 The first release.

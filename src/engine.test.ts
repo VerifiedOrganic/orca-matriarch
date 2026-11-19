@@ -8,6 +8,7 @@ import type { WorkerRow } from './orca-cli.ts'
 import type { Action } from './plan.ts'
 import { check, pr, SHA } from './testing/fixtures.ts'
 import { ActivityTracker } from './worker.ts'
+import type { RemoveWorktree } from './worktrees.ts'
 
 const T0 = 1_800_000_000_000
 
@@ -342,6 +343,134 @@ describe('the worktree of a merged PR', () => {
     assert.deepEqual(h.store.get('cleanup:acme/app'), [])
   })
 
+  test("is removed only as the merged PR's branch, with every head the PR had, the merged one first", async () => {
+    const merged = pr({ number: 12, state: 'MERGED', headSha: 'b'.repeat(40) })
+    const h = harness([merged])
+    h.store.set('tracked:acme/app', [12])
+    // Its branch was rebased on the forge to update it: the worktree still holds the earlier head.
+    h.store.set(ledgerKey('acme/app', 12), { v: 1, ci: {}, conflicts: {}, comments: {}, reviews: {}, updates: {}, escalations: {}, notified: {}, merge: null, heads: { ['a'.repeat(40)]: T0 - 7200_000, ['c'.repeat(40)]: T0 - 3600_000 } })
+    const asked: RemoveWorktree[] = []
+    h.deps.removeWorktree = async (_path, what) => (asked.push(what), { removed: true })
+    h.deps.workers = async () => []
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked.length, 1)
+    const what = asked[0] as Extract<RemoveWorktree, { merged: unknown }>
+    assert.deepEqual([what.merged.number, what.merged.branch], [12, 'feature/login'])
+    assert.equal(what.merged.heads[0], 'b'.repeat(40))
+    assert.ok(what.merged.heads.indexOf('c'.repeat(40)) < what.merged.heads.indexOf('a'.repeat(40)), 'then newest first')
+  })
+
+  test("a later PR from the same worktree is cleaned up as its own, once the first is let go", async () => {
+    // #10 merged from this worktree and waited while its worker ran on; that worker moved it to a
+    // new branch, whose PR #12 merged too.
+    const ws: Workspace = { id: 'ws-login', kind: 'worktree', name: 'login', path: '/r/wt/login', branch: 'feature/next', hostId: null }
+    const h = harness([pr({ number: 12, state: 'MERGED', headRef: 'feature/next' })], { workspaces: [ws] })
+    h.store.set('tracked:acme/app', [12])
+    h.store.set('cleanup:acme/app', [{ path: '/r/wt/login', number: 10, at: T0, branch: 'feature/login', heads: ['d'.repeat(40)] }])
+    const asked: number[] = []
+    h.deps.removeWorktree = async (_path, what) => {
+      if (!('merged' in what)) throw new Error('not a merged cleanup')
+      asked.push(what.merged.number)
+      return what.merged.branch === 'feature/next' ? { removed: true } : { removed: false, moved: true, reason: "it is on feature/next now, not #10's branch" }
+    }
+    h.deps.workers = async () => []
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(asked, [10, 12])
+    assert.deepEqual(h.store.get('cleanup:acme/app'), [])
+  })
+
+  test('the newest worker that may still run is the one that counts, so an exited one does not hide it', async () => {
+    const merged = pr({ number: 12, state: 'MERGED' })
+    const h = harness([merged])
+    h.store.set('tracked:acme/app', [12])
+    let asked = 0
+    h.deps.removeWorktree = async () => (asked++, { removed: true })
+    // Newest first: a failed attempt that exited, listed above one Orca cannot vouch for.
+    h.deps.workers = async () => [
+      { dispatchId: 'd2', worktreeId: 'ws-login', taskId: 't', runId: 'r', agent: 'codex', model: null, state: 'failed', live: false, liveness: 'exited' },
+      { dispatchId: 'd1', worktreeId: 'ws-login', taskId: 't', runId: 'r', agent: 'codex', model: null, state: 'running', live: false, liveness: 'unverifiable' }
+    ]
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked, 0)
+    assert.equal((h.store.get('cleanup:acme/app') as { kept?: string }[])[0].kept, 'an agent is still running there')
+  })
+
+  test("waits while a worker there may still run, or Orca's worker list cannot be read", async () => {
+    const merged = pr({ number: 12, state: 'MERGED' })
+    const h = harness([merged])
+    h.store.set('tracked:acme/app', [12])
+    let asked = 0
+    h.deps.removeWorktree = async () => (asked++, { removed: true })
+    // Orca cannot vouch for it: just started, or restored after a restart.
+    h.deps.workers = async () => [{ dispatchId: 'd1', worktreeId: 'ws-login', taskId: 't', runId: 'r', agent: 'codex', model: null, state: 'ready', live: false, liveness: 'unverifiable' }]
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked, 0)
+    assert.equal((h.store.get('cleanup:acme/app') as { kept?: string }[])[0].kept, 'an agent is still running there')
+    h.deps.workers = async () => {
+      throw new Error('worker-list answered in a form this Matriarch does not read')
+    }
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked, 0, 'no list, nothing says it is idle')
+    assert.equal((h.store.get('cleanup:acme/app') as unknown[]).length, 1, 'still pending')
+    h.deps.workers = async () => [{ dispatchId: 'd1', worktreeId: 'ws-login', taskId: 't', runId: 'r', agent: 'codex', model: null, state: 'succeeded', live: false, liveness: 'exited' }]
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked, 1, 'Orca saw it exit: it goes')
+  })
+
+  test('is let go, not removed, when a new PR is open from the same branch, and waits for the PR list', async () => {
+    const merged = pr({ number: 12, state: 'MERGED' })
+    const again = pr({ number: 14, state: 'OPEN', headSha: 'e'.repeat(40) })
+    const h = harness([merged, again])
+    h.store.set('tracked:acme/app', [12])
+    let asked = 0
+    h.deps.removeWorktree = async () => (asked++, { removed: true })
+    h.deps.workers = async () => []
+    const list = h.deps.github!.listOpen
+    // Without the forge's open PRs nothing says the branch is free: it waits.
+    h.deps.github!.listOpen = async () => {
+      throw new Error('GitHub is down')
+    }
+    await tick(h.deps, { autopilot: true })
+    h.store.set('cleanup:acme/app', [{ path: '/r/wt/login', number: 12, at: T0, branch: 'feature/login', heads: [SHA] }])
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked, 0)
+    assert.equal((h.store.get('cleanup:acme/app') as unknown[]).length, 1)
+    h.deps.github!.listOpen = list
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked, 0, '#14 is open from feature/login: the worktree is its work now')
+    assert.ok(!(h.store.get('cleanup:acme/app') as { number: number }[]).some((c) => c.number === 12))
+  })
+
+  test('is let go, not removed, once a later worker has taken it over', async () => {
+    const merged = pr({ number: 12, state: 'MERGED' })
+    const h = harness([merged])
+    h.store.set('tracked:acme/app', [12])
+    const logs: string[] = []
+    h.deps.log = (m) => void logs.push(m)
+    let asked = 0
+    h.deps.removeWorktree = async () => (asked++, { removed: false, moved: true, reason: "it is on fix/next now, not #12's branch" })
+    h.deps.workers = async () => []
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked, 1)
+    assert.deepEqual(h.store.get('cleanup:acme/app'), [], 'no longer pending: its work now is not this PR\'s')
+    assert.ok(logs.some((l) => l.includes('left the worktree of merged #12') && l.includes('fix/next')))
+    await tick(h.deps, { autopilot: true })
+    assert.equal(asked, 1, 'not tried again')
+  })
+
+  test('queued by 0.1.0, finds its branch from the PR as it closed, or is left alone', async () => {
+    const h = harness([])
+    // 0.1.0 queued the path alone. #12's closed snapshot names its branch; #7 has none left.
+    h.store.set('cleanup:acme/app', [{ path: '/r/wt/login', number: 12, at: T0 }, { path: '/r/wt/search', number: 7, at: T0 }])
+    h.store.set('snap:acme/app#12', { snap: pr({ number: 12, state: 'MERGED', headSha: 'c'.repeat(40) }) })
+    const asked: { path: string; what: RemoveWorktree }[] = []
+    h.deps.removeWorktree = async (path, what) => (asked.push({ path, what }), { removed: true })
+    h.deps.workers = async () => []
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(asked, [{ path: '/r/wt/login', what: { merged: { number: 12, branch: 'feature/login', heads: ['c'.repeat(40)] } } }])
+    assert.deepEqual(h.store.get('cleanup:acme/app'), [], '#7 dropped: nothing says which branch it held')
+  })
+
   test('is left alone in dry run and when the setting is off', async () => {
     const merged = pr({ number: 12, state: 'MERGED' })
     const h = harness([merged])
@@ -352,6 +481,80 @@ describe('the worktree of a merged PR', () => {
     await tick(h.deps, { autopilot: false })
     await tick(h.deps, { autopilot: false })
     assert.equal(called, false)
+  })
+})
+
+describe('a PR that merges or closes', () => {
+  /** A PR a supervised worker built, as its ledger says, and the supervisor's mail. */
+  const setup = (p: PrSnapshot, builder: string | null = 'dispatch:d1') => {
+    const h = harness([p])
+    h.store.set('tracked:acme/app', [p.number])
+    if (builder) h.store.set(ledgerKey('acme/app', p.number), { v: 1, ci: {}, conflicts: {}, comments: {}, reviews: {}, updates: {}, escalations: {}, notified: {}, merge: null, heads: {}, builder: { address: builder, done: true } })
+    const told: { to: string; subject: string; body: string }[] = []
+    h.deps.tellSupervisor = async (_repo, _root, to, m) => (told.push({ to, ...m }), { id: `msg_${told.length}`, from: 'term_mailbox' })
+    h.deps.workers = async () => []
+    return { h, told }
+  }
+
+  test('is told to the supervisor once, so work that waited on it starts with nothing polling for it', async () => {
+    const { h, told } = setup(pr({ number: 12, state: 'MERGED', title: 'Add login' }))
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told.length, 1)
+    assert.equal(told[0].to, 'run:r1')
+    assert.equal(told[0].subject, 'acme/app #12 merged')
+    assert.match(told[0].body, /PR #12 "Add login" \(branch feature\/login\) merged into main\. Start the work that waited on it now\./)
+    assert.match(told[0].body, /nothing needs to wait or poll for it/)
+    // Recorded like any mail Matriarch sends, so a reply to it lands on the PR.
+    const sent = (h.store.get('mail:acme/app') as { sent: { id: string; kind: string; number?: number }[] }).sent
+    assert.deepEqual(sent.map((m) => [m.id, m.kind, m.number]), [['msg_1', 'merged', 12]])
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told.length, 1, 'once')
+  })
+
+  test('closed without merging says so', async () => {
+    const { h, told } = setup(pr({ number: 12, state: 'CLOSED' }))
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told[0]?.subject, 'acme/app #12 closed without merging')
+    assert.match(told[0].body, /none of it reached main\. Re-plan the work that waited on it\./)
+  })
+
+  test('one that closed in dry run, or before a supervisor was known, is told once autopilot is on and one is', async () => {
+    const { h, told } = setup(pr({ number: 12, state: 'MERGED' }))
+    await tick(h.deps, { autopilot: false })
+    assert.equal(told.length, 0, 'a dry run sends nothing')
+    const supervisor = h.deps.supervisor
+    h.deps.supervisor = async () => null
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told.length, 0, 'no supervisor to tell yet')
+    h.deps.supervisor = supervisor
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(told.map((t) => t.subject), ['acme/app #12 merged'])
+  })
+
+  test('a failed send is a warning, and is tried again until it goes, for a day', async () => {
+    const { h, told } = setup(pr({ number: 12, state: 'MERGED' }))
+    const tell = h.deps.tellSupervisor!
+    h.deps.tellSupervisor = async () => {
+      throw new Error('no_active_sender_terminal')
+    }
+    const board = await tick(h.deps, { autopilot: true })
+    assert.ok(board.repos[0].warnings.includes('Could not tell the supervisor that #12 merged: no_active_sender_terminal. Matriarch tries again.'))
+    h.deps.tellSupervisor = tell
+    await tick(h.deps, { autopilot: true })
+    assert.equal(told.length, 1, 'sent on the next check')
+    // One never sent in a day is let go.
+    const late = setup(pr({ number: 12, state: 'MERGED' }))
+    await tick(late.h.deps, { autopilot: false })
+    late.h.advance(25 * 3600_000)
+    await tick(late.h.deps, { autopilot: true })
+    assert.deepEqual(late.told, [])
+    assert.deepEqual(late.h.store.get('closednotes:acme/app'), [])
+  })
+
+  test('is not told for a PR no supervised worker built', async () => {
+    const { h, told } = setup(pr({ number: 12, state: 'MERGED' }), null)
+    await tick(h.deps, { autopilot: true })
+    assert.deepEqual(told, [])
   })
 })
 
@@ -448,7 +651,7 @@ describe("a finished worktree that never became a PR", () => {
   const setup = () => {
     const h = harness([], { workspaces: [gate, mine] })
     const removed: { path: string; keepBranch?: boolean }[] = []
-    h.deps.removeWorktree = async (path, options) => (removed.push({ path, keepBranch: options?.keepBranch }), { removed: true })
+    h.deps.removeWorktree = async (path, what) => (removed.push({ path, keepBranch: 'keepBranch' in what ? what.keepBranch : undefined }), { removed: true })
     h.deps.workers = async () => [
       { dispatchId: 'd-gate', worktreeId: 'ws-gate', taskId: 't', runId: 'r1', agent: 'codex', model: null, state: 'succeeded', live: false },
       // A worktree some other Run used: a person's, or another supervisor's.

@@ -37,6 +37,8 @@ export interface BriefInput {
   host?: string
   /** The advisor it may ask, and Matriarch's mailbox the questions go to; absent when there is none. */
   advisor?: { role: AdvisorSpec; address: string }
+  /** The shell its commands run in (the name of the person's `$SHELL`, such as zsh), when known. */
+  shell?: string
 }
 
 /** An advisor as the supervisor reads it: its agent, model and effort. */
@@ -80,7 +82,20 @@ export function supervisorLaunchArgs(role: RoleSpec, root: string, brief: string
   return args
 }
 
-export function supervisorBrief({ repo, root, objective, tag, base, config, forge, host, advisor }: BriefInput): string {
+/**
+ * How the supervisor's shell commands should wait, and the one shell difference that has bitten
+ * one: zsh does not split an unquoted variable into words, so a bash-style `set -- $s` loop never
+ * matched and polled forever. The shell is named only for Claude Code, which runs commands in the
+ * person's `$SHELL`; another agent may use its own.
+ */
+export function shellLines(shell: string | undefined, indent = ''): string[] {
+  const wait = 'Give any command that waits a time limit, and print a line on each pass, so a wait that cannot end shows.'
+  return shell === 'zsh'
+    ? [`${indent}Your shell commands run in zsh, not bash: an unquoted $var is not split into words, so split a`, `${indent}value with read (read -r a b c <<< "$s"). ${wait}`]
+    : [`${indent}${wait}`]
+}
+
+export function supervisorBrief({ repo, root, objective, tag, base, config, forge, host, advisor, shell }: BriefInput): string {
   const tiers = Object.entries(config.workers.tiers)
   const t = forgeTerms(forge)
   const contract = [
@@ -123,8 +138,13 @@ export function supervisorBrief({ repo, root, objective, tag, base, config, forg
     '   It takes up a PR only once it is ready: keep one as a draft only while it waits on something, and mark it',
     `   ready (${t.ready('<number>')}) as soon as its work is done.`,
     config.merge.mode === 'auto'
-      ? `   Matriarch merges each PR itself once its review passes. Never ask the user to merge: wait for the PR to show ${t.merged('<n>')} before starting work that depends on it.`
+      ? '   Matriarch merges each PR itself once its review passes. Never ask the user to merge.'
       : '   The user merges each PR once Matriarch marks it ready. Say in this chat which PR is ready and what waits on it, and keep other independent tasks moving meanwhile.',
+    '   With autopilot on, Matriarch tells you in this chat as each PR your workers built merges ("<repo> #<n>',
+    '   merged") or is closed without merging: start the work that depends on it then. In dry run it does not;',
+    `   when the user says one merged, look once (it shows ${t.merged('<n>')}). Do not write loops or background`,
+    '   commands that wait for a merge.',
+    ...shellLines(config.supervisor.agent === 'claude' ? shell : undefined, '   '),
     '6. When Matriarch sends you an escalation, decide the next step yourself: give the worker new instructions',
     '   (orca orchestration send --to dispatch:<id>), start a fixer on a stronger tier, or re-plan.',
     ...(advisor ? advisorInstructions(advisor.role, advisor.address, '   ') : []),

@@ -14,8 +14,8 @@
     "preview": "pnpm preview:build && python3 -m http.server 8765 --bind 127.0.0.1 --directory tools/preview"
   },
   "config": {
-    "orcaVersion": "1.4.259",
-    "orcaDebSha512": "DfrWwkQk7gsl9mXO+idkzIiau/xPt4FQeylUJdX5XNcMhVylek4t/HchfoGItk9aGyhDkY/AaDZX+s2Hw8HRaQ=="
+    "orcaVersion": "1.4.263",
+    "orcaDebSha512": "qe3G7qwkM2QDFcebh7fzAHZXGhCE05RjPj2+m9g6SKkwqLQIH3o0R+WDu0wuJPR3TAk2LXe3GGXFvqIXmiq5og=="
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

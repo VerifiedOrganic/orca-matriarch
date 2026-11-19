@@ -389,6 +389,21 @@ describe('a reviewer stopped by its account', () => {
     assert.deepEqual(run.reviewers.map((r) => [r.name, r.status, r.lock ?? null]), [['correctness', 'done', 'claude-dontask'], ['security', 'running', 'codex-sandbox']])
     assert.equal((await h.crew.restart({ pr: pr(), config: config(), name: 'correctness' })).restarted, false, 'a reviewer with a verdict is not restarted')
   })
+
+  test("a reviewer moved off the author's agent restarts where it was moved, not back on the author's", async () => {
+    const files: Record<string, string> = {}
+    const h = crewHarness(files, { lockdown: createLockdown(() => 1_000) })
+    const crew = [R('correctness', 'claude'), R('security', 'codex')]
+    // Codex wrote the PR: security reviews on Claude.
+    const moved = [crew[0], { ...crew[1], agent: 'claude', model: 'claude-model' }]
+    await h.crew.start({ pr: pr(), root: '/r', config: { ...config(), reviewers: crew }, round: 1, reviewers: moved })
+    // Restarted from the panel, which knows nothing of the move: the round's own record decides.
+    const res = await h.crew.restart({ pr: pr(), config: { ...config(), reviewers: crew }, name: 'security' })
+    assert.equal(res.restarted, true)
+    assert.equal(h.calls.filter((c) => c[1] === 'launch' && c[3] === 'codex').length, 0, 'never on codex')
+    const run = (await h.crew.get('acme/app', 12, SHA))!
+    assert.deepEqual(run.reviewers.map((r) => [r.name, r.agent]), [['correctness', 'claude'], ['security', 'claude']])
+  })
 })
 
 describe('an agent Orca resumes without the lockdown', () => {

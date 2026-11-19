@@ -376,6 +376,25 @@ describe('the engine and its mailbox', () => {
     return { deps, store, executed, box, advance: (ms: number) => (now += ms), now: () => now }
   }
 
+  test("mail waits in Orca while Orca's worker list cannot be read, and is taken once it can", async () => {
+    const e = engine([failing])
+    await tick(e.deps, { autopilot: true })
+    e.advance(10 * 60_000)
+    e.box.arrive(stored('msg_reply', { thread_id: 'msg_1', run_id: 'r1', subject: 'Re: Escalation: Matriarch needs a decision on acme/app #12', body: 'Handled: a fixer is on it.', created_at: iso(e.now() - 60_000) }))
+    const listed = e.deps.workers
+    // Without the list a worker's reply could be taken for the supervisor's: none is read.
+    e.deps.workers = async () => {
+      throw new Error('worker-list answered in a form this Matriarch does not read')
+    }
+    const waiting = await tick(e.deps, { autopilot: true })
+    assert.equal(waiting.tracks.find((t) => t.pr?.number === 12)?.pr?.note ?? null, null)
+    assert.deepEqual(learnedSenders(loadMailState(e.store.get(mailKey('acme/app'))), 'run:r1'), [])
+    assert.ok(waiting.errors.some((x) => x.includes("Matriarch's mail waits")))
+    e.deps.workers = listed
+    const back = await tick(e.deps, { autopilot: true })
+    assert.equal(back.tracks.find((t) => t.pr?.number === 12)?.pr?.note?.text, 'Handled: a fixer is on it.')
+  })
+
   test("the supervisor's answer is on the PR: its log, its card, and the person is not told until the answer's time ran out", async () => {
     const e = engine([failing])
     await tick(e.deps, { autopilot: true })

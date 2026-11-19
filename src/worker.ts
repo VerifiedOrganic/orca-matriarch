@@ -45,6 +45,8 @@ export interface WorkerOptions {
 export { reviewGuard } from './guard.ts'
 import { reviewGuard, type ClaudeHomes, type Guard } from './guard.ts'
 import { createLimitsGuard, limitsChanged, limitsMessage } from './limits.ts'
+import { removeWorktree } from './worktrees.ts'
+import { clip } from './values.ts'
 
 /**
  * Matriarch's mailbox in each project: a terminal of its own in the main checkout, which Orca
@@ -136,8 +138,8 @@ import { createLockdown } from './lockdown.ts'
 
 const DISK_FULL = 'The disk is full:'
 /** The Orca release Matriarch is built and tested against (package.json's config.orcaVersion). */
-export const TESTED_ORCA = '1.4.259'
-export const PLUGIN_VERSION = '0.1.0'
+export const TESTED_ORCA = '1.4.263'
+export const PLUGIN_VERSION = '0.1.1'
 
 let stop: (() => void) | null = null
 
@@ -234,6 +236,10 @@ const SUMMARY: { lanes: Lane[]; label: string }[] = [
   { lanes: ['ready', 'merging'], label: 'ready' }
 ]
 
+/** Orca refuses a status bar text or tooltip longer than these, and the whole update with it. */
+const TEXT_MAX = 64
+const TOOLTIP_MAX = 256
+
 export function statusText(board: Board): { text: string; tooltip: string; tone: 'neutral' | 'accent' | 'success' | 'warning' | 'danger' } {
   const count = (lanes: Lane[]) => board.tracks.filter((t) => lanes.includes(t.lane)).length
   const parts = SUMMARY.map((s) => ({ ...s, n: count(s.lanes) })).filter((s) => s.n > 0)
@@ -249,7 +255,24 @@ export function statusText(board: Board): { text: string; tooltip: string; tone:
     ...board.errors
   ].join('\n')
   const tone = needYou > 0 || attention.length > 0 ? 'danger' : fixing > 0 ? 'warning' : count(['ready']) > 0 ? 'success' : board.autopilot ? 'accent' : 'neutral'
-  return { text: board.autopilot ? text : `${text} (dry run)`, tooltip, tone }
+  // Most important first, so what is cut is the end of the problems; the panel shows them all.
+  return { text: clip(board.autopilot ? text : `${text} (dry run)`, TEXT_MAX), tooltip: clip(tooltip, TOOLTIP_MAX), tone }
+}
+
+const CHECK_FAILED = "Matriarch's last check failed:"
+
+/**
+ * The board after a check failed: the last good one, with why and how old it is in its problems,
+ * and the status bar saying so. A full disk gets its own words: the save is what failed.
+ */
+export function failedBoard(board: Board, error: unknown): { board: Board; status: { text: string; tooltip: string; tone: 'warning' | 'danger' } } {
+  const text = error instanceof Error ? error.message : String(error)
+  const diskFull = (error as NodeJS.ErrnoException | null)?.code === 'ENOSPC' || /ENOSPC/.test(text)
+  const why = diskFull
+    ? `${DISK_FULL} Matriarch cannot save its state and agents' builds fail. Free some space; it carries on by itself.`
+    : `${CHECK_FAILED} ${text.split('\n')[0].slice(0, 200)}. ${board.ready ? `What shows here is from ${new Date(board.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Nothing has been checked yet'}; it tries again by itself.`
+  const errors = [...board.errors.filter((e) => !e.startsWith(DISK_FULL) && !e.startsWith(CHECK_FAILED)), why]
+  return { board: { ...board, errors }, status: { text: diskFull ? 'Matriarch: disk full' : 'Matriarch: check failed', tooltip: clip(why, TOOLTIP_MAX), tone: diskFull ? 'danger' : 'warning' } }
 }
 
 /** Why a project cannot be followed when its origin names no forge at all. */
@@ -568,25 +591,7 @@ export function createWorker(options: WorkerOptions = {}) {
         const forge = forgeKind(ref) === 'gitlab' ? gitlabForge : githubForge
         return forge.commentIssue ? forge.commentIssue(ref, number, body) : { ok: false, error: `cannot comment on ${forgeTerms(forgeKind(ref)).name} issues here` }
       },
-      removeWorktree: async (path, options) => {
-        // Only a clean worktree goes: anything uncommitted, even an untracked file, keeps it.
-        const status = await exec('git', ['-C', path, 'status', '--porcelain'], { timeoutMs: 15_000 })
-        if (status.code !== 0) return { removed: false, reason: 'git status failed there' }
-        if (status.stdout.trim()) return { removed: false, reason: 'it has uncommitted changes' }
-        if (options?.keepBranch) {
-          // A worktree that never became a PR keeps its branch, and goes only if every commit on that
-          // branch is on a remote. One on a detached commit (a gate checking a PR) has none of its own.
-          const onBranch = (await exec('git', ['-C', path, 'symbolic-ref', '-q', 'HEAD'], { timeoutMs: 10_000 })).code === 0
-          if (onBranch) {
-            const unpushed = await exec('git', ['-C', path, 'rev-list', '--count', 'HEAD', '--not', '--remotes'], { timeoutMs: 15_000 })
-            if (unpushed.code !== 0 || unpushed.stdout.trim() !== '0') return { removed: false, reason: 'it has commits that are not pushed' }
-          }
-          await cli.run(['worktree', 'rm', '--worktree', `path:${path}`])
-          return { removed: true }
-        }
-        await cli.run(['worktree', 'rm', '--worktree', `path:${path}`, '--delete-branch'])
-        return { removed: true }
-      },
+      removeWorktree: (path, what) => removeWorktree(exec, cli, path, what),
       executor: createExecutor({
         exec,
         orca: cli,
@@ -629,13 +634,12 @@ export function createWorker(options: WorkerOptions = {}) {
         } catch (error) {
           failures++
           orca.log(`tick failed: ${(error as Error).stack ?? String(error)}`)
-          // A full disk fails the save, so no new board comes: say what is wrong on the old one.
-          // The next good check replaces it.
-          if ((error as NodeJS.ErrnoException).code === 'ENOSPC' || /ENOSPC/.test(String(error))) {
-            board = { ...board, errors: [...board.errors.filter((e) => !e.startsWith(DISK_FULL)), `${DISK_FULL} Matriarch cannot save its state and agents' builds fail. Free some space; it carries on by itself.`] }
-            postBoard(board)
-            await orca.host.call('statusBar.update', { id: 'summary', text: 'Matriarch: disk full', tooltip: DISK_FULL, tone: 'danger' }).catch(() => {})
-          }
+          // A failed check brings no new board: the last one says so, and how old it is, so what
+          // it shows is not taken as current. The next good check replaces it.
+          const failed = failedBoard(board, error)
+          board = failed.board
+          postBoard(board)
+          await orca.host.call('statusBar.update', { id: 'summary', ...failed.status }).catch(() => {})
         } finally {
           running = null
         }
@@ -738,7 +742,8 @@ export function createWorker(options: WorkerOptions = {}) {
       const role = cfg.config.advisor
       const address = advisorUsable(role) ? await mailboxFor(repo, repoView.root) : null
       const advice = advisorUsable(role) && address ? { role, address } : null
-      const brief = supervisorBrief({ repo, root: repoView.root, objective: objective ?? '', tag, base, config: cfg.config, forge: repoView.forge, host: ref?.host, ...(advice ? { advisor: advice } : {}) })
+      const shell = basename(process.env.SHELL ?? '')
+      const brief = supervisorBrief({ repo, root: repoView.root, objective: objective ?? '', tag, base, config: cfg.config, forge: repoView.forge, host: ref?.host, ...(advice ? { advisor: advice } : {}), ...(shell ? { shell } : {}) })
       let receipt: unknown
       try {
         receipt = await cli.run(supervisorLaunchArgs(sup, repoView.root, brief, 'chat'))

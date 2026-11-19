@@ -277,7 +277,10 @@ export interface Crew {
   load(): Promise<void>
   /**
    * Starts one reviewer of a running round again, in the same worktree and locked down the same
-   * way, after whatever stopped it (a usage limit, a prompt) was dealt with. The others keep going.
+   * way, after whatever stopped it (a usage limit, a prompt) was dealt with; the others keep going.
+   * It runs on the agent the round started it on: with the config's model and thinking level when
+   * the config still has it on that agent, else exactly as it ran (one moved off the author's
+   * agent stays moved).
    */
   restart(input: { pr: PrSnapshot; config: MatriarchConfig; name: string }): Promise<{ restarted: boolean; message: string }>
 }
@@ -568,7 +571,8 @@ export function createCrew(deps: CrewDeps): Crew {
       if (i < 0) return { restarted: false, message: `no reviewer "${name}" in this round` }
       const old = run.reviewers[i]
       if (old.status === 'done') return { restarted: false, message: `${name} already wrote its verdict` }
-      const spec: ReviewerSpec = config.reviewers.find((r) => r.name === name) ?? {
+      const configured = config.reviewers.find((r) => r.name === name)
+      const spec: ReviewerSpec = configured && configured.agent === old.agent ? configured : {
         name: old.name, agent: old.agent, blocking: old.blocking,
         ...(old.model ? { model: old.model } : {}), ...(old.effort ? { effort: old.effort } : {}), ...(old.focus ? { focus: old.focus } : {})
       }
